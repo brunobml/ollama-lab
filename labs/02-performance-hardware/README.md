@@ -106,6 +106,20 @@ Raw (2 runs per context; prompt = 120 synthetic log lines ≈ 5,064 tokens):
 * On this card, long context is cheap for qwen3.5 (≈2 GB for 64K) thanks to the hybrid architecture.
 * Whether the 9b fits at 64K depends on what else is using the GPU at that moment.
 
+### Step 4 — CPU vs GPU: partial offload curve
+
+Documented way to force CPU: start the server with `CUDA_VISIBLE_DEVICES=-1` (all-or-nothing, requires a server restart). Used instead: the **request option `num_gpu`** (not in the Modelfile docs). Verified on 0.40.2: `num_gpu: 0` → `/api/ps` `size_vram = 0`, and `server.log` shows llama-server started with `-ngl 0` (llama.cpp's "number of GPU layers"), so partial values work too. qwen3.5:4b has 33 offloadable layers.
+
+Same `server.log` command line also showed: llama-server listens on `127.0.0.1:<random port>` behind Ollama (proxy → internal service), `--no-mmproj-offload` in CPU mode, and `--context-shift --keep 4` (relevant to truncation — Phase 3).
+
+Hardware for CPU inference: i7-10700K (8C/16T), 4 × 16 GB DDR4 rated 3200 but **running at 2400 MT/s** (dual channel → 38.4 GB/s theoretical, vs ≈760 GB/s on the GPU).
+
+```powershell
+ollama stop qwen3.5:4b
+.\scripts\bench.ps1 -Model qwen3.5:4b -LogLines 30 -NumPredict 128 -NumCtx 8192 -NumGpu 33,24,16,8,0
+ollama stop qwen3.5:4b
+```
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 results (2026-10-10)

@@ -4,6 +4,7 @@ param(
     [int]$NumPredict = 256,
     [int[]]$NumCtx = @(4096),
     [int]$LogLines = 0,
+    [int[]]$NumGpu = @(-1),   # layers on GPU; -1 = let Ollama decide (all that fit)
     [string]$Prompt = 'Explain step by step how the Kubernetes scheduler places a pod on a node.'
 )
 
@@ -15,13 +16,17 @@ $logs = if ($LogLines) {
 } else { '' }
 
 $results = foreach ($ctx in $NumCtx) {
+  foreach ($gpu in $NumGpu) {
     1..$Runs | ForEach-Object {
+        $options = @{ num_predict = $NumPredict; num_ctx = $ctx; temperature = 0; seed = 42 }
+        if ($gpu -ge 0) { $options.num_gpu = $gpu }   # undocumented option; maps to llama-server -ngl
+
         $body = @{
             model   = $Model
             prompt  = "[run $_ $(Get-Random)]`n$logs`n$Prompt"
             stream  = $false
             think   = $false
-            options = @{ num_predict = $NumPredict; num_ctx = $ctx; temperature = 0; seed = 42 }
+            options = $options
         } | ConvertTo-Json -Depth 4
 
         $r  = Invoke-RestMethod http://127.0.0.1:11434/api/generate -Method Post -Body $body -ContentType 'application/json'
@@ -30,6 +35,7 @@ $results = foreach ($ctx in $NumCtx) {
         [pscustomobject]@{
             Model      = $Model
             Ctx        = $ctx
+            NumGpu     = if ($gpu -ge 0) { $gpu } else { 'auto' }
             Run        = $_
             LoadS      = [math]::Round($r.load_duration / 1e9, 2)
             PromptTok  = $r.prompt_eval_count
@@ -40,5 +46,6 @@ $results = foreach ($ctx in $NumCtx) {
             GpuPct     = if ($ps.size) { [int](100 * $ps.size_vram / $ps.size) } else { $null }
         }
     }
+  }
 }
 $results | Format-Table -AutoSize
