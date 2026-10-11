@@ -1,0 +1,28 @@
+# Model weights and model stores
+*.gguf
+*.safetensors
+*.bin
+models/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+*.key
+
+# Private data and vector stores
+private-docs/
+chroma/
+*.sqlite
+*.db
+
+# Raw benchmark output (commit summaries in results/, not raw dumps)
+results/raw/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
