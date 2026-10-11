@@ -65,7 +65,27 @@ ollama show qwen3.5:4b --modelfile
 
 ### Step 3 — First inference with observation
 
-(Guided in session.)
+Terminal A: `.\scripts\check-vram.ps1`. Terminal B:
+
+```powershell
+# Run 1: cold start (model loads from disk into VRAM)
+ollama run qwen3.5:4b --verbose "Explain a Kubernetes readiness probe in two sentences."
+# Run 2: same prompt, warm
+ollama run qwen3.5:4b --verbose "Explain a Kubernetes readiness probe in two sentences."
+# Run 3: warm, thinking off
+ollama run qwen3.5:4b --verbose --think=false "Explain a Kubernetes readiness probe in two sentences."
+ollama ps
+ollama stop qwen3.5:4b
+
+# Afterwards: the load's memory breakdown
+Select-String "$env:LOCALAPPDATA\Ollama\server.log" -Pattern 'offloaded|buffer size|starting llama-server|template selection' | Select-Object -Last 12
+```
+
+| `--verbose` field | Meaning | Bottleneck |
+|---|---|---|
+| `load duration` | Weights disk → VRAM | Disk, PCIe |
+| `prompt eval rate` | Prompt tokens/s (parallel) | GPU compute |
+| `eval count` / `eval rate` | Generated tokens, tokens/s (sequential) | GPU memory bandwidth |
 
 ## 5. Hypotheses → Observed Metrics
 
@@ -77,6 +97,33 @@ ollama show qwen3.5:4b --modelfile
 | `ollama show` | 4B, Q4_K_M | `qwen35` arch, 4.2B params, Q4_K_M, context 262,144; projector `clip` 333.51M params |
 | Capabilities | tools / thinking to verify | completion, vision, tools, thinking (**on by default**) ✅ |
 | Default sampling (params layer) | — | `temperature 1`, `top_k 20`, `top_p 0.95`, `presence_penalty 1.5` |
+| Cold load duration | several seconds | **not captured yet** — rerun pending |
+| Warm load duration | ≈0 | 28–30 ms ✅ |
+| VRAM when loaded | > 3.3 GB file size | 2,329 → 6,192 MiB = **+3,863 MiB** ✅ |
+| `ollama ps` | `100% GPU`, ctx 4096 | `3.1 GB`, `100% GPU`, `4096`, runner `llamacpp` ✅ |
+| Thinking on (Run 2) | many tokens | 1,520 tokens, 118.3 tok/s, 13.18 s total |
+| Thinking off (Run 3) | few tokens, same rate | 54 tokens, 116.0 tok/s, 0.90 s total ✅ |
+| Unload (`ollama stop`) | VRAM back to baseline | 6,192 → 2,329 MiB within 2 s ✅ |
+
+### Findings from `server.log` (load at 19:10)
+
+```text
+CUDA0 model buffer       2,515 MiB   LLM weights, 33/33 layers on GPU
+CUDA0 KV cache             128 MiB   n_ctx 4096
+CUDA0 recurrent state       50 MiB   hybrid architecture (llama_memory_recurrent)
+CUDA0 compute buffers      291 MiB   68 text + 223 vision
+vision projector weights  ~640 MiB   inferred from mmproj file size (not logged)
+CUDA runtime overhead     ~240 MiB   remainder
+                         ≈ 3,860 MiB ≈ nvidia-smi delta
+CUDA_Host (system RAM)     497 MiB   kept off-GPU (likely token embeddings)
+```
+
+* **Ollama's `SIZE` is an estimate**; plan with `nvidia-smi`.
+* **qwen3.5 is hybrid**: most layers keep a fixed-size recurrent state; only some have a KV cache. Long contexts should cost far less VRAM than the classic formula predicts (measure in Phase 2).
+* **Chat formatting** comes from a built-in Go renderer (`renderer=qwen3.5 parser=qwen3.5`), not the 13-byte template layer.
+* **Ollama starts `llama-server.exe`** (llama.cpp) as a child process pointed at the GGUF blob — the `llamacpp` runner.
+* **Prompt eval 18 tok/s is misleading**: 16 of ~20 tokens were reused from the cache (`prompt eval cached`); tiny prompts are dominated by fixed overhead.
+* **Quality (one sample):** Run 3 (no thinking) was factually wrong — readiness failures remove the pod from the Service's EndpointSlice; the kubelet runs the probe but doesn't route traffic. Test properly in Phase 3.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -140,5 +187,23 @@ All 8 blobs total **3,324,175,492 bytes** — almost all of it the two GGUF file
 * In binary GiB (1024³): **3.10 GiB**.
 
 So `ollama list` reports **decimal GB**, while `nvidia-smi` reports **MiB**. Convert before comparing a model's size with free VRAM.
+
+</details>
+
+**5. Run 2 and Run 3 generated at almost the same tokens/s, but Run 2 took 15× longer. Why?**
+
+<details>
+<summary>Answer</summary>
+
+Generation **rate** is a property of the model + hardware: each token reads the weights from VRAM once, so it's bounded by memory bandwidth (~117 tok/s here). Total **time** is rate × token count. Thinking produced ~1,466 hidden reasoning tokens before a 54-token answer. To make responses faster, you either generate fewer tokens (thinking off, shorter answers) or raise the rate (smaller model, more bandwidth) — two different levers.
+
+</details>
+
+**6. The file is 3.3 GB, but VRAM grew by 3,863 MiB. Name the extra consumers.**
+
+<details>
+<summary>Answer</summary>
+
+KV cache (128 MiB at 4,096 context), recurrent state (50 MiB — hybrid architecture), compute buffers (291 MiB, text + vision), and the CUDA runtime/context overhead. Meanwhile ≈497 MiB of weights stayed in system RAM (`CUDA_Host`), so "file size = VRAM" is wrong in both directions. Always measure with `nvidia-smi`.
 
 </details>

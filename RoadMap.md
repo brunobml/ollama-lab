@@ -196,7 +196,7 @@ flowchart TD
   * Quantization: FP16 → Q8_0 → Q4_K_M → Q2_K and their quality/size trade-offs.
   * KV cache size per sequence:
     $\text{KV} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times n_{\text{ctx}} \times \text{bytes\_per\_element}$
-    (use **KV heads**, not attention heads — grouped-query attention shares K/V across query heads. If `ollama show` reveals hybrid/linear-attention layers, only full-attention layers hold a classic KV cache — verify for qwen3.5.)
+    (use **KV heads**, not attention heads — grouped-query attention shares K/V across query heads. qwen3.5 is **confirmed hybrid** in Lab 01: at 4,096 context the log shows a 128 MiB KV cache plus a 50 MiB fixed recurrent-state buffer, so only the full-attention layers grow with context.)
   * Ollama knobs (documented in the FAQ): `OLLAMA_CONTEXT_LENGTH` / `num_ctx` (default 4096 per FAQ — verify in `ollama ps`), `OLLAMA_KV_CACHE_TYPE` (`f16` default, `q8_0`, `q4_0`), `OLLAMA_FLASH_ATTENTION`.
   * Metrics: load time, Time to First Token (TTFT), prompt evaluation rate (`prompt_eval_count / prompt_eval_duration`), generation rate (`eval_count / eval_duration`).
 * **Hands-on Experiment:**
