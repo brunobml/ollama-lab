@@ -87,6 +87,25 @@ Select-String "$env:LOCALAPPDATA\Ollama\server.log" -Pattern 'offloaded|buffer s
 | `prompt eval rate` | Prompt tokens/s (parallel) | GPU compute |
 | `eval count` / `eval rate` | Generated tokens, tokens/s (sequential) | GPU memory bandwidth |
 
+### Step 4 — First custom model (`Modelfile`)
+
+[`Modelfile`](Modelfile) in this directory: `FROM qwen3.5:4b`, `PARAMETER temperature 0.3`, and a Kubernetes-engineer `SYSTEM` prompt.
+
+```powershell
+ollama create devops-assistant -f labs/01-foundations/Modelfile
+ollama list
+ollama show devops-assistant
+
+# Pulled models use the legacy layout; locally created models use manifests-v2
+$root = "$env:USERPROFILE\.ollama\models"
+(Get-Content "$root\manifests\registry.ollama.ai\library\qwen3.5\4b" | ConvertFrom-Json).layers | Format-Table mediaType, size, digest
+(Get-Content "$root\manifests-v2\ollama.com\library\devops-assistant\latest" | ConvertFrom-Json).layers | Format-Table mediaType, size, digest
+
+# Same question, 3 runs per model
+1..3 | ForEach-Object { ollama run qwen3.5:4b --think=false "Explain a Kubernetes readiness probe in two sentences." }
+1..3 | ForEach-Object { ollama run devops-assistant --think=false "Explain a Kubernetes readiness probe in two sentences." }
+```
+
 ## 5. Hypotheses → Observed Metrics
 
 | Check | Hypothesis | Observed (2026-10-10) |
@@ -126,6 +145,25 @@ CUDA_Host (system RAM)     497 MiB   kept off-GPU (likely token embeddings)
 * **Prompt eval 18 tok/s is misleading**: 16 of ~20 tokens were reused from the cache (`prompt eval cached`); tiny prompts are dominated by fixed overhead.
 * **Load time is mostly fixed overhead, not disk:** the store is on a Samsung 990 PRO NVMe (~7 GB/s), so reading 3.3 GB takes well under 1 s. The 4 s reload is process spawn + CUDA init + projector load + warmup. The 40.7 s first load is **unexplained** — hypotheses: Defender scanning the new blob, one-time GPU kernel cache, cold OS cache. Test in Phase 2 with the first load of `qwen3.5:9b`.
 * **Quality (one sample):** Run 3 (no thinking) was factually wrong — readiness failures remove the pod from the Service's EndpointSlice; the kubelet runs the probe but doesn't route traffic. Test properly in Phase 3.
+
+### Findings from Step 4 (custom model)
+
+| Check | Hypothesis | Observed |
+|---|---|---|
+| Weights reused | GGUF layers shared | ✅ `using existing layer` for both GGUFs; 3 new blobs: system (198 B), params (67 B), manifest (1,274 B) — **≈1.5 KB of extra disk** |
+| `ollama list` | 3.3 GB for both | ✅ logical size, not unique disk usage (like `docker images`) |
+| Parameter inheritance | open question | **Inherited and merged**: `{"presence_penalty":1.5,"temperature":0.3,"top_k":20,"top_p":0.95}` — like a Kustomize patch |
+| Manifest location | same layout as pulled models | ❌ created models live in `manifests-v2\ollama.com\library\<name>\<tag>`; layers record `"from":"qwen3.5:4b"` |
+
+Answer quality (`--think=false`, 3 runs each, graded against Kubernetes behavior: kubelet runs the probe → sets Pod `Ready=false` → EndpointSlice controller marks the endpoint not ready → kube-proxy stops routing; no restart):
+
+| Run | Base `qwen3.5:4b` (temp 1.0) | `devops-assistant` (temp 0.3 + system prompt) |
+|---|---|---|
+| 1 | 🟡 says probes poll only "until responsive" | 🟡 says the **kubelet** updates EndpointSlices |
+| 2 | 🟡 nonsense clause about "existing requests" | 🟡 calls readiness "a liveness check"; kubelet removes endpoints |
+| 3 | 🔴 "on startup", self-contradiction, invented "pod set" | 🟢 fully correct |
+
+**Lesson:** the system prompt improved consistency and removed the worst errors, but the model **reused the prompt's vocabulary without understanding it** — "kubelet" and "EndpointSlice" were listed together, so it credited the kubelet with the controller's job. A system prompt controls style and vocabulary, not knowledge (→ RAG in Phase 5). Three samples is anecdotal; Phase 3 measures this properly.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -207,5 +245,24 @@ Generation **rate** is a property of the model + hardware: each token reads the 
 <summary>Answer</summary>
 
 KV cache (128 MiB at 4,096 context), recurrent state (50 MiB — hybrid architecture), compute buffers (291 MiB, text + vision), and the CUDA runtime/context overhead. Meanwhile ≈497 MiB of weights stayed in system RAM (`CUDA_Host`), so "file size = VRAM" is wrong in both directions. Always measure with `nvidia-smi`.
+
+</details>
+
+**7. `devops-assistant` costs ≈1.5 KB of disk, yet `ollama list` says 3.3 GB. If you created 10 such variants, how much disk would they use, and how much VRAM if all were loaded at once?**
+
+<details>
+<summary>Answer</summary>
+
+Disk: still ≈3.3 GB plus ≈15 KB — the weights blob is shared (content addressing).
+VRAM: **expected not to be shared** — each loaded model gets its own `llama-server` process with its own copy of the weights, KV cache, and buffers (≈3.8 GB each here), so only two would fit in 10 GB, and Ollama would evict older ones. Like pods from the same image: the image is cached once on the node, but each pod needs its own memory. *Verified or refuted in Step 5.* To serve many "personas" cheaply, use one model and vary the system prompt per request.
+
+</details>
+
+**8. Why did the custom model attribute EndpointSlice updates to the kubelet?**
+
+<details>
+<summary>Answer</summary>
+
+The system prompt listed "kubelet, Service, EndpointSlice" together. The model is steered to use those words, but a system prompt adds no knowledge about how the components relate, so it placed them plausibly but incorrectly. System prompts shape vocabulary, tone, and format; correct facts must come from the model's training or from retrieved context (RAG, Phase 5). Also: wording in your prompt can introduce errors that weren't there before.
 
 </details>
