@@ -1,0 +1,67 @@
+# Ollama Architecture (as observed on this machine)
+
+Everything here was verified in Labs 00–01 on Ollama 0.40.2, Windows 11, RTX 3080. Items not yet verified are marked.
+
+## Components
+
+```mermaid
+flowchart LR
+    TRAY["ollama app.exe<br/>(tray, supervisor)"] --> SRV
+    CLI["ollama CLI"] -->|HTTP 127.0.0.1:11434| SRV["ollama.exe serve<br/>API + scheduler"]
+    API["PowerShell / Python"] -->|HTTP| SRV
+    SRV -->|spawns, one per loaded weights blob| RUN["llama-server.exe<br/>(llama.cpp runner)"]
+    RUN -->|CUDA| GPU["RTX 3080 VRAM"]
+    RUN -->|mmap / read| BLOBS["~/.ollama/models/blobs"]
+    SRV --> MAN["manifests / manifests-v2"]
+```
+
+| Component | Role | Kubernetes analogy |
+|---|---|---|
+| `ollama app.exe` | Tray app; starts and supervises the server | systemd / node agent |
+| `ollama.exe` (server) | HTTP API, model registry client, scheduler, chat renderer | kube-apiserver + scheduler |
+| `llama-server.exe` | llama.cpp inference process for one set of weights | the workload pod |
+| Model store | Manifests + content-addressed blobs | node image cache |
+| `keep_alive` | Idle timeout per loaded runner, reset by each request (default 5 min) | scale-to-zero |
+
+## Model store
+
+* `manifests\registry.ollama.ai\library\<model>\<tag>` — pulled models (legacy layout, plus a v2 index in `manifests-v2\ollama.com\...`).
+* `manifests-v2\ollama.com\library\<model>\<tag>` — locally created models (`ollama create`).
+* `blobs\sha256-<digest>` — file name = SHA-256 of content; shared across tags.
+* Layer types seen: `model` (GGUF weights), `projector` (vision encoder GGUF), `template`, `system`, `params`, `license`.
+
+## Request path
+
+1. Client sends `POST /api/generate` or `/api/chat`.
+2. Server resolves the model's manifest and merges params: Modelfile `PARAMETER` overrides base model params (verified); request `options` override both (documented, not yet tested here).
+3. Server formats the conversation with a **built-in renderer** for the model family (`renderer=qwen3.5`), not the template layer.
+4. If a runner with the **same weights blob** is loaded, the request goes to it (even for a different model name); otherwise the scheduler starts a new `llama-server`.
+5. The runner evaluates the prompt (reusing cached prefix tokens: `prompt eval cached`) and generates tokens.
+6. A **parser** splits output into thinking / content / tool calls.
+7. `keep_alive` expiry is reset.
+
+## Memory of a loaded model (qwen3.5:4b, 4,096 context)
+
+| Consumer | Size | Where |
+|---|---|---|
+| LLM weights | 2,515 MiB | VRAM |
+| Vision projector weights | ≈640 MiB (inferred) | VRAM |
+| Compute buffers | 291 MiB | VRAM |
+| KV cache | 128 MiB | VRAM |
+| Recurrent state (hybrid arch) | 50 MiB | VRAM |
+| CUDA runtime overhead | ≈240 MiB (remainder) | VRAM |
+| **Total measured** | **≈3,860 MiB** | `nvidia-smi` delta |
+| Host-side weights (likely embeddings) | 497 MiB | system RAM |
+
+Ollama's own `SIZE` estimate was 3.1 GB — plan with measured values.
+
+## Networking
+
+* Binds `127.0.0.1:11434` (IPv4 only). Use `127.0.0.1`, not `localhost`: Windows resolves `localhost` to `::1` first, costing ≈2 s per request.
+* WSL2 (NAT) cannot reach it; see `docs/environment.md`.
+
+## Not yet verified
+
+* Whether variants with different load-time settings (`num_ctx`) can share a runner (Phase 2).
+* Cause of the 40.7 s first-ever load vs 3–4 s reloads (Phase 2).
+* Scheduler behavior when a second, different model does not fit in VRAM (Phase 2).

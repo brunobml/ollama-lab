@@ -106,6 +106,19 @@ $root = "$env:USERPROFILE\.ollama\models"
 1..3 | ForEach-Object { ollama run devops-assistant --think=false "Explain a Kubernetes readiness probe in two sentences." }
 ```
 
+### Step 5 — Two models at once, and auto-unload
+
+Announced over-ceiling experiment (two copies would need ≈10.0 GB of 10.24 GB).
+
+```powershell
+ollama run qwen3.5:4b --think=false --keepalive 2m "Say OK."
+ollama run devops-assistant --verbose --think=false --keepalive 2m "Explain a Kubernetes readiness probe in two sentences."
+ollama ps
+# wait ~2 minutes, watch check-vram.ps1
+# afterwards: which runners started, and which requests were served?
+Select-String "$env:LOCALAPPDATA\Ollama\server.log" -Pattern 'starting llama-server|POST'
+```
+
 ## 5. Hypotheses → Observed Metrics
 
 | Check | Hypothesis | Observed (2026-10-10) |
@@ -164,6 +177,16 @@ Answer quality (`--think=false`, 3 runs each, graded against Kubernetes behavior
 | 3 | 🔴 "on startup", self-contradiction, invented "pod set" | 🟢 fully correct |
 
 **Lesson:** the system prompt improved consistency and removed the worst errors, but the model **reused the prompt's vocabulary without understanding it** — "kubelet" and "EndpointSlice" were listed together, so it credited the kubelet with the controller's job. A system prompt controls style and vocabulary, not knowledge (→ RAG in Phase 5). Three samples is anecdotal; Phase 3 measures this properly.
+
+### Findings from Step 5 (two models, auto-unload)
+
+| Check | Hypothesis | Observed |
+|---|---|---|
+| Second model sharing weights | separate runner, VRAM ≈ doubles (or eviction / spill) | ❌ **runner reused**: one `starting llama-server` (19:31:41); the `devops-assistant` request (19:31:56) took 0.85 s with no load; VRAM stayed ≈6,240 MiB; `/api/ps` kept showing `qwen3.5:4b` |
+| Default `keep_alive` | unload 5 min after last request | ✅ last request 19:26:18 → unloaded 19:31:18 |
+| `--keepalive 2m` | unload after 2 min | ✅ expiry 19:33:56; `/api/ps` empty at 19:34:04 |
+| Timer reset | each request extends expiry | ✅ expiry moved 19:33:44 → 19:33:56 after the second request |
+| Idle baseline | ≈2.3 GB | 2,407 MiB (drift continues) |
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -254,7 +277,7 @@ KV cache (128 MiB at 4,096 context), recurrent state (50 MiB — hybrid architec
 <summary>Answer</summary>
 
 Disk: still ≈3.3 GB plus ≈15 KB — the weights blob is shared (content addressing).
-VRAM: **expected not to be shared** — each loaded model gets its own `llama-server` process with its own copy of the weights, KV cache, and buffers (≈3.8 GB each here), so only two would fit in 10 GB, and Ollama would evict older ones. Like pods from the same image: the image is cached once on the node, but each pod needs its own memory. *Verified or refuted in Step 5.* To serve many "personas" cheaply, use one model and vary the system prompt per request.
+VRAM: **also shared** — this refuted the original prediction (Step 5). When `devops-assistant` was requested while `qwen3.5:4b` was loaded, Ollama started **no new `llama-server`**: it routed the request to the runner that already held the same weights blob and applied the system prompt and parameters per request. So 10 variants of one base model cost one model's VRAM (≈3.8 GB), not ten. System prompt and sampling parameters are request-level config — like a ConfigMap applied per request, not a new pod. *Untested:* variants that change load-time settings (e.g. `num_ctx`) probably cannot share a runner — check in Phase 2.
 
 </details>
 
