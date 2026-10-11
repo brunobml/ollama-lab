@@ -91,7 +91,54 @@ Keep `qwen3.5:4b` — later labs use it. (`ollama rm qwen3.5:4b` removes the man
 
 ## 8. Check Your Understanding
 
-1. Which layer makes this model able to see images, and what does it cost on disk?
-2. Why is the blob's filename equal to the SHA-256 of its content, and what does that give you (two tags sharing a layer, corrupted downloads)?
-3. The params layer sets `temperature 1`. Where would you change it permanently for your own model variant?
-4. `ollama list` says 3.3 GB. Add up the layers — does it match?
+**1. Which layer makes this model able to see images, and what does it cost on disk?**
+
+<details>
+<summary>Answer</summary>
+
+The `application/vnd.ollama.image.projector` layer (`mmproj.gguf`): a CLIP vision encoder with 333.51M parameters, **675,569,120 bytes (≈676 MB)** — about 20% of the download. It converts an image into embeddings (dimension 2560) that the language model reads like tokens. Its VRAM cost is measured in Step 3.
+
+</details>
+
+**2. Why is the blob's filename equal to the SHA-256 of its content, and what does that give you?**
+
+<details>
+<summary>Answer</summary>
+
+It's **content addressing**, the same model as OCI registries:
+
+* **Integrity:** recompute the hash; if it doesn't match the name, the blob is corrupt. A broken download can't silently be used.
+* **Deduplication:** two tags that share a layer (e.g. your custom model built `FROM qwen3.5:4b`) point to the same blob — stored once.
+* **Immutability:** a blob can never change. Tags are mutable pointers (manifests); blobs are not. Re-pulling a tag only downloads blobs you don't have.
+
+</details>
+
+**3. The params layer sets `temperature 1`. Where would you change it permanently for your own model variant?**
+
+<details>
+<summary>Answer</summary>
+
+In a **Modelfile**, then build a new model:
+
+```text
+FROM qwen3.5:4b
+PARAMETER temperature 0.7
+```
+
+`ollama create devops-assistant -f Modelfile` writes a new manifest with a new params layer but **reuses the 2.65 GB weights blob** — near-zero extra disk, like a Dockerfile that only adds a config layer. Per-request overrides (API `options`, `/set parameter` in `ollama run`) are temporary.
+
+</details>
+
+**4. `ollama list` says 3.3 GB. Add up the layers — does it match?**
+
+<details>
+<summary>Answer</summary>
+
+All 8 blobs total **3,324,175,492 bytes** — almost all of it the two GGUF files (2,648,593,216 + 675,569,120).
+
+* In decimal GB (1000³): **3.32 GB** → matches `ollama list`.
+* In binary GiB (1024³): **3.10 GiB**.
+
+So `ollama list` reports **decimal GB**, while `nvidia-smi` reports **MiB**. Convert before comparing a model's size with free VRAM.
+
+</details>

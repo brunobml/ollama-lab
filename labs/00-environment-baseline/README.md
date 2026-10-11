@@ -92,7 +92,46 @@ Nothing to clean up — this lab is read-only.
 
 ## 8. Check Your Understanding
 
-1. `ollama list` and `ollama ps` are both empty. What does each tell you, and what is the Kubernetes equivalent of each?
-2. Why can't WSL2 reach this API, and why is that a safe default?
-3. Ollama reports 8.9 GiB available while `nvidia-smi` shows ≈1.6 GB used of 10 GB. Where does the difference come from?
-4. If a teammate says "Ollama is slow", which two commands from this lab would you run first, and why?
+**1. `ollama list` and `ollama ps` are both empty. What does each tell you, and what is the Kubernetes equivalent of each?**
+
+<details>
+<summary>Answer</summary>
+
+`ollama list` shows models **stored on disk** — like images cached on a node (`crictl images`).
+`ollama ps` shows models **loaded in memory** and consuming VRAM/RAM — like running pods (`kubectl get pods`).
+A model can be on disk without being loaded; that is the normal idle state.
+
+</details>
+
+**2. Why can't WSL2 reach this API, and why is that a safe default?**
+
+<details>
+<summary>Answer</summary>
+
+Ollama binds `127.0.0.1:11434`. WSL2 in NAT mode has its own network namespace, so its `localhost` is its own loopback, and the Windows host IP (`172.25.96.1`) has no listener because Ollama isn't bound there.
+It's safe because the Ollama API has **no authentication** — anyone who can reach the port can run models, pull models, or delete them. Binding to loopback is the equivalent of a `ClusterIP` Service with no Ingress.
+
+</details>
+
+**3. Ollama reports 8.9 GiB available while `nvidia-smi` shows ≈1.6 GB used of 10 GB. Where does the difference come from?**
+
+<details>
+<summary>Answer</summary>
+
+* **Timing:** `available="8.9 GiB"` was logged once at server start; `nvidia-smi` is a live reading. Desktop apps (browser, Parsec, virtual displays) allocate and free VRAM continuously — this lab saw idle usage move from 1,647 MiB to 2,284 MiB in a few hours.
+* **Units:** GiB (1024³) vs MiB vs GB (1000³) make similar numbers look different.
+* **Lesson:** treat Ollama's startup figure like a node's allocatable capacity — a scheduling input, not live truth. Check free VRAM right before each experiment.
+
+</details>
+
+**4. If a teammate says "Ollama is slow", which two commands from this lab would you run first, and why?**
+
+<details>
+<summary>Answer</summary>
+
+1. `ollama ps` — is the model loaded, and is `PROCESSOR` `100% GPU`? A CPU/GPU split is the most common cause of slow generation.
+2. `nvidia-smi` (or `scripts/check-vram.ps1`) — is free VRAM low because something else is using the GPU?
+
+Then check `server.log` for `library=cpu` (GPU not detected) and, for API clients, whether they use `localhost` instead of `127.0.0.1` (the ≈2 s IPv6 fallback found in this lab).
+
+</details>
