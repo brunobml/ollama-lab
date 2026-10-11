@@ -75,7 +75,7 @@ Sizes are download sizes from the ollama.com library (checked 2026-10-10). VRAM 
 
 | Model | Download | Max Context | Input | Phase(s) | Purpose |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`qwen3.5:4b`** | 3.3–4.0 GB | 256K | text + image | 1–7 | **First model.** Fast baseline, fully on GPU, also covers vision. Tools/thinking: verify |
+| **`qwen3.5:4b`** | 3.3 GB (Q4_K_M, pulled) | 256K | text + image | 1–7 | **First model.** Verified via `ollama show`: 4.2B params, completion, vision, tools, thinking (on by default) |
 | `qwen3.5:9b` | 6.6–7.6 GB | 256K | text + image | 2, 3, 6 | Same family, larger: clean size comparison and CPU-spill experiments |
 | `qwen2.5-coder:7b` | 4.7 GB (Q4_K_M) | 32K | text | 6 | Older code-specialized model; compare against qwen3.5 for DevOps code tasks |
 | Embedding model (e.g. `nomic-embed-text`) | verify | verify | text | 5 | Embeddings for RAG — confirm availability and size before Phase 5 |
