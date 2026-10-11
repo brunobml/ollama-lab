@@ -58,6 +58,20 @@ Calls `POST /api/generate` directly so every run does identical work: thinking o
 .\scripts\bench.ps1 -Model qwen3.5:9b
 ```
 
+### Step 3 — Context size vs VRAM and speed
+
+Same ≈3,000-token prompt every run; only `num_ctx` changes. **Run the two sweeps one after the other, never concurrently.**
+
+```powershell
+ollama stop qwen3.5:4b; ollama stop qwen3.5:9b
+.\scripts\bench.ps1 -Model qwen3.5:4b -LogLines 120 -NumCtx 4096,8192,16384,32768,65536
+ollama stop qwen3.5:4b
+.\scripts\bench.ps1 -Model qwen3.5:9b -LogLines 120 -NumCtx 4096,8192,16384,32768,65536
+ollama stop qwen3.5:9b
+```
+
+**Accidental experiment — concurrent sweeps (19:58):** both sweeps were started at the same time in separate terminals. The scheduler logged `llama-server model predicted to exceed available memory, evicting` before nearly every request and reloaded the other model each time; every request took ≈18.8 s. The log still confirmed the KV cache sizes: **1,024 MiB at 32K and 2,048 MiB at 64K** (exactly 128 MiB × 8 and × 16). Ollama's predicted need for the 9b at 64K was "13.2 GiB" vs ≈8.2 GiB from its own buffer breakdown — unexplained; check in the isolated run.
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 results (2026-10-10)
@@ -93,6 +107,8 @@ KV cache is identical: its size depends on attention-layer count × KV heads × 
 |---|---|---|
 | Load takes tens of seconds | Security scan of model blobs | Defender CPU during load |
 | `ollama ps` shows CPU/GPU split | Not enough free VRAM | `check-vram.ps1` before loading |
+| Every request takes ≈19 s; constant `starting llama-server` | Two models that don't fit together are requested concurrently → scheduler evicts and reloads on each request (thrashing) | `server.log`: `predicted to exceed available memory, evicting`. Run one model at a time, or use one model for all clients |
+| `ParserError: An empty pipe element is not allowed` | A `foreach (...) {}` statement piped directly | Assign to a variable first: `$r = foreach (...) {...}; $r \| Format-Table` |
 
 ## 7. Cleanup
 
