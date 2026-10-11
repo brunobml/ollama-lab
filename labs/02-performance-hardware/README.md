@@ -120,6 +120,24 @@ ollama stop qwen3.5:4b
 ollama stop qwen3.5:4b
 ```
 
+### Step 4 results (qwen3.5:4b, ctx 8,192, ≈1,297-token prompt, 128 generated)
+
+| GPU layers | GPU share | Gen predicted | **Gen measured** (tok/s) | % of full | Prompt (tok/s) | TTFT (prompt only) | VRAM MiB |
+|---|---|---|---|---|---|---|---|
+| 33 | 100% | ≈117 | **121.7 / 124.1** | 100% | 3,773 / 4,641 | ≈0.3 s | 5,405 |
+| 24 | 73% | ≈25 | **24.0 / 22.8** | 19% | 2,373 / 2,219 | ≈0.6 s | 3,920 |
+| 16 | 48% | ≈15 | **13.4 / 12.5** | 11% | 1,796 / 1,503 | ≈0.8 s | 3,321 |
+| 8 | 24% | ≈10 | **8.1 / 7.7** | 6% | 1,334 / 1,169 | ≈1.0 s | 2,770 |
+| 0 | 0% | 6–10 | **6.8 / 7.0** | 6% | **76 / 76** | **≈17 s** | 1,300 (= idle baseline) |
+
+**Generation follows a serial model:** time per token ≈ (CPU layer share × 145 ms) + (GPU layer share × 8.1 ms). Predicted 22.0 / 12.7 / 8.9 tok/s for 24 / 16 / 8 layers vs measured 23.4 / 13.0 / 7.9. Moving 27% of layers to the CPU cost 81% of the speed. CPU-only ≈ 3 GB per token at ≈21 GB/s effective (≈55% of DDR4-2400 dual-channel theoretical).
+
+**Prompt processing degrades gently** (8/33 layers on GPU is still 16× faster than CPU-only). Likely cause, not yet verified: for large batches llama.cpp copies CPU-resident weights over PCIe and runs the matrix math on the GPU ("op offload", disabled by `--no-op-offload`); for one-token generation the copy isn't worth it. Check in Phase 9.
+
+**VRAM:** the first 9 layers removed freed 1,485 MiB, later groups of 8 only ≈570 MiB — likely the large output (vocabulary) layer leaves first. Unconfirmed.
+
+**Takeaways:** a smaller model at 100% GPU beats a larger partially-offloaded one; CPU-only is usable for short prompts but not for long inputs (RAG, logs); a CPU-only inference pod is ≈18× slower generating and ≈55× slower on prompts than a GPU pod.
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 results (2026-10-10)
@@ -224,5 +242,23 @@ Llama 3 8B: every one of 32 layers is full attention → 2 (K,V) × 32 layers ×
 <summary>Answer</summary>
 
 No. Idle VRAM drifted between ≈1.3 and ≈2.4 GB during this lab; on a busier desktop the same config spills to CPU or fails. It's like setting a pod's memory limit to the node's free memory measured at one moment. A safe default leaves margin (e.g. 9b at 32K ≈ 7.4 GB of model allocation, or 4b at 64K), and you raise it deliberately when needed.
+
+</details>
+
+**8. With 73% of layers on the GPU, why do you get only 19% of full generation speed?**
+
+<details>
+<summary>Answer</summary>
+
+Each token passes through all layers in sequence, so per-token time is the **sum** of GPU-layer time and CPU-layer time. CPU layers are ≈18× slower (RAM ≈38 GB/s vs VRAM ≈760 GB/s), so even a small CPU share dominates: 0.27 × 145 ms + 0.73 × 8.1 ms ≈ 45 ms per token ≈ 22 tok/s. It's like a request path through several services — the slowest hop sets the latency, not the average.
+
+</details>
+
+**9. A 14B model would fit 70% on this GPU; the 9b fits 100%. Which would you choose for an interactive assistant, and when might the other choice win?**
+
+<details>
+<summary>Answer</summary>
+
+Interactive: the 9b at 100% GPU (≈85 tok/s) — the partially-offloaded 14B would generate around 20 tok/s. The 14B could win for offline/batch jobs where answer quality matters more than latency, or for prompt-heavy tasks with short outputs, since prompt processing degrades much more gently under partial offload. Measure quality before deciding (Phase 3).
 
 </details>
