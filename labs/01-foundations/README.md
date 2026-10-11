@@ -97,7 +97,8 @@ Select-String "$env:LOCALAPPDATA\Ollama\server.log" -Pattern 'offloaded|buffer s
 | `ollama show` | 4B, Q4_K_M | `qwen35` arch, 4.2B params, Q4_K_M, context 262,144; projector `clip` 333.51M params |
 | Capabilities | tools / thinking to verify | completion, vision, tools, thinking (**on by default**) ✅ |
 | Default sampling (params layer) | — | `temperature 1`, `top_k 20`, `top_p 0.95`, `presence_penalty 1.5` |
-| Cold load duration | several seconds | **not captured yet** — rerun pending |
+| Reload (file in OS cache) | several seconds | **4.02 s** `load duration` (server log: 3.0 s) ✅ |
+| First-ever load | several seconds | **40.7 s** (server log 19:10:43 → 19:11:23) ❗ unexplained — see below |
 | Warm load duration | ≈0 | 28–30 ms ✅ |
 | VRAM when loaded | > 3.3 GB file size | 2,329 → 6,192 MiB = **+3,863 MiB** ✅ |
 | `ollama ps` | `100% GPU`, ctx 4096 | `3.1 GB`, `100% GPU`, `4096`, runner `llamacpp` ✅ |
@@ -123,6 +124,7 @@ CUDA_Host (system RAM)     497 MiB   kept off-GPU (likely token embeddings)
 * **Chat formatting** comes from a built-in Go renderer (`renderer=qwen3.5 parser=qwen3.5`), not the 13-byte template layer.
 * **Ollama starts `llama-server.exe`** (llama.cpp) as a child process pointed at the GGUF blob — the `llamacpp` runner.
 * **Prompt eval 18 tok/s is misleading**: 16 of ~20 tokens were reused from the cache (`prompt eval cached`); tiny prompts are dominated by fixed overhead.
+* **Load time is mostly fixed overhead, not disk:** the store is on a Samsung 990 PRO NVMe (~7 GB/s), so reading 3.3 GB takes well under 1 s. The 4 s reload is process spawn + CUDA init + projector load + warmup. The 40.7 s first load is **unexplained** — hypotheses: Defender scanning the new blob, one-time GPU kernel cache, cold OS cache. Test in Phase 2 with the first load of `qwen3.5:9b`.
 * **Quality (one sample):** Run 3 (no thinking) was factually wrong — readiness failures remove the pod from the Service's EndpointSlice; the kubelet runs the probe but doesn't route traffic. Test properly in Phase 3.
 
 ## 6. Troubleshooting & Failure Modes
