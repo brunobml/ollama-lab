@@ -72,6 +72,40 @@ ollama stop qwen3.5:9b
 
 **Accidental experiment — concurrent sweeps (19:58):** both sweeps were started at the same time in separate terminals. The scheduler logged `llama-server model predicted to exceed available memory, evicting` before nearly every request and reloaded the other model each time; every request took ≈18.8 s. The log still confirmed the KV cache sizes: **1,024 MiB at 32K and 2,048 MiB at 64K** (exactly 128 MiB × 8 and × 16). Ollama's predicted need for the 9b at 64K was "13.2 GiB" vs ≈8.2 GiB from its own buffer breakdown — unexplained; check in the isolated run.
 
+### Step 3 results (isolated sweeps, 2026-10-10)
+
+Raw (2 runs per context; prompt = 120 synthetic log lines ≈ 5,064 tokens):
+
+| Model | Ctx | LoadS (run 1) | PromptTok | PromptTokS | GenTokS | VramMiB | GPU |
+|---|---|---|---|---|---|---|---|
+| 4b | 4,096 | 3.99 | **2,050** | 4,036 / *47,626* | 120.1 / 120.3 | 5,162 | 100% |
+| 4b | 8,192 | 5.04 | 5,063 | 4,908 / 5,186 | 117.0 / 118.6 | 5,372 | 100% |
+| 4b | 16,384 | 5.12 | 5,064 | 4,914 / 5,093 | 117.2 / 114.9 | 5,644 | 100% |
+| 4b | 32,768 | 5.13 | 5,064 | 4,814 / 5,059 | 115.4 / 113.5 | 6,195 | 100% |
+| 4b | 65,536 | 5.34 | 5,064 | 4,569 / 4,664 | 113.5 / 113.9 | 7,170 | 100% |
+| 9b | 4,096 | 6.18 | **2,050** | 3,090 / *36,996* | 84.8 / 84.0 | 7,805 | 100% |
+| 9b | 8,192 | 6.14 | 5,068 | 3,444 / 3,513 | 85.5 / 85.5 | 8,054 | 100% |
+| 9b | 16,384 | 6.09 | 5,069 | 3,323 / 3,422 | 85.2 / 85.2 | 8,207 | 100% |
+| 9b | 32,768 | 6.11 | 5,068 | 3,345 / 3,430 | 85.6 / 85.5 | 8,718 | 100% |
+| 9b | 65,536 | 6.07 | 5,069 | 3,327 / 3,431 | 85.7 / 85.7 | 9,765 | 100% |
+
+| Check | Hypothesis | Observed |
+|---|---|---|
+| Prompt size | ≈3,000 tokens | ❌ ≈5,064 tokens (≈42 tokens per log line) |
+| Truncation at default 4,096 ctx | — | ⚠️ **Silent**: only 2,050 of 5,064 tokens kept, no error. Cut from the **front** — the cache-busting marker was removed, so run 2 hit the prefix cache (impossible 47,626 tok/s) |
+| VRAM growth 4K → 64K | ≈ +1.9 GB (KV 128 → 2,048 MiB) | ✅ 4b +2,008 MiB, 9b +1,960 MiB → **≈32 KiB of KV cache per token** (a standard 8B like Llama 3 8B: 128 KiB/token) |
+| 9b − 4b at 4K | ≈2,590 MiB (Lab 01 estimates) | ✅ 2,643 MiB |
+| 9b fits at 64K | ❌ predicted spill (≈10.8 GB needed) | ✅ fits: 9,765 / 10,240 MiB, 100% GPU, no slowdown. Prediction used a stale 2.4 GB baseline; idle was ≈1.3 GB this time. Only 475 MiB spare — not a safe default |
+| Prompt processing | thousands tok/s; 9b ≈ half of 4b | ✅ 4b ≈5,000 tok/s (TTFT ≈1.0 s for 5K tokens), 9b ≈3,400 tok/s (≈1.5 s); ratio 1.47×, not 1.91× |
+| Generation vs ctx | flat unless spilling | ✅ 9b flat ≈85.5; 4b 117 → 114 (−3%). Both slightly below Step 2 because 5K tokens are now in the context |
+| `num_ctx` change reloads runner | yes | ✅ `LoadS` 4–6 s on run 1 of every context size → variants share a runner only if load-time settings match |
+
+**Takeaways**
+
+* **Set `num_ctx` deliberately.** The default 4,096 silently drops long inputs from the front.
+* On this card, long context is cheap for qwen3.5 (≈2 GB for 64K) thanks to the hybrid architecture.
+* Whether the 9b fits at 64K depends on what else is using the GPU at that moment.
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 results (2026-10-10)
@@ -140,5 +174,41 @@ The 40 s was the NVIDIA driver compiling CUDA kernels on llama-server's first ru
 <summary>Answer</summary>
 
 It generates 2 tokens in ≈15 ms — timer resolution, scheduling jitter, and per-request overhead dominate. Rates need hundreds of tokens per sample, several runs, and fixed settings (`num_predict`, `temperature`, `seed`, thinking off) so models are compared on equal work.
+
+</details>
+
+**4. The 9b has 1.91× the GPU weights of the 4b but generates only 1.38× slower. What does that tell you?**
+
+<details>
+<summary>Answer</summary>
+
+Time per token = fixed overhead + weights ÷ bandwidth. Solving with both models: the *extra* 2.41 GB is read at ≈775 GB/s (the 3080's rated 760 GB/s), and ≈4.8 ms per token is fixed overhead (kernel launches, CPU-side sampling and embeddings, Windows GPU scheduling). For small models the overhead dominates, so shrinking the model gives diminishing speed returns.
+
+</details>
+
+**5. At `num_ctx` 4096 the 5,064-token prompt became 2,050 tokens. How did the "impossible" 47,626 tok/s prove which end was cut?**
+
+<details>
+<summary>Answer</summary>
+
+Each run starts with a unique marker to defeat the prefix cache. Run 2 was served from cache, so the marker must have been gone — i.e. truncation removed the **beginning** of the prompt and both runs kept an identical tail. Lesson: with the default context, long inputs lose their start (often the instructions or the earliest log lines) silently. Set `num_ctx` large enough, and check `prompt_eval_count` against what you sent.
+
+</details>
+
+**6. Why does qwen3.5 need only ≈32 KiB of KV cache per token while Llama 3 8B needs 128 KiB?**
+
+<details>
+<summary>Answer</summary>
+
+Llama 3 8B: every one of 32 layers is full attention → 2 (K,V) × 32 layers × 8 KV heads × 128 dims × 2 bytes = 128 KiB/token. qwen3.5 is hybrid: most layers keep a fixed-size recurrent state (the constant 50 MiB) and only a few full-attention layers store K/V per token. Same context, a quarter of the memory — architecture matters as much as parameter count when sizing VRAM.
+
+</details>
+
+**7. The 9b fit at 64K today, with 475 MiB spare. Should 64K be its default on this machine?**
+
+<details>
+<summary>Answer</summary>
+
+No. Idle VRAM drifted between ≈1.3 and ≈2.4 GB during this lab; on a busier desktop the same config spills to CPU or fails. It's like setting a pod's memory limit to the node's free memory measured at one moment. A safe default leaves margin (e.g. 9b at 32K ≈ 7.4 GB of model allocation, or 4b at 64K), and you raise it deliberately when needed.
 
 </details>

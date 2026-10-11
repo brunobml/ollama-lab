@@ -55,6 +55,12 @@ flowchart LR
 
 Ollama's own `SIZE` estimate was 3.1 GB — plan with measured values.
 
+## Context and truncation
+
+* Default `num_ctx` is 4,096. Longer prompts are **silently truncated from the front** (Lab 02: 5,064 → 2,050 tokens, no error).
+* KV cache is allocated at load for the full `num_ctx`: ≈32 KiB/token for qwen3.5 (hybrid), plus a fixed 50 MiB recurrent state.
+* Changing `num_ctx` starts a new runner (≈4–6 s load).
+
 ## Networking
 
 * Binds `127.0.0.1:11434` (IPv4 only). Use `127.0.0.1`, not `localhost`: Windows resolves `localhost` to `::1` first, costing ≈2 s per request.
@@ -62,6 +68,8 @@ Ollama's own `SIZE` estimate was 3.1 GB — plan with measured values.
 
 ## Not yet verified
 
-* Whether variants with different load-time settings (`num_ctx`) can share a runner (Phase 2).
-* Cause of the 40.7 s first-ever load vs 3–4 s reloads (Phase 2).
-* Scheduler behavior when a second, different model does not fit in VRAM (Phase 2).
+* ~~Whether variants with different `num_ctx` can share a runner~~ — **no**: changing `num_ctx` reloads the runner (Lab 02).
+* ~~Cause of the 40.7 s first-ever load~~ — one-time CUDA kernel compile cached in `%APPDATA%\NVIDIA\ComputeCache` (Lab 02).
+* ~~Scheduler behavior when two models don't fit~~ — evicts and reloads per request (thrashing, Lab 02).
+* Why the scheduler predicted "13.2 GiB" for the 9b at 64K when its buffers total ≈8.2 GiB.
+* Exact truncation rule when a prompt exceeds `num_ctx` (observed: 5,064 → 2,050 tokens at 4,096, cut from the front).
