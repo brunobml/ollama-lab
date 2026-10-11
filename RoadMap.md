@@ -366,5 +366,6 @@ Open decisions (to settle when the phase starts):
 
 | Phase | Status |
 | :--- | :--- |
-| 0 — Environment baseline | In progress (Step 1: API inspection) |
-| 1–9 | Not started |
+| 0 — Environment baseline | Done — baseline recorded, `scripts/check-vram.ps1` built |
+| 1 — Foundations | Next |
+| 2–9 | Not started |

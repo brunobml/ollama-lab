@@ -29,15 +29,15 @@ flowchart LR
 
 ```powershell
 # 1. Health check — like a readiness probe
-Invoke-RestMethod http://localhost:11434/api/version
+Invoke-RestMethod http://127.0.0.1:11434/api/version
 
 # 2. "ollama list" is the same call as GET /api/tags
 ollama list
-Invoke-RestMethod http://localhost:11434/api/tags | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:11434/api/tags | ConvertTo-Json
 
 # 3. Loaded models — "kubectl get pods" vs. "list images"
 ollama ps
-Invoke-RestMethod http://localhost:11434/api/ps | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:11434/api/ps | ConvertTo-Json
 
 # 4. Who is listening, and on which interface?
 Get-NetTCPConnection -LocalPort 11434 -State Listen |
@@ -60,14 +60,21 @@ Write your observed values in the table below.
 
 ## 5. Hypotheses → Observed Metrics
 
-| Check | Hypothesis | Observed |
+| Check | Hypothesis | Observed (2026-10-10) |
 |---|---|---|
-| `/api/version` | `0.40.2` | |
-| `/api/tags` | empty `models` list | |
-| `/api/ps` | empty `models` list | |
-| Listener | `127.0.0.1:11434` only, process `ollama` | |
-| VRAM used (idle) | ≈1.6 GB of 10 GB | |
-| Ollama "available" | ≈8.9 GiB, `library=CUDA` | |
+| `/api/version` | `0.40.2` | `0.40.2` ✅ |
+| `/api/tags` | empty `models` list | 0 models ✅ |
+| `/api/ps` | empty `models` list | 0 models ✅ |
+| Listener | `127.0.0.1:11434` only, process `ollama` | `127.0.0.1:11434`, `ollama` ✅ |
+| VRAM used (idle) | ≈1.6 GB of 10 GB | **2,284 MiB** of 10,240 MiB ❌ (was 1,647 MiB earlier the same day) |
+| Ollama "available" | ≈8.9 GiB, `library=CUDA` | `library=CUDA total="10.0 GiB" available="8.9 GiB"` ✅ |
+
+**Finding:** the idle VRAM baseline is not constant. Other desktop apps take
+GPU memory too, so free VRAM moved from ≈8.4 GB to ≈7.8 GB within hours. The
+`available="8.9 GiB"` line in `server.log` is a snapshot taken when the
+server started, not a live value. The 8,500 MiB working ceiling in
+`RoadMap.md` is only safe when the desktop is quiet, so check free VRAM
+right before every measurement.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -77,6 +84,7 @@ Write your observed values in the table below.
 | `library=cpu` in server.log | GPU not detected | Driver version; `nvidia-smi` |
 | Port in use by another process | Second Ollama (e.g. Docker) | `Get-NetTCPConnection -LocalPort 11434` |
 | WSL2 cannot connect | NAT + localhost bind (expected) | See `docs/environment.md` |
+| Every API call takes ≈2 s | `localhost` resolves to `::1` (IPv6) first; Ollama listens on IPv4 only, so each call waits for the IPv6 attempt to fail | Use `http://127.0.0.1:11434`. Measured: `localhost` 2,103 ms vs `127.0.0.1` 16 ms |
 
 ## 7. Cleanup
 

@@ -56,11 +56,11 @@ Read-only assessment performed on 2026-10-10. Nothing was installed or modified.
 (Get-Command ollama).Source
 Get-Process ollama*
 ollama list; ollama ps
-Invoke-RestMethod http://localhost:11434/api/version
+Invoke-RestMethod http://127.0.0.1:11434/api/version
 Get-NetTCPConnection -LocalPort 11434 -State Listen
 nvidia-smi --query-gpu=name,memory.used,memory.total,driver_version,compute_cap --format=csv
 Select-String "$env:LOCALAPPDATA\Ollama\server.log" -Pattern 'inference compute'
 wsl -l -v
-wsl -d Ubuntu -- curl -s -m 3 http://localhost:11434/api/version
+wsl -d Ubuntu -- curl -s -m 3 http://127.0.0.1:11434/api/version
 docker version; docker info
 ```
