@@ -267,6 +267,7 @@ KV cache is identical: its size depends on attention-layer count × KV heads × 
 | Load takes tens of seconds | Security scan of model blobs | Defender CPU during load |
 | `ollama ps` shows CPU/GPU split | Not enough free VRAM | `check-vram.ps1` before loading |
 | Every request takes ≈19 s; constant `starting llama-server` | Two models that don't fit together are requested concurrently → scheduler evicts and reloads on each request (thrashing) | `server.log`: `predicted to exceed available memory, evicting`. Run one model at a time, or use one model for all clients |
+| First request after a driver update: ≈38 s load + ≈30 s for a tiny prompt | CUDA kernels recompiled for the new driver (2026-10-12: 610.88 → 617.42 at 08:55; 21 files / 70 MB written to `%APPDATA%\NVIDIA\ComputeCache` at 09:13–09:14: 15 during load, 6 during the first prompt). One-time; next load 3.9 s, generation speed unchanged (126 / 124 tok/s) | `nvidia-smi` driver version; ComputeCache file times; `UserPnp` event 20003 in the System log |
 | `ParserError: An empty pipe element is not allowed` | A `foreach (...) {}` statement piped directly | Assign to a variable first: `$r = foreach (...) {...}; $r \| Format-Table` |
 
 ## 7. Cleanup

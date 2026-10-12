@@ -45,7 +45,7 @@ Docker Desktop:     CLI 29.8.1 installed; engine fails: "Docker Desktop is unabl
 CPU:                Intel Core i7-10700K @ 3.80GHz (8 cores, 16 threads)
 System Memory:      64 GB (≈44 GB free at idle)
 GPU:                NVIDIA GeForce RTX 3080, 10,240 MiB, compute capability 8.6
-NVIDIA Driver:      610.88
+NVIDIA Driver:      610.88 (617.42 since 2026-10-12; Phase 2 measured on 610.88, 4b speed re-checked: unchanged)
 Inference Engine:   Ollama v0.40.2, user-level process started by the tray app (not a Windows service)
                     Listening on 127.0.0.1:11434 only
 Ollama GPU detect:  library=CUDA compute=8.6 total="10.0 GiB" available="8.9 GiB" (server.log)
@@ -370,4 +370,5 @@ Open decisions (to settle when the phase starts):
 | 0 — Environment baseline | Done — baseline recorded, `scripts/check-vram.ps1` built |
 | 1 — Foundations | Done — see `labs/01-foundations`, `docs/architecture.md` |
 | 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
-| 3–9 | Not started |
+| 3 — Prompting | In progress — lab set up (thinking on vs off, reproducibility) |
+| 4–9 | Not started |
