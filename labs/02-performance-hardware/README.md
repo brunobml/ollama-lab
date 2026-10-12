@@ -138,6 +138,44 @@ ollama stop qwen3.5:4b
 
 **Takeaways:** a smaller model at 100% GPU beats a larger partially-offloaded one; CPU-only is usable for short prompts but not for long inputs (RAG, logs); a CPU-only inference pod is ≈18× slower generating and ≈55× slower on prompts than a GPU pod.
 
+### Step 5 — Quantization: Q4_K_M vs Q8_0
+
+**Concept.** Quantization stores each weight in fewer bits. Q8_0 uses 8 bits per weight (plus one scale per block of 32 weights). Q4_K_M uses about 4.5–5 bits, mixing 4- and 6-bit blocks ("K-quants"; the M means "medium": a few sensitive tensors keep more bits). Same model and parameter count, different precision. It's like compressing an image: smaller and faster to move around, with some loss of detail. Generation is memory-bandwidth bound (Step 2), so fewer bytes means faster generation. The question is how much quality that costs.
+
+**Verified on this machine (manifests):**
+
+| Tag | Weights blob | Projector blob | Note |
+|---|---|---|---|
+| `qwen3.5:4b` (= `4b-q4_K_M`) | 2,526 MiB | 644 MiB | `ollama show`: Q4_K_M |
+| `qwen3.5:4b-q8_0` | 4,275 MiB (1.69×) | 644 MiB, **same digest** | `ollama show`: Q8_0 |
+
+The vision projector is one shared blob, so the download added ≈4.2 GiB to disk, not the 5.2 GB `ollama list` shows. That's content-addressed storage, like shared container image layers.
+
+**Predictions** (Step 2 model: ≈4.8 ms fixed + GPU weight bytes ÷ ≈775 GB/s):
+
+| Metric | Q4_K_M | Q8_0 predicted |
+|---|---|---|
+| Weights on GPU | 2,515 MiB | ≈4,250 MiB (×1.69) |
+| VRAM total (nvidia-smi) | measured | ≈ +1,750 MiB |
+| Generation | ≈122 tok/s | **≈95 tok/s** (8.2 ms → 10.6 ms per token) |
+| Prompt processing | measured | similar (compute bound, not bandwidth bound) |
+| Quality on short factual questions | — | about the same score; some wording differs |
+
+**Run** (one model at a time, sequentially):
+
+```powershell
+ollama stop qwen3.5:4b
+.\scripts\bench.ps1 -Model qwen3.5:4b      -LogLines 30 -NumPredict 128
+ollama stop qwen3.5:4b
+.\scripts\bench.ps1 -Model qwen3.5:4b-q8_0 -LogLines 30 -NumPredict 128
+.\scripts\quality.ps1 -Models qwen3.5:4b,qwen3.5:4b-q8_0
+ollama stop qwen3.5:4b-q8_0
+```
+
+`scripts/quality.ps1` asks six fixed questions (temperature 0, seed 42, thinking off). It scores each answer with keyword regexes and saves the full answers to `results/raw/quality-<time>.md` (gitignored). `SameText` shows whether Q8_0's answer is word-for-word identical to Q4_K_M's. The `fake-flag` question asks about a kubectl flag that doesn't exist, so it is a hallucination trap. Regex scoring is crude: read the answers file before trusting a score.
+
+`bench.ps1` fix: it now matches the model name exactly. The old wildcard `qwen3.5:4b*` would also have matched `qwen3.5:4b-q8_0`.
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 results (2026-10-10)
@@ -260,5 +298,23 @@ Each token passes through all layers in sequence, so per-token time is the **sum
 <summary>Answer</summary>
 
 Interactive: the 9b at 100% GPU (≈85 tok/s) — the partially-offloaded 14B would generate around 20 tok/s. The 14B could win for offline/batch jobs where answer quality matters more than latency, or for prompt-heavy tasks with short outputs, since prompt processing degrades much more gently under partial offload. Measure quality before deciding (Phase 3).
+
+</details>
+
+**10. Q8_0 has 1.69× the weight bytes of Q4_K_M. Why should generation be less than 1.69× slower?**
+
+<details>
+<summary>Answer</summary>
+
+Per-token time has a fixed part (≈4.8 ms here: kernel launches, sampling, the non-weight work) plus a part that scales with weight bytes read. Only the second part grows 1.69×: 4.8 + 3.4 ms → 4.8 + 5.8 ms, i.e. ≈1.3× slower. Same as a request with fixed connection overhead: doubling the payload doesn't double the latency.
+
+</details>
+
+**11. When would you pick Q8_0 over Q4_K_M on this GPU, and when would you pick a 9b at Q4 over a 4b at Q8?**
+
+<details>
+<summary>Answer</summary>
+
+Q8_0 when it fits with your needed context and you measured a quality gain on your own tasks (e.g. precise code or numbers) worth the speed and VRAM. In general, more parameters at 4-bit beat fewer parameters at 8-bit for similar memory: the 9b Q4 (≈4.8 GiB of weights) is likely a better use of VRAM than the 4b Q8 (≈4.2 GiB). Verify on your own question set rather than trusting the rule of thumb.
 
 </details>

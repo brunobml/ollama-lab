@@ -8,7 +8,7 @@ param(
     [string]$Prompt = 'Explain step by step how the Kubernetes scheduler places a pod on a node.'
 )
 
-# Synthetic pod logs: about 25 tokens per line, so 120 lines is about 3,000 tokens
+# Synthetic pod logs: measured ≈42 tokens per line (Lab 02 step 3)
 $logs = if ($LogLines) {
     (1..$LogLines | ForEach-Object {
         "2026-10-10T12:{0:00}:{1:00}Z pod/api-{2} ns=prod level=INFO msg=`"request served`" latency_ms={3}" -f ($_ % 60), ($_ % 60), ($_ % 7), (Get-Random -Maximum 900)
@@ -30,7 +30,7 @@ $results = foreach ($ctx in $NumCtx) {
         } | ConvertTo-Json -Depth 4
 
         $r  = Invoke-RestMethod http://127.0.0.1:11434/api/generate -Method Post -Body $body -ContentType 'application/json'
-        $ps = (Invoke-RestMethod http://127.0.0.1:11434/api/ps).models | Where-Object name -like "$Model*"
+        $ps = (Invoke-RestMethod http://127.0.0.1:11434/api/ps).models | Where-Object { $_.name -eq $Model -or $_.name -eq "${Model}:latest" }   # exact: a wildcard would also match qwen3.5:4b-q8_0
 
         [pscustomobject]@{
             Model      = $Model
