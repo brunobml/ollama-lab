@@ -368,5 +368,5 @@ Open decisions (to settle when the phase starts):
 | :--- | :--- |
 | 0 — Environment baseline | Done — baseline recorded, `scripts/check-vram.ps1` built |
 | 1 — Foundations | Done — see `labs/01-foundations`, `docs/architecture.md` |
-| 2 — Performance | In progress — steps 1–4 done (load, speed, context, CPU vs GPU); next: quantization |
+| 2 — Performance | In progress — steps 1–5 done (load, speed, context, CPU vs GPU, quantization); next: 9b Q4 vs 4b Q8 quality, Phase 2 wrap-up |
 | 3–9 | Not started |

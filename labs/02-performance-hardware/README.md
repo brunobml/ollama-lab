@@ -176,6 +176,37 @@ ollama stop qwen3.5:4b-q8_0
 
 `bench.ps1` fix: it now matches the model name exactly. The old wildcard `qwen3.5:4b*` would also have matched `qwen3.5:4b-q8_0`.
 
+### Step 5 results (2026-10-12, ctx 4,096, ≈1,300-token prompt, 128 generated)
+
+| Metric | Q4_K_M | Q8_0 predicted | **Q8_0 measured** |
+|---|---|---|---|
+| VRAM (nvidia-smi) | 5,412 MiB | +≈1,750 | **7,160 MiB (+1,748)** ✅ |
+| Generation | 125.5 / 124.3 tok/s | ≈95 | **96.2 / 97.0 / 95.5 / 95.9** ✅ |
+| Per token | 8.0 ms | 10.6 ms | **10.4 ms** |
+| Prompt (cold / warm) | 3,476 / 4,543 tok/s | similar | 4,097 / 4,686 (and 4,097 / 4,611) ✅ |
+| Load | 5.3 s | — | 6.1 s / 4.1 s (disk cache noise) |
+
+**The bandwidth model holds.** Q8_0 adds 2.4 ms per token for 1,748 MiB (1.83 GB) of extra weights → ≈767 GB/s, the same ≈775 GB/s derived from 4b vs 9b in Step 2. Twice the bits, 1.69× the bytes, only 1.30× slower, because ≈4.6 ms per token is fixed overhead.
+
+**Prompt processing was not slower; Q8_0 was slightly faster in both runs.** Prompt processing is compute bound, and Q8_0 blocks are simpler to unpack than K-quants. Only 2 samples per model, so treat this as a hint, not a result.
+
+**Quality (`quality.ps1`, thinking off, temperature 0, seed 42):**
+
+| Question | Q4_K_M | Q8_0 | Reading the answers |
+|---|---|---|---|
+| probe-defaults | 2/2 | 2/2 | Both correct, word-for-word identical |
+| readiness-vs-liveness | 1/3 | 1/3 | Both right about restarts, both name the wrong component (Q4 "CoreDNS", Q8 "the scheduler"); neither mentions Endpoints |
+| helm-state | 0/2 | 0/2 | Q4 invents `/var/lib/helm/releases` and a `--home` flag (Helm 2). Q8 also starts wrong (`$HOME/.helm`) but then says releases are stored **in the cluster**: closest to the real answer (Secrets in the release namespace) |
+| argocd-selfheal | 2/2 | 2/2 | Both correct |
+| sched-math | 2/3 | 2/3 | Both open with **"Yes"**, do the math correctly, then conclude **"cannot"**. The 2/3 is a scoring bug: `3500\text{m}` (LaTeX) didn't match `3500m`. Fixed in the script |
+| fake-flag | 0/1 | 0/1 | Both confidently explain the non-existent `--auto-heal` flag |
+
+* **Quantization changed the wording (5 of 6 answers differ) but not the facts.** Every error appears in both versions. The mistakes come from what a 4B model knows, not from 4-bit rounding. Extra precision doesn't add knowledge.
+* **"Yes … cannot":** with thinking off, the model commits to an answer in its first token, before doing the arithmetic. Neither precision fixed this. Thinking mode should, and that's a Phase 3 topic.
+* **The regex score hid both the contradiction and the LaTeX miss.** Automated scoring needs reading the answers, especially at 6 questions.
+
+**Takeaway:** on this GPU and for this model size, Q8_0 costs 1.75 GiB of VRAM and 23% of generation speed for no measurable quality gain on this question set. Q4_K_M stays the default. Better use of ≈4–5 GiB of weights: more parameters (9b Q4), to be tested with the same question set.
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 results (2026-10-10)

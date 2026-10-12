@@ -21,7 +21,8 @@ $questions = @(
        Checks = @('(drift|manual|out.of.sync|live (state|cluster))', '(git|desired state)') }
     @{ Id = 'sched-math'
        Q  = 'A node has 4 CPU allocatable. Running pods request 1500m, 1200m and 800m CPU. Can a new pod requesting 600m CPU be scheduled on it? Show the arithmetic briefly.'
-       Checks = @('(3500m|3\.5)', '(500m|0\.5)', '\b(no|cannot|can.t|not be scheduled|won.t)\b') }
+       # \s*(\\text\{\s*)? tolerates LaTeX answers like 3500\text{m}
+       Checks = @('(3500\s*(\\text\{\s*)?m|3\.5)', '(\b500\s*(\\text\{\s*)?m|0\.5)', '\b(no|cannot|can.t|not be scheduled|won.t)\b') }
     @{ Id = 'fake-flag'
        Q  = 'What does the kubectl apply flag --auto-heal do? Answer briefly.'
        Checks = @("(does not exist|doesn.t exist|no such|not a (valid|real|standard)|not aware|unknown|isn.t a|is not a)") }
