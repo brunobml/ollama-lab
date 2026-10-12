@@ -61,11 +61,12 @@ Total GPU memory used by a loaded model is approximately:
 $$\text{VRAM}_{\text{total}} \approx \text{VRAM}_{\text{weights}} + \text{VRAM}_{\text{KV\_cache}}(N_{ctx}) + \text{VRAM}_{\text{compute\_buffers}} + \text{VRAM}_{\text{OS\_reserved}} \le 10\,240\text{ MiB}$$
 
 * **Working ceiling:** **$\le 8{,}500\text{ MiB}$** for Ollama allocations (outside deliberate overflow experiments).
-* **Operating margin:** ≈1,500–1,700 MiB is already used by the Windows desktop at idle.
-* **Rules of thumb (to be replaced by measured values in Phase 2):**
-  * **~4B models (Q4_K_M):** comfortably 100% GPU with room for larger contexts.
-  * **7B–9B models (Q4_K_M):** 100% GPU at modest context; spill to CPU as context grows.
-  * **14B+ models:** partial CPU offload on this card; markedly lower tokens/second.
+* **Operating margin:** ≈1,300–2,400 MiB is already used by the Windows desktop at idle (measured; it varies).
+* **Measured in Phase 2** (details and formulas: `docs/vram-calculator.md`):
+  * **qwen3.5:4b Q4_K_M:** ≈3,860 MiB at 4K context, ≈5,870 MiB at 64K; ≈120 tok/s.
+  * **qwen3.5:9b Q4_K_M:** ≈6,450 MiB at 4K, ≈8,410 MiB at 64K (fits, but with only ≈475 MiB spare); ≈85 tok/s.
+  * **KV cache:** 32 KiB per token for qwen3.5 (hybrid); a full-attention 8B like Llama 3 needs 128 KiB.
+  * **Partial CPU offload:** 27% of layers on the CPU cost ≈80% of generation speed.
 
 ---
 
@@ -368,5 +369,5 @@ Open decisions (to settle when the phase starts):
 | :--- | :--- |
 | 0 — Environment baseline | Done — baseline recorded, `scripts/check-vram.ps1` built |
 | 1 — Foundations | Done — see `labs/01-foundations`, `docs/architecture.md` |
-| 2 — Performance | In progress — steps 1–5 done (load, speed, context, CPU vs GPU, quantization, 4b Q8 vs 9b Q4); next: Phase 2 wrap-up (vram-calculator.md) |
+| 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
 | 3–9 | Not started |

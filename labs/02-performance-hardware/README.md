@@ -271,7 +271,11 @@ KV cache is identical: its size depends on attention-layer count × KV heads × 
 
 ## 7. Cleanup
 
-`ollama stop qwen3.5:9b`. Keep both models for later steps.
+`ollama stop qwen3.5:9b`. Keep `qwen3.5:4b` and `qwen3.5:9b` for later phases.
+
+Removed on 2026-10-12: `qwen3.5:4b-q8_0` (Step 5 done; freed ≈4.2 GiB, the shared projector blob stayed) and `devops-assistant` (rebuild with `ollama create devops-assistant -f labs/01-foundations/Modelfile`). Model store: 14 GiB → 9.2 GiB.
+
+The measured sizing and speed numbers from this lab are summarized in [`docs/vram-calculator.md`](../../docs/vram-calculator.md).
 
 ## 8. Check Your Understanding
 
