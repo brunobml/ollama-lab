@@ -207,6 +207,30 @@ ollama stop qwen3.5:4b-q8_0
 
 **Takeaway:** on this GPU and for this model size, Q8_0 costs 1.75 GiB of VRAM and 23% of generation speed for no measurable quality gain on this question set. Q4_K_M stays the default. Better use of ≈4–5 GiB of weights: more parameters (9b Q4), to be tested with the same question set.
 
+### Step 5b — More bits or more parameters? 4b Q8_0 vs 9b Q4_K_M (2026-10-12)
+
+Similar memory: 4b Q8_0 ≈ 5.6 GiB of model allocation, 9b Q4_K_M ≈ 6.4 GiB (both at ctx 4,096).
+
+```powershell
+.\scripts\quality.ps1 -Models qwen3.5:4b,qwen3.5:4b-q8_0,qwen3.5:9b
+```
+
+| Question | 4b Q4 | 4b Q8 | 9b Q4 (score) | 9b answer, read by hand |
+|---|---|---|---|---|
+| probe-defaults | ✅ | ✅ | 0/2 | ❌ **New error:** claims readiness probes have no defaults and don't run unless configured. The 4b got this right |
+| readiness-vs-liveness | partial | partial | 3/3 | ✅ Endpoints, no restart, restart per `restartPolicy` |
+| helm-state | ❌ | ❌ | 2/2 | ⚠️ Main point right (stored in the cluster, Secrets, `helm.sh/release.v1`), but details are wrong: "ConfigMap and Secret… in `kube-system`" was Helm 2 behavior. Helm 3 uses Secrets in the release's namespace. The score over-credits it |
+| argocd-selfheal | ✅ | ✅ | 2/2 | ✅ |
+| sched-math | "Yes… cannot" | "Yes… cannot" | 3/3 | ✅ Says "No" first, then shows the math |
+| fake-flag | ❌ invents it | ❌ invents it | 1/1 | ✅ Says the flag doesn't exist (its side remark that `--prune` belongs to `kubectl delete` is wrong; it's an `apply` flag) |
+
+Generation: 9b 73–88 tok/s in this run vs 4b Q8 90–96. The 9b got slower question by question (88 → 73), below Step 2's steady ≈85.5. Not investigated; possible causes are GPU clocks/temperature or other desktop GPU use.
+
+* **More parameters beat more bits.** For about 15% more memory, the 9b fixed 4 of the 5 weak answers, including the hallucination trap and the "Yes… cannot" contradiction. Q8_0 fixed none.
+* **Bigger is not uniformly better.** The 9b got one question wrong that both 4b versions answered correctly. Check models against a question set; don't assume an ordering.
+* **The regex scores are unreliable in both directions.** 4b sched-math now scores 3/3 with the contradiction still there. 9b helm-state scores 2/2 with wrong details. Six questions plus keyword checks are a smoke test, not an evaluation (Phase 3 / evaluation topics).
+* **Reproducibility preview:** the 4b answers were word-for-word identical to the 08:45 run (temperature 0, seed 42, same settings). Only the score changed, because of the regex fix. Phase 3 will test what breaks this.
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 results (2026-10-10)
