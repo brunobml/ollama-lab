@@ -10,9 +10,9 @@ Read-only assessment performed on 2026-10-10. Nothing was installed or modified.
 | CPU | Intel Core i7-10700K @ 3.80GHz, 8 cores / 16 threads |
 | RAM | 64 GB total, ≈44.5 GB free at idle |
 | GPU | NVIDIA GeForce RTX 3080, 10,240 MiB, compute capability 8.6 |
-| NVIDIA driver | 610.88 at baseline; **617.42 since 2026-10-12 08:55** (installed automatically; see Lab 02 troubleshooting). Ollama requires ≥ 550 for this GPU — OK |
+| NVIDIA driver | 610.88 at baseline; 617.42 from 2026-10-12 08:55 (installed automatically; see Lab 02 troubleshooting); **591.86 by 2026-10-22**: deliberate rollback by the user after a known NVIDIA issue with the newer driver. Ollama requires ≥ 550 for this GPU — OK |
 | VRAM in use at idle | ≈1,647 MiB (desktop + virtual display adapters) |
-| Ollama | 0.40.2, `%LOCALAPPDATA%\Programs\Ollama\ollama.exe` |
+| Ollama | 0.40.2 at baseline (Phases 0–2 measured on it); **0.40.5 by 2026-10-22** (upgraded between sessions). `%LOCALAPPDATA%\Programs\Ollama\ollama.exe` |
 | Ollama processes | `ollama app` (tray app, supervises) + `ollama` (server) |
 | Ollama listener | `127.0.0.1:11434` only |
 | `OLLAMA_*` env vars | none set (all defaults) |
