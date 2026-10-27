@@ -19,7 +19,7 @@ A model generates text **one token at a time**. At each step it computes a proba
 
 * Lab 02 complete; `qwen3.5:4b` (and `qwen3.5:9b` for optional comparisons).
 * VRAM: 4b at 8,192 context ≈ 4.0 GB of model allocation (`docs/vram-calculator.md`). One model at a time.
-* Scripts: `scripts/quality.ps1` (now with `-Think`, `-NumCtx` and a **Wrong** column), `scripts/repro.ps1`, `scripts/rescore.ps1` (re-applies the current `quality.ps1` patterns to saved answers, offline), `scripts/chat-template.ps1` and `scripts/system-prompt.ps1` (Step 3), `scripts/sampling-loop.ps1` and `scripts/sampling.ps1` (Step 4).
+* Scripts: `scripts/quality.ps1` (now with `-Think`, `-NumCtx` and a **Wrong** column), `scripts/repro.ps1`, `scripts/rescore.ps1` (re-applies the current `quality.ps1` patterns to saved answers, offline), `scripts/chat-template.ps1` and `scripts/system-prompt.ps1` (Step 3), `scripts/sampling-loop.ps1` and `scripts/sampling.ps1` (Step 4), `scripts/context-overflow.ps1` and `scripts/chat-overflow.ps1` (Step 5).
 
 ## 3. Architecture
 
@@ -256,9 +256,67 @@ ollama stop qwen3.5:4b
 
 The point of 4b: **temperature controls how adventurous the picks are; the filters decide what's too unlikely to pick at all.** The useful combination is "creative where the model is unsure, deterministic where it's sure". That's what min-p is designed for.
 
+### Step 5 — Context overflow: what does the model actually see?
+
+`num_ctx` is a hard limit: the KV cache is allocated for exactly that many tokens at load time (Lab 02). Everything the model works with, including the prompt, the chat history and its own answer so far, must fit. When it doesn't, something gets dropped, and the API doesn't return an error. This step finds out **what** is dropped, **where**, and whether you can tell from the response.
+
+Analogy: a fixed-size ring buffer, like `kubectl logs --tail`. You get the most recent part and nothing tells you how much was lost, except a counter if you know where to look (here: `prompt_eval_count`).
+
+**What we know so far:**
+* Lab 02: a 5,064-token prompt at `num_ctx 4096` was processed as **2,050** tokens, cut from the front, with no error.
+* `server.log` shows llama-server started with `--context-shift --keep 4`.
+* That fits one rule exactly: **keep the first 4 tokens + the last half of the context**: 4 + (4,096 − 4) / 2 = 2,050. Leaving half the context free gives the answer room to be generated. Hypothesis only, from one data point.
+* The API docs (checked 2026-10-27) say nothing about overflow for `/api/generate` or `/api/chat`: no `truncate` or `shift` field, no error. Only `/api/embed` documents truncation.
+
+#### Step 5a — One long prompt
+
+`context-overflow.ps1` builds a prompt with a **fact at the top** ("The cluster name is blue-falcon"), numbered log lines (`L0001`, `L0002`, …), and a **question at the end** ("What is the cluster name, and what is the first log line number you can see?"). It first counts the real token size of each prompt at `num_ctx 16384`, then sends it at the test context size.
+
+* **Part 1, prompt overflow:** 50, 120 and 250 lines at `num_ctx 4096`; 120 lines at 8192.
+* **Part 2, `truncate: false`:** this field isn't in the docs. Does Ollama return an error instead of truncating, or silently ignore it (like `bogus_option` in Step 4)?
+* **Part 3, generation overflow:** the prompt fits (≈3,000 tokens), but asking it to copy every line back needs more than the ≈1,000 tokens left. Run with the default, and with `shift: false` (also undocumented).
+
+```powershell
+.\scripts\context-overflow.ps1      # ≈11 requests, two reloads (16K, 4K, 8K, 4K); ≈2–3 minutes
+```
+
+**Predictions:**
+
+| Case | KeptTok | Answer | Why |
+|---|---|---|---|
+| 50 lines, 4096 | = SentTok | cluster=blue-falcon first=L0001 | Fits |
+| 120 lines, 4096 | **2,050** | cluster **wrong or invented**, first = a line far from L0001 | Front cut: the fact at the top is gone. The 4 kept tokens are the template start (`<\|im_start\|>user` …), not the fact |
+| 250 lines, 4096 | **2,050** again | first line even further down | The kept size depends on `num_ctx`, not on the input |
+| 120 lines, 8192 | = SentTok | correct | Fits again |
+| truncate=false | **unknown** | error, or same as 120 lines | Undocumented |
+| Generation, default | **unknown**: Total > 4,096? | | `--context-shift` should drop old tokens and keep generating |
+| Generation, shift=false | **unknown**: stops at the limit? | | Undocumented |
+
+Also check: does `server.log` say anything when it truncates? Each part prints new log lines that mention truncation or shift.
+
+#### Step 5b — One long chat
+
+`chat-overflow.ps1` builds a conversation that grows past the context **one message at a time**: a system message with a fact (rotation code `ORCA-7`), a first user turn with another fact (ticket `INC-4821`), 12 turns of log batches, then a question asking for both facts and the lowest batch number still visible. It's sent once at `num_ctx 16384` (fits) and once at 4096.
+
+```powershell
+.\scripts\chat-overflow.ps1         # 2 requests, ≈30 s
+ollama stop qwen3.5:4b
+```
+
+Two competing hypotheses:
+
+| | A: whole messages dropped | B: same as one long prompt |
+|---|---|---|
+| Mechanism | `/api/chat` removes the **oldest messages** until the rest fits, keeping the system message and the latest one | The chat is flattened to one prompt (Step 3), then cut from the front |
+| PromptTok at 4096 | close to 4,096 | 2,050 |
+| code (system) | **ORCA-7** remembered | lost |
+| ticket (turn 1) | lost | lost |
+| lowest batch | a middle batch | a later batch |
+
+My guess is **A**, from memory of Ollama's source (it trims chat history at message boundaries and keeps system messages). That's not verified and not documented, so the run decides. Under A the system message is safe; under B, a long chat silently loses its instructions, which matters for every assistant built on `/api/chat`.
+
 ### Later steps
 
-* Step 5 — Context overflow: what the model actually sees when input exceeds `num_ctx` (Lab 02 showed the front is cut; `server.log` showed `--context-shift --keep 4`).
 * Step 6 — Hallucination patterns and how to reduce them (grounding with provided context).
 
 ## 5. Hypotheses → Observed Metrics
