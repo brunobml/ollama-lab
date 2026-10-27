@@ -224,6 +224,8 @@ ollama create qwen3.5:4b-ctx8k -f labs\04-apis-structured-output\Modelfile.ctx8k
 
 This downloads nothing. It writes a small manifest that reuses the existing weights (the same blobs, Lab 01), plus a parameter layer with `num_ctx 8192`. Remove it with `ollama rm qwen3.5:4b-ctx8k` (the weights stay, because `qwen3.5:4b` still uses them). Like a Helm values override: the same chart, a different default. Without it, Part 3 skips that case.
 
+Created 2026-10-27 (approved). Verified on disk: only two new blobs, the params layer (80 B, `num_ctx 8192`) and the manifest (1,128 B). The other four layers (weights 2.65 GB, projector, template, license) and the config blob have the same digests as `qwen3.5:4b`. `ollama list` still shows 3.3 GB for each model; that is the logical size, not extra disk. New observation: Ollama 0.40.10 wrote the manifest to `models\manifests-v2\ollama.com\library\qwen3.5\4b-ctx8k`, not to the old `manifests\registry.ollama.ai\…` tree that holds the pulled models.
+
 ```powershell
 .\.venv\Scripts\python scripts\openai_compat.py      # ≈1 minute; unloads at the end
 ```
