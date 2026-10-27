@@ -46,7 +46,9 @@ $part1 = foreach ($c in $cases) {
         Case       = $c.Name
         ChatTok    = $chat.prompt_eval_count
         RawTok     = $raw.prompt_eval_count
-        SameAnswer = $chat.message.content.Trim() -eq $raw.response.Trim()   # think on: expected False, raw keeps the thinking text inline
+        SameAnswer = $chat.message.content.Trim() -eq $raw.response.Trim()   # think on: False, raw keeps the thinking text inline
+        # think on: does chat's separate `thinking` field hold the same text raw returns inline?
+        SameThink  = if ($c.Think) { $raw.response.Trim().StartsWith("$($chat.message.thinking)".Trim()) } else { '' }
         ChatAnswer = ($chat.message.content -replace '\s+', ' ').Substring(0, [math]::Min(50, $chat.message.content.Length))
     }
 }
