@@ -379,5 +379,5 @@ Open decisions (to settle when the phase starts):
 | 0 — Environment baseline | Done — baseline recorded, `scripts/check-vram.ps1` built |
 | 1 — Foundations | Done — see `labs/01-foundations`, `docs/architecture.md` |
 | 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
-| 3 — Prompting | In progress — lab set up (thinking on vs off, reproducibility) |
+| 3 — Prompting | In progress — Steps 1–2 done (thinking on vs off, reproducibility); Steps 3–6 next |
 | 4–9 | Not started |

@@ -14,19 +14,19 @@ $questions = @(
     @{ Id = 'probe-defaults'
        Q  = 'In Kubernetes, what are the default periodSeconds and failureThreshold of a readinessProbe? Answer briefly.'
        Checks = @('periodSeconds\D{0,40}\b10\b', 'failureThreshold\D{0,40}\b3\b')
-       Wrong  = @('(does|do)\W+not\W+(define|have|set)', "doesn.t\W+(define|have|set)", 'no default') }   # \W+ skips Markdown like **not**
+       Wrong  = @('(does|do)\W+not\W+(define|have|set)', "doesn.t\W+(define|have|set)", 'no default', 'has\W+no\W+`?(periodSeconds|failureThreshold|default)', '\bnull\b') }   # \W+ skips Markdown like **not**
     @{ Id = 'readiness-vs-liveness'
        Q  = 'What happens to a Pod when its readinessProbe fails, and how does that differ from a failing livenessProbe? Answer briefly.'
-       Checks = @('endpoint', "(not|n't|never|without) (be )?restart", 'liveness[^.]*restart')
+       Checks = @('endpoint', "((not|n't|never|without) (be )?restart|(keeps?|continues|remains|stays)[^.]{0,30}running)", 'liveness[^.]*restart')
        Wrong  = @('CoreDNS', 'scheduler stops') }
     @{ Id = 'helm-state'
        Q  = 'Where does Helm 3 store release information by default? Answer briefly.'
        Checks = @('secret', 'namespace')
-       Wrong  = @('kube-system', 'ConfigMap', '/var/lib/helm', '\.helm[/\\]') }
+       Wrong  = @('kube-system', 'ConfigMap', '/var/lib/helm', '~/\.helm', '\.helm[/\\]', 'kube-state-metrics', 'leases\.helm') }
     @{ Id = 'argocd-selfheal'
        Q  = 'In Argo CD, what does syncPolicy.automated.selfHeal do? Answer briefly.'
        Checks = @('(drift|manual|out.of.sync|live (state|cluster))', '(git|desired state)')
-       Wrong  = @() }
+       Wrong  = @('changes[^\n]{0,80}back to (the |your )?git') }   # wrong direction: self-heal reverts the cluster to Git
     @{ Id = 'sched-math'
        Q  = 'A node has 4 CPU allocatable. Running pods request 1500m, 1200m and 800m CPU. Can a new pod requesting 600m CPU be scheduled on it? Show the arithmetic briefly.'
        # \s*(\\text\{\s*)? tolerates LaTeX answers like 3500\text{m}
@@ -34,7 +34,7 @@ $questions = @(
        Wrong  = @('^\W*yes\b') }       # verdict "Yes" in the first word contradicts the math
     @{ Id = 'fake-flag'
        Q  = 'What does the kubectl apply flag --auto-heal do? Answer briefly.'
-       Checks = @("(does not exist|doesn.t exist|no such|not a (valid|real|standard)|not aware|unknown|isn.t a|is not a)")
+       Checks = @("(does not exist|doesn.t exist|there is no|no such|not a (valid|real|standard)|not aware|unknown|isn.t a|is not a)")
        Wrong  = @('^(the )?`?--auto-heal`? flag (tells|makes|enables|causes|instructs)') }
 )
 
