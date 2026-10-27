@@ -20,6 +20,7 @@ $body = @{ model = $Model; prompt = $Prompt; stream = $false; think = $false; op
 $sha  = [System.Security.Cryptography.SHA256]::Create()
 $seen = [ordered]@{}   # hash -> first text
 $rows = foreach ($i in 1..$Runs) {
+    Write-Progress -Activity "repro: $Model, temperature $Temperature" -Status "Run $i of $Runs ($($seen.Count) distinct so far)" -PercentComplete ([int](100 * ($i - 1) / $Runs))
     $r = Invoke-RestMethod http://127.0.0.1:11434/api/generate -Method Post -Body $body -ContentType 'application/json'
     $hash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($r.response))[0..3] | ForEach-Object { $_.ToString('x2') })
     if (-not $seen.Contains($hash)) { $seen[$hash] = $r.response }
@@ -34,6 +35,7 @@ $rows = foreach ($i in 1..$Runs) {
         Done      = $r.done_reason
     }
 }
+Write-Progress -Activity "repro: $Model, temperature $Temperature" -Completed
 $rows | Format-Table -AutoSize
 
 $seedText = if ($NoSeed) { 'none' } else { $Seed }

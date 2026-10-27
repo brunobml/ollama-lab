@@ -38,7 +38,16 @@ $cases = @(
        Raw  = "${im}user`n$user$ie`n${im}assistant`n<think>`n" }
 )
 Add-Content $report "# Part 1: /api/chat vs raw ChatML ($Model)`n"
+$turns = @(   # Part 2 conversation
+    'Our production cluster is called blue-falcon and runs 12 nodes. Just acknowledge.'
+    'How many nodes does it run?'
+    'What is the cluster called?'
+)
+$steps = $cases.Count + $turns.Count
+$n = 0
 $part1 = foreach ($c in $cases) {
+    Write-Progress -Activity "chat-template: $Model" -Status "Step $($n + 1) of ${steps}: part 1, $($c.Name)" -PercentComplete ([int](100 * $n / $steps))
+    $n++
     $chat = Invoke-Chat $c.Msgs ([bool]$c.Think)
     $raw  = Invoke-Raw $c.Raw
     Add-Content $report "## $($c.Name)`n`n### Raw prompt`n`n``````text`n$($c.Raw)`n```````n`n### chat thinking`n`n$($chat.message.thinking)`n`n### chat answer`n`n$($chat.message.content)`n`n### raw response`n`n$($raw.response)`n"
@@ -55,15 +64,12 @@ $part1 = foreach ($c in $cases) {
 $part1 | Format-Table -AutoSize
 
 # --- Part 2: statelessness ---
-# The same conversation, with and without the client re-sending history.
-$turns = @(
-    'Our production cluster is called blue-falcon and runs 12 nodes. Just acknowledge.'
-    'How many nodes does it run?'
-    'What is the cluster called?'
-)
+# The same conversation, with and without the client re-sending history ($turns, defined above).
 Add-Content $report "# Part 2: statelessness`n"
 $history = @()
 $part2 = for ($i = 0; $i -lt $turns.Count; $i++) {
+    Write-Progress -Activity "chat-template: $Model" -Status "Step $($n + 1) of ${steps}: part 2, turn $($i + 1)" -PercentComplete ([int](100 * $n / $steps))
+    $n++
     $history += @{ role = 'user'; content = $turns[$i] }
     $with    = Invoke-Chat $history
     $without = if ($i -gt 0) { Invoke-Chat @(@{ role = 'user'; content = $turns[$i] }) }
@@ -78,5 +84,6 @@ $part2 = for ($i = 0; $i -lt $turns.Count; $i++) {
         NoHistory     = if ($without) { ($without.message.content -replace '\s+', ' ').Substring(0, [math]::Min(45, $without.message.content.Length)) } else { '' }
     }
 }
+Write-Progress -Activity "chat-template: $Model" -Completed
 $part2 | Format-Table -AutoSize
 "Prompts and answers saved to $report"

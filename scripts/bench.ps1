@@ -15,9 +15,14 @@ $logs = if ($LogLines) {
     }) -join "`n"
 } else { '' }
 
+$total = $NumCtx.Count * $NumGpu.Count * $Runs
+$n = 0
 $results = foreach ($ctx in $NumCtx) {
   foreach ($gpu in $NumGpu) {
     1..$Runs | ForEach-Object {
+        $gpuText = if ($gpu -ge 0) { $gpu } else { 'auto' }
+        Write-Progress -Activity "bench: $Model" -Status "Request $($n + 1) of ${total}: num_ctx $ctx, num_gpu $gpuText, run $_ of $Runs" -PercentComplete ([int](100 * $n / $total))
+        $n++
         $options = @{ num_predict = $NumPredict; num_ctx = $ctx; temperature = 0; seed = 42 }
         if ($gpu -ge 0) { $options.num_gpu = $gpu }   # undocumented option; maps to llama-server -ngl
 
@@ -48,4 +53,5 @@ $results = foreach ($ctx in $NumCtx) {
     }
   }
 }
+Write-Progress -Activity "bench: $Model" -Completed
 $results | Format-Table -AutoSize

@@ -43,9 +43,13 @@ $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 $report = Join-Path $OutDir "quality-$stamp.md"
 $first  = @{}   # answers of the first model, to spot wording changes
 
+$total = $Models.Count * $questions.Count
+$n = 0
 $results = foreach ($model in $Models) {
     Add-Content $report "# $model (think=$([bool]$Think))`n"
     foreach ($q in $questions) {
+        Write-Progress -Activity "quality: think=$([bool]$Think)" -Status "Request $($n + 1) of ${total}: $model, $($q.Id)" -PercentComplete ([int](100 * $n / $total))
+        $n++
         $body = @{
             model   = $model
             prompt  = $q.Q
@@ -75,5 +79,6 @@ $results = foreach ($model in $Models) {
         }
     }
 }
+Write-Progress -Activity "quality: think=$([bool]$Think)" -Completed
 $results | Format-Table -AutoSize
 "Answers saved to $report"

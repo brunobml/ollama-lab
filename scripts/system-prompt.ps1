@@ -30,10 +30,14 @@ $compliant = '^\s*kubectl [^\r\n`]+\s*$'   # one line, starts with kubectl, no b
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $report = Join-Path $OutDir "system-prompt-$(Get-Date -Format 'yyyyMMdd-HHmmss').md"
 
+$total = $conditions.Count * $tasks.Count * $Runs
+$n = 0
 $rows = foreach ($c in $conditions) {
     Add-Content $report "# $($c.Name)`n"
     foreach ($t in $tasks) {
         for ($i = 1; $i -le $Runs; $i++) {
+            Write-Progress -Activity "system-prompt: $Model" -Status "Request $($n + 1) of ${total}: $($c.Name), run $i of $Runs" -CurrentOperation $t -PercentComplete ([int](100 * $n / $total))
+            $n++
             $msgs = @()
             if ($c.Sys) { $msgs += @{ role = 'system'; content = $c.Sys } }
             $msgs += @{ role = 'user'; content = (& $c.User $t) }
@@ -45,6 +49,7 @@ $rows = foreach ($c in $conditions) {
         }
     }
 }
+Write-Progress -Activity "system-prompt: $Model" -Completed
 
 $rows | Group-Object Condition | ForEach-Object {
     $toks = @($_.Group.Tok | Sort-Object)
