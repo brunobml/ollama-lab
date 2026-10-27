@@ -19,7 +19,7 @@ A model generates text **one token at a time**. At each step it computes a proba
 
 * Lab 02 complete; `qwen3.5:4b` (and `qwen3.5:9b` for optional comparisons).
 * VRAM: 4b at 8,192 context ≈ 4.0 GB of model allocation (`docs/vram-calculator.md`). One model at a time.
-* Scripts: `scripts/quality.ps1` (now with `-Think`, `-NumCtx` and a **Wrong** column), `scripts/repro.ps1`, `scripts/rescore.ps1` (re-applies the current `quality.ps1` patterns to saved answers, offline), `scripts/chat-template.ps1` and `scripts/system-prompt.ps1` (Step 3).
+* Scripts: `scripts/quality.ps1` (now with `-Think`, `-NumCtx` and a **Wrong** column), `scripts/repro.ps1`, `scripts/rescore.ps1` (re-applies the current `quality.ps1` patterns to saved answers, offline), `scripts/chat-template.ps1` and `scripts/system-prompt.ps1` (Step 3), `scripts/sampling-loop.ps1` and `scripts/sampling.ps1` (Step 4).
 
 ## 3. Architecture
 
@@ -171,9 +171,93 @@ ollama stop qwen3.5:4b
 
 The override case matters for security. Anything an automation puts in the user message (a log line, a ticket, a web page) can contain instructions. If the system message doesn't reliably win, it isn't a security boundary: that's **prompt injection** (Phase 6).
 
+### Step 4 — Sampling parameters
+
+Step 2 showed *that* temperature creates variation. This step shows *how* the sampler picks a token, what each setting changes, and whether the right settings fix the Step 1 thinking loop.
+
+#### How the sampler works
+
+At each step the model outputs a score (logit) for every token in its vocabulary: 248,320 tokens for qwen3.5 (`tokenizer.ggml.tokens` in `ollama show qwen3.5:4b --verbose`). The sampler turns those scores into one chosen token. In Ollama 0.40.10 (`RUNNER llamacpp`), `server.log` prints the chain for every request:
+
+```text
+sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+```
+
+(`?` = inactive with current settings.) In order:
+
+| Stage | Setting | What it does | Analogy |
+|---|---|---|---|
+| penalties | `presence_penalty`, `frequency_penalty`, `repeat_penalty` (+ `repeat_last_n`) | Lower the score of tokens **already in the output**. Presence: a fixed penalty once a token has appeared. Frequency: grows with each use. Repeat: llama.cpp's multiplicative penalty over the last `repeat_last_n` tokens | Rate-limiting a client that keeps sending the same request |
+| top-k | `top_k` | Keep only the k highest-scoring tokens | `head -n k` of a sorted list |
+| top-p | `top_p` | Keep the smallest set of top tokens whose probabilities add up to p | Keep the endpoints that serve 95% of the traffic |
+| min-p | `min_p` | Drop tokens less than `min_p` × the top token's probability | Drop replicas whose health score is below 10% of the best one |
+| temp | `temperature` | Sharpen (< 1) or flatten (> 1) what's left. 0 = always take the top token | How strongly a load balancer prefers the healthiest backend |
+| dist | `seed` | Draw one token at random from the final distribution | The random draw; the seed makes it repeatable |
+
+Note that temperature comes **after** the filters here, so top-k, top-p and min-p decide *which* tokens can be picked, and temperature only reshapes the odds among them. (Other engines order the chain differently, so the same numbers don't always mean the same thing elsewhere.)
+
+**Verified on 0.40.10 (2026-10-27):**
+* All of `temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `repeat_last_n` reach the sampler: the log echoes the values sent.
+* **An unknown option is silently ignored.** `bogus_option` returned a normal answer, with only `level=WARN msg="invalid option provided" option=bogus_option` in `server.log`. A typo like `temprature` would quietly run with the default. Check the log, or the `Sampler` column in 4a.
+* Qwen3.5-4B model card ("Best Practices"): thinking, general tasks: `temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5`. Non-thinking, general: `temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5`. The card says `presence_penalty` "between 0 and 2" can "reduce endless repetitions", but "a higher value may occasionally result in language mixing and a slight decrease in model performance". **Ollama's defaults (`ollama show qwen3.5:4b --parameters`) are the thinking/general set.** Every Lab 02–03 run overrode them with temperature 0.
+
+#### Step 4a — Does sampling break the thinking loop?
+
+`sampling-loop.ps1` re-asks the Step 1 helm-state question (thinking on, `num_predict 4096`, `num_ctx 8192`) under four conditions:
+
+| Condition | Settings | Runs |
+|---|---|---|
+| greedy | temperature 0, seed 42: Step 1 again | 1 (deterministic) |
+| greedy+presence | temperature 0, presence_penalty 1.5 | 1 |
+| defaults | Modelfile: temp 1, top_k 20, top_p 0.95, presence 1.5 | 3 |
+| defaults-presence | same, but presence_penalty 0 | 3 |
+
+`MaxRepeat` = how many times the most repeated line of the thinking occurs. 10 or more means a loop. `Sampler` = the settings read back from `server.log`.
+
+```powershell
+.\scripts\sampling-loop.ps1          # 8 runs; up to ≈35 s each if they loop: ≈2–5 minutes
+```
+
+**Predictions:**
+
+| Condition | Prediction | Why |
+|---|---|---|
+| greedy | `length`, MaxRepeat ≥ 10: the Step 1 loop | Same input, same deterministic picks |
+| greedy+presence | **unknown** | The penalty alone could push it off the repeated tokens, even without randomness |
+| defaults | Mostly `stop`, fewer tokens. **Answer probably still wrong** | Randomness plus penalty breaks the loop; neither adds the missing fact (Helm 3 → Secrets in the release namespace) |
+| defaults-presence | Between the two: some loops | Randomness alone can escape a loop, but nothing pushes against repeating |
+
+#### Step 4b — One setting at a time
+
+`sampling.ps1` asks two short questions (thinking off) 10 times per condition:
+
+* **name**: "Suggest a name for a Kubernetes namespace for the payments team's staging environment." Variety is fine here, but the answer must be a **valid namespace name** (RFC 1123 label: lowercase, digits, `-`).
+* **port**: "What is the default secure port of the Kubernetes API server?" One right answer (`6443`): variety means errors.
+
+The baseline **raw** is temperature 1 with every filter off (`top_k 0`, `top_p 1`, `min_p 0`, no penalty), sampling straight from the model's probabilities. Each other condition changes **one thing** from it. temp 1.5 is deliberately too hot, so the filters have something to fix.
+
+```powershell
+.\scripts\sampling.ps1               # 160 short requests, ≈1–2 minutes
+ollama stop qwen3.5:4b
+```
+
+**Predictions** (Distinct / Valid, out of 10):
+
+| Condition | name | port | Why |
+|---|---|---|---|
+| greedy (temp 0) | 1 / 10 | 1 / 10 | Same top token every time |
+| temp 0.3 | 1–3 / 10 | 1 / 10 | Sharpened: almost always the top token |
+| raw (temp 1) | 5–10 / ≈9 | 1–2 / ≈9–10 | The model's own distribution. The port fact should dominate |
+| temp 1.5 | ≈10 / **lower** | 2–5 / **lower** | Flattened: rare, wrong tokens get real odds; maybe malformed names |
+| temp 1.5 + top_k 5 | high / ≈10 | low / ≈10 | Only 5 candidates survive, so junk tokens are gone, but variety stays |
+| temp 1.5 + top_p 0.5 | lower / ≈10 | 1 / 10 | Keeps only the head of the distribution |
+| temp 1.5 + min_p 0.1 | medium / ≈10 | 1 / 10 | Adapts: when the model is sure (the port), only the top token survives; when unsure (a name), several do |
+| model defaults | medium / ≈10 | 1 / 10 | Qwen's tuned set: variety with filters |
+
+The point of 4b: **temperature controls how adventurous the picks are; the filters decide what's too unlikely to pick at all.** The useful combination is "creative where the model is unsure, deterministic where it's sure". That's what min-p is designed for.
+
 ### Later steps
 
-* Step 4 — Sampling parameters: `top_k`, `top_p`, `min_p`, `repeat_penalty`. Start with the Step 1 helm-state loop: does thinking with sampling (e.g. temperature 0.6, top_p 0.95; check the qwen3.5 model card) break the repetition loop and give an answer?
 * Step 5 — Context overflow: what the model actually sees when input exceeds `num_ctx` (Lab 02 showed the front is cut; `server.log` showed `--context-shift --keep 4`).
 * Step 6 — Hallucination patterns and how to reduce them (grounding with provided context).
 
@@ -276,7 +360,7 @@ What it shows:
 
 1. **Generation order matters.** When the verdict is the first token, it is chosen before the reasoning exists. Thinking, or asking for "arithmetic first, verdict last", fixes that class of error.
 2. **Thinking isn't free, and it isn't knowledge.** When the model doesn't know a fact, thinking can loop and burn the whole token budget without giving any answer. Always set `num_predict`, and check `done_reason`.
-3. **Greedy decoding plus thinking can loop.** These runs use `temperature 0`. The 4b's helm-state loop is the classic greedy repetition failure. Qwen's model cards recommend sampling, not greedy decoding, in thinking mode (from memory of the Qwen3 cards; not yet verified for qwen3.5). This is a Step 4 experiment.
+3. **Greedy decoding plus thinking can loop.** These runs use `temperature 0`. The 4b's helm-state loop is the classic greedy repetition failure. *Correction (checked 2026-10-27):* the Qwen3.5-4B model card doesn't mention greedy decoding. It recommends sampling settings and says `presence_penalty` (0–2) can "reduce endless repetitions". Ollama's qwen3.5 defaults are exactly the card's "thinking mode, general tasks" set. Tested in Step 4a.
 4. **The regex scorer is a smoke test, not a judge.** It gave 3 false negatives and 2 false positives in 24 answers. It can't tell direction ("Git → cluster" vs "cluster → Git") or spot new hallucinations. Read the answers.
    *Fixed afterwards:* `quality.ps1` gained the missed phrasings ("keeps … running", "there is no") and the newly seen wrong claims (`kube-state-metrics`, `leases.helm`, `~/.helm`, "has **no** periodSeconds", "changes … back to Git"). Replayed offline against these 24 saved answers, Score + Wrong now agree with reading in every case. The same caveat applies: these patterns only catch errors already seen.
 5. **Determinism is a property of the whole setup.** Same prompt + settings + model + hardware + sequential requests gave identical output 100% of the time. Without a seed, any temperature > 0 gave a new answer every time.
