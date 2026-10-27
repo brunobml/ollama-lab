@@ -43,7 +43,7 @@ Write-Progress -Activity "chat-overflow: $Model" -Status "Step 2 of 2: same chat
 $before = (Get-Content $log).Count
 $small = Invoke-Chat $NumCtx 40
 $logHits = Get-Content $log | Select-Object -Skip $before | Where-Object { $_ -match 'truncat|shift|exceed|context limit' } |
-    ForEach-Object { ($_ -replace '^time=\S+ ', '').Substring(0, [math]::Min(140, $_.Length)) }
+    ForEach-Object { $s = $_ -replace '^time=\S+ ', ''; $s.Substring(0, [math]::Min(160, $s.Length)) }
 Write-Progress -Activity "chat-overflow: $Model" -Completed
 
 $rows = foreach ($x in @(@{ Ctx = $countCtx; R = $full }, @{ Ctx = $NumCtx; R = $small })) {

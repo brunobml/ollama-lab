@@ -460,6 +460,42 @@ What it shows:
 * **Temperature 1.5 without filters breaks the output:** 6 of 10 names were junk tokens. Each filter fixed that in its own way. **top_k 5** kept the most variety (8 distinct) with all 10 valid. **top_p 0.5** collapsed to the single top answer. **min_p 0.1** kept just 2. For names, the model is confident about the first tokens, so the relative min-p cut leaves little.
 * **Predictions:** raw names had less variety than predicted (3, not 5–10): the model is fairly sure about "payments-staging". min_p on the port kept 2 answers, not 1, because the model really is split. The filters did what they are designed to do; the model's distribution was different from what I assumed.
 
+### Step 5a — One long prompt
+
+Raw: `results/raw/context-overflow-20261027-134047.md`; `server.log` lines from 13:38–13:43. (The script dropped two log lines through a `Substring` bug, since fixed; they were read from `server.log` directly.)
+
+| Lines | num_ctx | Sent | Kept | Hypothesis | Answer |
+|---|---|---|---|---|---|
+| 50 | 4096 | 2,463 | 2,463 | 2,463 | ✅ cluster=blue-falcon first=L0001 |
+| 120 | 4096 | 5,823 | **2,050** | 2,050 | ❌ **cluster=prod** first=L0077 |
+| 250 | 4096 | 12,063 | **2,050** | 2,050 | ❌ **cluster=prod** first=L0210 |
+| 120 | 8192 | 5,823 | 5,823 | 5,823 | ✅ cluster=blue-falcon first=L0001 |
+
+**The rule is confirmed, by measurement and by Ollama's own log:**
+
+```text
+level=WARN source=llama_server.go:334 msg="truncating input prompt" limit=2050 prompt=5823 keep=4 new=2050
+level=WARN source=llama_server.go:334 msg="truncating input prompt" limit=2050 prompt=12063 keep=4 new=2050
+```
+
+* **Kept = 4 + (num_ctx − 4) / 2**, whatever the input size: 5,823 and 12,063 both became 2,050. Ollama keeps the first 4 tokens and the **last** part of the prompt, and leaves half the context free for the answer.
+* **Ollama cuts the prompt itself, before llama-server sees it.** llama-server logged `truncated = 0` and `n_tokens = 2059` (2,050 prompt + 9 generated). The only trace is a `WARN` line in `server.log`. The HTTP response is a normal `200` with an answer.
+* **The model invented the missing fact, and it was plausible.** With "The cluster name is blue-falcon" cut away, it answered **`prod`**, taken from `ns=prod` in the log lines it could still see. It didn't say "I don't know". The worst failure: a confident, plausible wrong answer from silently missing input.
+* **What it saw matches the math.** The log lines are ≈48 tokens each ((12,063 − 5,823) / 130). 2,050 tokens minus the question leaves room for ≈41 lines, so the visible window should start around L0079 (120 lines) and L0209 (250 lines). The model reported L0077 and L0210: close, read from the text it was given.
+* **`truncate: false` exists, although it isn't documented.** Instead of cutting, Ollama returned an error: `"request (12063 tokens) exceeds the available context size (4096 tokens), try increasing it"`. For automation, this is the setting you want: **fail loudly instead of answering from half the input**. Like `set -euo pipefail`.
+
+Part 3, generation overflow (75 lines ≈ 3,644 prompt tokens, `num_predict 3000`, asked to copy every line):
+
+| Mode | Prompt | Generated | Total | Done |
+|---|---|---|---|---|
+| default | 3,644 | 452 | **4,096** | length |
+| shift=false | 3,644 | 452 | **4,096** | length |
+
+* **Generation stops exactly when the context is full**, here after 452 of the 3,000 allowed tokens. Both modes were identical because **context shift is off for this model**: the runner logged `KV cache shifting is not supported for this context, disabling KV cache shifting`, even though Ollama starts it with `--context-shift`. Likely reason: qwen3.5 is hybrid (Lab 01). Its recurrent layers keep a running state, not per-token entries that could be dropped and shifted. Not verified with a full-attention model.
+* **`done_reason: length` has two meanings:** `num_predict` reached, *or* context full. Here the answer was cut at 452 tokens, far below `num_predict`. Check `prompt_eval_count + eval_count` against `num_ctx` to tell which.
+
+Aside: the same log window shows `llama-server GPU discovery watchdog timed out` warnings at runner start. The runs completed normally. Keep an eye on `ollama ps` (`100% GPU`) after the next loads, in case GPU discovery is struggling with driver 591.86.
+
 ### Lessons
 
 1. **Generation order matters.** When the verdict is the first token, it is chosen before the reasoning exists. Thinking, or asking for "arithmetic first, verdict last", fixes that class of error.

@@ -31,7 +31,7 @@ function Invoke-Gen([string]$prompt, [hashtable]$opts, [hashtable]$extra = @{}) 
         $err = $null
     } catch { $r = $null; $err = "$($_.ErrorDetails.Message)" }
     $logHits = Get-Content $log | Select-Object -Skip $before | Where-Object { $_ -match 'truncat|shift|exceed|context limit' } |
-        ForEach-Object { ($_ -replace '^time=\S+ ', '').Substring(0, [math]::Min(140, $_.Length)) }
+        ForEach-Object { $s = $_ -replace '^time=\S+ ', ''; $s.Substring(0, [math]::Min(160, $s.Length)) }
     [pscustomobject]@{ R = $r; Error = $err; Log = @($logHits) }
 }
 
@@ -57,7 +57,7 @@ Add-Content $report "# Part 1: prompt overflow ($Model)`n"
 $part1 = foreach ($c in $cases) {
     Write-Progress -Activity "context-overflow: $Model" -Status "Step $($n + 1) of ${steps}: $($c.Lines) lines at num_ctx $($c.Ctx)" -PercentComplete ([int](100 * $n / $steps)); $n++
     $g = Invoke-Gen $c.Prompt @{ num_ctx = $c.Ctx; num_predict = 30; temperature = 0; seed = 42 }
-    $hyp = if ($c.SentTok -gt $c.Ctx) { 4 + [math]::Floor(($c.Ctx - 4) / 2) } else { $c.SentTok }
+    $hyp = if ($c.SentTok -gt $c.Ctx) { 4 + [int][math]::Floor(($c.Ctx - 4) / 2) } else { $c.SentTok }
     Add-Content $report "## $($c.Lines) lines, num_ctx $($c.Ctx)`n`nSent $($c.SentTok), kept $($g.R.prompt_eval_count)`n`nAnswer: $($g.R.response)`n`nLog: $($g.Log -join ' | ')`n"
     [pscustomobject]@{
         Lines    = $c.Lines
