@@ -17,7 +17,7 @@ Until now we used Ollama as an experiment target. This lab treats it as what it 
 
 * Labs 01–03. `qwen3.5:4b` (≈4 GB VRAM at 4K context). One model at a time.
 * **Python (from Step 2):** Python 3.12 via the launcher, `py -3.12`. Plain `python` on this machine is a **3.9** from the Microsoft Store, which Pydantic 2.14 doesn't support (needs ≥ 3.10). See Step 2 for the virtual environment.
-* Scripts: `scripts/stream.ps1` (Step 1).
+* Scripts: `scripts/stream.ps1` (Step 1), `scripts/client_basics.py` (Step 3).
 
 ## 3. Architecture
 
@@ -89,9 +89,53 @@ py -3.12 -m venv .venv                          # project-local, gitignored; no 
 
 **Done 2026-10-27 (approved):** Python 3.12.1 venv, 27.7 MB on disk. Installed `ollama 0.6.3`, `pydantic 2.14.1`, `httpx 0.28.1` (the HTTP client underneath `ollama`) plus 9 small dependencies. Check: `Client(host='http://127.0.0.1:11434').list()` returns both models; `git status` stays clean (`.venv/` is gitignored). Always call the venv's interpreter: `.\.venv\Scripts\python`.
 
+### Step 3 — The Python client and its failure modes
+
+The `ollama` library is a **thin wrapper over httpx**: it builds the same JSON body as Step 1, posts it, and turns the response into typed objects. Knowing exactly what it adds, and what it *doesn't* handle, is what lets you write a robust integration. Analogy: `client-go` vs `curl` against the Kubernetes API. Same endpoints and same objects, but typed, with conveniences, and with defaults you need to know.
+
+**Read from the installed source (`.venv\Lib\site-packages\ollama\_client.py`, 0.6.3)**, not assumed:
+
+| Behavior | What the code does | Why it matters |
+|---|---|---|
+| Default timeout | `timeout: None`: **wait forever** (httpx's own default would be 5 s) | A hung or slow server blocks your script indefinitely. Set one: `Client(host=..., timeout=120)` |
+| Host | `host` argument, else the `OLLAMA_HOST` environment variable | An env var can silently redirect your script to another server |
+| `OLLAMA_API_KEY` | If set, sent as `Authorization: Bearer …` | Relevant for Ollama's cloud; not used here |
+| HTTP 4xx/5xx | `httpx.HTTPStatusError` → `ollama.ResponseError(message, status_code)`. The message is the `error` field of the JSON body | One exception type for server-side errors |
+| Server unreachable | `httpx.ConnectError` → Python's built-in **`ConnectionError`** | A different type from `ResponseError` |
+| Timeouts | **Not wrapped**: raw `httpx` exceptions | A third type to catch |
+| Streaming | `chat(stream=True)` returns a **generator**; the HTTP request and its errors happen on the **first iteration**. An `error` line mid-stream raises `ResponseError` with `status_code -1` | A `try` around the call alone catches nothing |
+| `chat()` parameters | `tools, stream, think, logprobs, top_logprobs, format, options, keep_alive`: **no `truncate`** | Lab 03's safety switch is only reachable with raw HTTP |
+
+`client_basics.py` makes each of these visible:
+
+* **Part 1:** the same non-streaming request through the library and through raw `httpx`. Same answer? What type comes back?
+* **Part 2:** streaming with the library, timed on the client (compare with Step 1).
+* **Part 3:** seven failure modes, each showing the exception type, status code, message and how long it took. Unknown model (normal and streaming), oversized prompt (library vs raw `truncate: false`), an option of the wrong type (`temperature: "hot"`), a server that isn't there, and a **1 s client timeout during a cold load**. Afterwards it checks whether the server finished loading anyway.
+
+```powershell
+.\.venv\Scripts\python scripts\client_basics.py      # ≈40 s; unloads the model at the end
+```
+
+**Predictions:**
+
+| Case | Prediction | Why |
+|---|---|---|
+| Part 1: same answer | True; library returns `ollama._types.ChatResponse`, raw returns `dict` | Same JSON on the wire; temperature 0 + seed (Lab 03 Step 2) |
+| Part 1: access | Both `lib.message.content` and `lib["message"]["content"]` work | The response models are subscriptable Pydantic models |
+| Part 2 | TTFT ≈ Step 1's warm stream; same text as Part 1 | Same server, same request |
+| unknown model | `ResponseError`, **404**, "model … not found" | `raise_for_status` on a 404 |
+| unknown model, stream=True | **No exception at the call**; `ResponseError` 404 on the first `next()` | Lazy generator |
+| oversized, library | **No exception**, `prompt_eval_count=2050`, answer `prod` or similar | Silent truncation (Lab 03 Step 5a), and the library can't turn it off |
+| oversized, raw truncate=false | **No exception** either, but `HTTP 400: {"error": "request (… tokens) exceeds the available context size …"}` | httpx returns 4xx as a normal response unless you call `raise_for_status()` |
+| temperature="hot" | **unknown**: 400, or ignored like a misspelled option (Lab 03 Step 4) | A wrong *type* may be stricter than a wrong *name* |
+| server not running | `builtins.ConnectionError` fast (< 1 s) | Connection refused on localhost is immediate |
+| timeout 1 s, cold | `httpx.ReadTimeout` after ≈1 s | Not wrapped by the library |
+| `/api/ps` 8 s later | **unknown**: the model loaded anyway, or the load was cancelled | Does the server notice the client left? |
+
+The last case is the one to watch. If the server keeps working for a client that's gone, a client with short timeouts and retries can pile up work (and VRAM) on the server. That's the classic retry-storm problem from microservices.
+
 ### Later steps
 
-* Step 3 — The Python client: chat, streaming, a custom `Client` (host, timeout), `ResponseError` handling. Compare with the raw HTTP from Step 1.
 * Step 4 — Structured output: extract Kubernetes incident data from raw logs into a Pydantic `IncidentReport` schema. Measure the **parse rate** over 50 runs (including `num_predict` truncation) and **field accuracy** separately (Lab 03: valid shape ≠ correct values). Corrupt and adversarial logs.
 * Step 5 — The OpenAI-compatible API with the `openai` library: what's the same, what's missing (`num_ctx`), and why it matters for tools like Codex (Phase 6).
 * Step 6 — Errors, timeouts and concurrency: unknown model, oversized input (`truncate: false`), client timeouts vs cold starts, and what happens to 4 simultaneous requests with one slot (`n_slots = 1`, queued). Testing `OLLAMA_NUM_PARALLEL` > 1 is a server setting change: approval first.
