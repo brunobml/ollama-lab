@@ -383,9 +383,9 @@ ollama stop qwen3.5:4b
 
 Prediction: **unknown**. Same flag, different trimming code path (message trimming happens before rendering).
 
-### Later steps
+### Next
 
-* Phase 3 is complete after Step 6. Next: Phase 4 (REST API, streaming, structured JSON output).
+Phase 3 is complete. Next: Phase 4 (REST API, streaming, structured JSON output). Its schema-constrained output adds one more validation layer: shape is guaranteed, but as this lab showed, correct content still has to be checked separately.
 
 ## 5. Hypotheses → Observed Metrics
 
@@ -591,6 +591,38 @@ Raw: `results/raw/chat-overflow-20261027-134507.md`. 28 messages: system (`ORCA-
 
 Not tested: whether `truncate: false` also makes `/api/chat` return an error instead of trimming.
 
+### Step 6 — Grounding
+
+Raw: `results/raw/grounding-20261027-140256.md`. qwen3.5:4b, temperature 0, thinking off.
+
+| Condition | helm-state | probe-defaults | api-port | fake-flag | Score |
+|---|---|---|---|---|---|
+| closed | ❌ `/var/lib/helm` | ✅ | ❌ 443 | ❌ invents behavior | 1/4 |
+| grounded | ✅ | ✅ | ✅ | ✅ "There is no `--auto-heal` flag" | **4/4** |
+| grounded-strict | ◐ "In the namespace of the release." (no "Secrets") | ⊘ **NOT IN REFERENCE** | ✅ "6443" | ⊘ NOT IN REFERENCE | 1 + ½ |
+| irrelevant-strict | ⊘ | ⊘ | ⊘ | ⊘ | **4/4 abstained** ✅ |
+| poisoned | ☠ ConfigMaps in kube-system | ☠ **30 and 5** | ☠ 8443 | ☠ "enables **watch mode**…" | **4/4 poisoned** |
+| poisoned-strict | ☠ kube-system | ⊘ (wording, see below) | ☠ 8443 | ☠ | 3/4 poisoned |
+
+(◐ partial, ⊘ abstained, ☠ repeated the poison)
+
+| Prediction | Observed |
+|---|---|
+| closed: as in Steps 1 and 4 | ✅ Same errors (`/var/lib/helm`, 443, invented `--auto-heal`) |
+| grounded: all correct | ✅ 4/4: the reference fixed every error |
+| grounded-strict: all correct | ❌ **Over-abstention**: 2 of 4 refused, and one answer was cut to the bare minimum |
+| irrelevant-strict: unknown | ✅ All 4 abstained, even probe-defaults, which it knows |
+| poisoned: probe unknown | ☠ **Followed the poison even for the fact it knew.** Closed-book it said 10/3 correctly; given "30 and 5", it said 30 and 5 |
+| poisoned-strict: all POISON | 3/4. The one abstention wasn't poison detection (see below) |
+
+What it shows:
+* **Grounding works, and that's the whole case for RAG.** One paragraph of correct reference turned 1/4 into 4/4, including the two facts the model didn't know (Helm Secrets, 6443) and the flag it had invented.
+* **The context beats the model's own knowledge, even when the model is right.** The 4b knows the probe defaults (closed: correct), yet with a wrong reference it answered 30 and 5 without any hesitation or caveat. It never once flagged a reference as suspicious. For poisoned fake-flag it even **embellished**: "enables watch mode" isn't in the poisoned text.
+* **"Answer only from the reference" makes the model literal.** In both strict probe cases the reference said "Probe fields" and the question said "readinessProbe". The model explained (poisoned-strict): "it only mentions probe fields in general context without specifying which probe type they apply to … NOT IN REFERENCE". It can't bridge general → specific under the strict rule. For fake-flag, "no self-healing option" + no `--auto-heal` in the list didn't count as an answer either, so absence of evidence became abstention. Strict answers were also minimal ("In the namespace of the release.", leaving out *Secrets*). The one poisoned-strict abstention was this wording effect, not poison detection.
+* **The abstain rule is a precision/recall trade-off**, like an alert threshold. It was perfect where the reference was useless (4/4), but it also blocked 2 good answers. Tune it with the wording: e.g. "The reference may use general terms; apply them to the question. Say NOT IN REFERENCE only if it says nothing relevant". (Not tested.)
+
+`truncate: false` on `/api/chat` (leftover from Step 5): **also an error**: `"request (11687 tokens) exceeds the available context size (4096 tokens), try increasing it"`. The message trimming from 5b is skipped too. One flag, the same behavior on both endpoints.
+
 Aside: the same log window shows `llama-server GPU discovery watchdog timed out` warnings at runner start. The runs completed normally. Keep an eye on `ollama ps` (`100% GPU`) after the next loads, in case GPU discovery is struggling with driver 591.86.
 
 ### Lessons
@@ -601,6 +633,10 @@ Aside: the same log window shows `llama-server GPU discovery watchdog timed out`
 4. **The regex scorer is a smoke test, not a judge.** It gave 3 false negatives and 2 false positives in 24 answers. It can't tell direction ("Git → cluster" vs "cluster → Git") or spot new hallucinations. Read the answers.
    *Fixed afterwards:* `quality.ps1` gained the missed phrasings ("keeps … running", "there is no") and the newly seen wrong claims (`kube-state-metrics`, `leases.helm`, `~/.helm`, "has **no** periodSeconds", "changes … back to Git"). Replayed offline against these 24 saved answers, Score + Wrong now agree with reading in every case. The same caveat applies: these patterns only catch errors already seen.
 5. **Determinism is a property of the whole setup.** Same prompt + settings + model + hardware + sequential requests gave identical output 100% of the time. Without a seed, any temperature > 0 gave a new answer every time.
+6. **The system prompt is guidance, not a boundary** (Step 3). User-supplied text bent the output's content while its format held.
+7. **Settings you don't send come from the Modelfile, and typos are ignored** (Step 4). Read back the effective values in `server.log`.
+8. **Overflow is silent** (Step 5). One long prompt keeps 4 + (num_ctx − 4) / 2 tokens from the end. A long chat drops its oldest messages but keeps the system message. In both cases the model invents what's missing. `truncate: false` turns it into an error.
+9. **A missing fact can't be reasoned or sampled into existence, only supplied** (Steps 1, 4, 6). Grounding fixed every error, and the model then trusted the reference completely, wrong or not.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -845,4 +881,64 @@ In 5a Part 3, generation stopped after 452 tokens with `done_reason: length`, bu
 2. **The context window:** prompt + output reached `num_ctx`. Here 3,644 + 452 = 4,096 exactly. Many models can *shift* the context (drop old tokens and keep going), but the runner disabled that for qwen3.5 (`KV cache shifting is not supported for this context`), likely because its hybrid layers keep a running state that can't be shifted.
 
 To tell them apart: if `eval_count` equals `num_predict`, it was the output cap; if `prompt_eval_count + eval_count` equals `num_ctx`, the context was full. The fixes differ: raise `num_predict` or ask for shorter output in the first case, raise `num_ctx` or send a shorter prompt in the second. Either way, a `length` answer is incomplete and should be handled as such (Q2).
+</details>
+
+**14. Why did the model say "30 and 5" when it knew "10 and 3"?**
+
+Closed-book, the 4b gave the correct probe defaults (periodSeconds 10, failureThreshold 3). Given a reference that said 30 and 5, it answered 30 and 5, with no caveat. It followed all four poisoned references, and for `--auto-heal` it added details ("watch mode") the poison didn't even contain.
+
+*Why does the context win over what the model "knows"? If you build a RAG assistant over your team's runbooks, where does that put the risk?*
+
+<details><summary>Answer</summary>
+
+To the model, both are just signals for the next token, and **text right in front of it is a much stronger signal than a pattern faintly stored in its weights**. A closed-book answer is recall of something seen in training. With a reference in the prompt, the most likely continuation is to *copy* from it, and the model was trained (instruction tuning) to use provided context. It has no notion of a source being trustworthy, and it doesn't check the reference against what it knows. The embellishment ("watch mode") shows it builds a fluent answer *around* the reference, not just a quote.
+
+For a RAG assistant, **the trust moves from the model to the documents**:
+
+* **Doc quality becomes answer quality.** An outdated runbook (Helm 2 instructions in a Helm 3 world) gets repeated confidently. That's exactly the poisoned Helm case, and the most likely real-world version.
+* **Who can write to the source is a security question.** If a wiki page, a ticket or a log line can end up in the retrieved context, its author can steer the answer. This is prompt injection again (Step 3b), through the data path.
+* **Mitigations:** curated sources with owners and review (like code), show the retrieved source with the answer so a human can check it, date and version the docs, and for anything that acts, validate the output against ground truth (Q4). Treat the knowledge base like a config repo: changes are reviewed, because they change behavior.
+</details>
+
+**15. The strict rule abstained on two answerable questions. Bug or feature?**
+
+With "Answer only from the reference. If the reference does not contain the answer, reply exactly: NOT IN REFERENCE", the 4b correctly abstained on all four irrelevant references. But it also abstained on probe-defaults, where the correct reference said "Probe fields: periodSeconds … Default to 10 seconds", because the question said "readinessProbe".
+
+*What trade-off does the rule create? How would you tune it, and how would you know you'd improved it?*
+
+<details><summary>Answer</summary>
+
+It's a **precision/recall trade-off**, like an alerting threshold:
+
+* **Precision went up:** with a useless reference, it said NOT IN REFERENCE 4/4 instead of answering from memory or making something up. For automation, "I don't know" is a safe, detectable result.
+* **Recall went down:** the rule made the model **literal**. "Probe fields" didn't count as an answer about "readinessProbe" (general → specific), and "no self-healing option, no `--auto-heal` in the list" didn't count as "the flag doesn't exist" (absence of evidence). Answers also got minimal ("In the namespace of the release.", leaving out Secrets).
+
+Tuning:
+
+* **Say what counts as relevant:** "The reference may use general terms; apply them to the question. Reply NOT IN REFERENCE only if the reference says nothing relevant." Or allow "the reference implies…" answers.
+* **Ask for a quote:** "Answer, then quote the sentence you used." It makes the answer checkable, and a model that can't find a sentence to quote has a natural reason to abstain.
+* **Improve the reference, not only the prompt:** in RAG, retrieval with chunks that use the same terms as the questions (or both "Probe" and "readinessProbe") avoids the mismatch.
+
+How you'd know: like Step 4 and Phase 5, **measure both sides on a labelled set**. Answerable questions (abstaining is a miss) and unanswerable ones (answering is a miss), for every prompt variant. Improving one rate while breaking the other isn't progress, the same as with alert thresholds.
+</details>
+
+**16. What did Phase 3 teach you about trusting a model's answer?**
+
+Look back over Steps 1–6: a "Yes" written before the arithmetic, a thinking loop with no answer, a perfect regex score on a wrong answer, a format kept while content was injected, `443` ten times at temperature 0, `prod` invented from a truncated prompt, a ticket number built from timestamps, and 30/5 copied from a wrong reference.
+
+*If a teammate proposes an LLM step in a pipeline (triage incidents, propose a fix), what checks would you insist on?*
+
+<details><summary>Answer</summary>
+
+Every failure in this lab had the same shape: **a fluent, confident answer that was wrong, and nothing in the HTTP response said so.** The model's confidence carries no information about correctness. So the checks have to come from outside:
+
+* **Input completeness:** `truncate: false`, or compare `prompt_eval_count` with what you sent (Step 5). Never let the model answer from half the input.
+* **Output completeness:** check `done_reason` and set `num_predict` (Steps 1, 5). Treat `length` as a failure.
+* **Grounding with trusted, versioned sources** for any fact (Step 6). Prefer "not in reference" over guessing, and measure both its hit and miss rates.
+* **Validation against ground truth**, not keyword matching (Steps 1, 3): parse and allow-list commands, recompute numbers, check claims against the cluster.
+* **Uncertainty signals:** sample a few times; disagreement means "don't trust this" (Step 4).
+* **Reproducibility for debugging:** fixed seed, temperature 0, pinned model, settings read back from the log (Steps 2, 4). Remember that's repeatability, not correctness.
+* **Least privilege and a human gate for anything that acts** (Step 3, Phase 6). The system prompt isn't a boundary; RBAC is.
+
+That's the same discipline as any untrusted service in a platform: validate inputs, check outputs, limit blast radius, observe. The LLM just makes the failures sound convincing.
 </details>
