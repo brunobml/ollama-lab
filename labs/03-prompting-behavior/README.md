@@ -19,7 +19,7 @@ A model generates text **one token at a time**. At each step it computes a proba
 
 * Lab 02 complete; `qwen3.5:4b` (and `qwen3.5:9b` for optional comparisons).
 * VRAM: 4b at 8,192 context ≈ 4.0 GB of model allocation (`docs/vram-calculator.md`). One model at a time.
-* Scripts: `scripts/quality.ps1` (now with `-Think`, `-NumCtx` and a **Wrong** column), `scripts/repro.ps1`, `scripts/rescore.ps1` (re-applies the current `quality.ps1` patterns to saved answers, offline), `scripts/chat-template.ps1` and `scripts/system-prompt.ps1` (Step 3), `scripts/sampling-loop.ps1` and `scripts/sampling.ps1` (Step 4), `scripts/context-overflow.ps1` and `scripts/chat-overflow.ps1` (Step 5).
+* Scripts: `scripts/quality.ps1` (now with `-Think`, `-NumCtx` and a **Wrong** column), `scripts/repro.ps1`, `scripts/rescore.ps1` (re-applies the current `quality.ps1` patterns to saved answers, offline), `scripts/chat-template.ps1` and `scripts/system-prompt.ps1` (Step 3), `scripts/sampling-loop.ps1` and `scripts/sampling.ps1` (Step 4), `scripts/context-overflow.ps1` and `scripts/chat-overflow.ps1` (Step 5), `scripts/grounding.ps1` (Step 6).
 
 ## 3. Architecture
 
@@ -315,9 +315,77 @@ Two competing hypotheses:
 
 My guess is **A**, from memory of Ollama's source (it trims chat history at message boundaries and keeps system messages). That's not verified and not documented, so the run decides. Under A the system message is safe; under B, a long chat silently loses its instructions, which matters for every assistant built on `/api/chat`.
 
+### Step 6 — Hallucination and grounding
+
+So far the models have answered confidently without the facts four times: helm-state (`/var/lib/helm`, `$HOME/.helm`), the API port (`443`), the truncated cluster name (`prod`) and the dropped ticket (`INC-2026-10-27-13`). Thinking didn't fix it (Step 1), and sampling didn't either (Step 4). The model can't reason or sample its way to a fact it doesn't have.
+
+**Grounding** means putting the facts in the prompt: a reference text, then the question. The model then works like a reader, not like a memory. This is the core idea behind RAG (Phase 5), where software *finds* the reference automatically. Here we write it by hand to measure the effect on its own.
+
+Analogy: the difference between asking an engineer from memory and handing them the runbook. With the runbook they're much more accurate, but only as accurate as the runbook. A wrong runbook gets followed too.
+
+#### What we test
+
+`grounding.ps1` asks four questions the models got wrong (helm-state, probe-defaults, api-port, fake-flag) under six conditions, at temperature 0 with thinking off:
+
+| Condition | System message | User message |
+|---|---|---|
+| closed | none | question only (Step 1 again) |
+| grounded | none | correct reference + question |
+| grounded-strict | "Answer only from the reference. If the reference does not contain the answer, reply exactly: NOT IN REFERENCE" | correct reference + question |
+| irrelevant-strict | the same rule | an **unrelated** reference (HPA defaults) + question |
+| poisoned | none | a plausible **wrong** reference + question |
+| poisoned-strict | the same rule | wrong reference + question |
+
+The reference is delimited (`<<<` … `>>>`) and labelled as data, and the question comes last, so it survives truncation (Step 5).
+
+**References.** The correct ones paraphrase the official docs, checked on 2026-10-27:
+* Helm: "By default, release information is stored in Secrets in the namespace of the release", `HELM_DRIVER` = configmap, secret, sql ([helm.sh, Advanced: Storage backends](https://helm.sh/docs/topics/advanced/)). The reference also mentions that Helm 2 used ConfigMaps in `kube-system`: a deliberate distractor that real docs often contain.
+* Probe: periodSeconds "Default to 10 seconds. Minimum value is 1", failureThreshold "Defaults to 3. Minimum value is 1" ([Pod v1 API, Probe](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/)).
+* API port: `--secure-port int Default: 6443` … "It cannot be switched off with 0" ([kube-apiserver reference](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/)).
+* kubectl apply: a list of real flags, and "kubectl apply has no self-healing option".
+
+The poisoned ones are deliberately plausible: Helm 3 in ConfigMaps in `kube-system` (Helm 2's real behavior), probe defaults 30 and 5, API port 8443, and an `--auto-heal` flag with a convincing description.
+
+**Verdicts:**
+* `correct`: all checks hit and no wrong claim.
+* `wrong`: a known wrong claim.
+* `POISON`: repeated the poisoned reference (only checked in poisoned conditions).
+* `abstain`: replied NOT IN REFERENCE.
+* `check`: partial, or a right answer that also hits a wrong-claim pattern (e.g. it mentions Helm 2's ConfigMaps for contrast). Read those answers.
+
+```powershell
+.\scripts\grounding.ps1                                   # 24 requests, ≈1 minute
+.\scripts\grounding.ps1 -Models qwen3.5:4b,qwen3.5:9b     # optional: both models, ≈3 minutes
+ollama stop qwen3.5:4b; ollama stop qwen3.5:9b
+```
+
+**Predictions (qwen3.5:4b):**
+
+| Condition | helm-state | probe-defaults | api-port | fake-flag | Why |
+|---|---|---|---|---|---|
+| closed | wrong | correct | wrong (443) | wrong (invents) | Same as Steps 1 and 4: `/api/chat` renders the same prompt (Step 3) |
+| grounded | correct | correct | correct | correct | Copying a fact from the context is much easier than recalling it |
+| grounded-strict | correct | correct | correct | correct | Same, plus the rule |
+| irrelevant-strict | abstain | abstain? **unknown** | abstain | abstain? | Will it admit the reference is useless, or answer from memory anyway (probe, which it knows)? |
+| poisoned | **POISON** | POISON? **unknown** | **POISON** | **POISON** | For a small model the context usually beats its own weak knowledge. Does it hold on to a fact it *does* know (probe)? |
+| poisoned-strict | POISON | POISON | POISON | POISON | The rule tells it to trust the reference |
+
+What this is really about: grounding moves the trust from the model's memory to the **reference**. That's a big improvement when the reference is right (the RAG case), and an attack surface when it's wrong or attacker-controlled. Poisoned docs and injected text (Step 3b) are the same problem.
+
+#### Leftover from Step 5: `truncate: false` on `/api/chat`
+
+Step 5a showed `/api/generate` returns an error with `truncate: false`. Does `/api/chat` too, or does it still trim old messages?
+
+```powershell
+.\scripts\chat-overflow.ps1 -TruncateFalse                # 1 request
+ollama stop qwen3.5:4b
+```
+
+Prediction: **unknown**. Same flag, different trimming code path (message trimming happens before rendering).
+
 ### Later steps
 
-* Step 6 — Hallucination patterns and how to reduce them (grounding with provided context).
+* Phase 3 is complete after Step 6. Next: Phase 4 (REST API, streaming, structured JSON output).
 
 ## 5. Hypotheses → Observed Metrics
 

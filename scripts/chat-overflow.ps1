@@ -2,6 +2,7 @@ param(
     [string]$Model = 'qwen3.5:4b',
     [int]$Batches = 12,               # filler turns; 12 x 20 log lines ≈ 2x a 4,096 context
     [int]$NumCtx = 4096,
+    [switch]$TruncateFalse,           # only send the chat once at $NumCtx with truncate=false (undocumented; Step 6)
     [string]$OutDir = 'results/raw'   # gitignored
 )
 
@@ -35,6 +36,17 @@ function Invoke-Chat([int]$ctx, [int]$predict) {
     $body = @{ model = $Model; messages = $messages; stream = $false; think = $false
                options = @{ num_ctx = $ctx; num_predict = $predict; temperature = 0; seed = 42 } } | ConvertTo-Json -Depth 5
     Invoke-RestMethod "$api/api/chat" -Method Post -Body $body -ContentType 'application/json'
+}
+
+if ($TruncateFalse) {
+    # Step 5a showed /api/generate errors with truncate=false. Does /api/chat too, or does it still trim messages?
+    $body = @{ model = $Model; messages = $messages; stream = $false; think = $false; truncate = $false
+               options = @{ num_ctx = $NumCtx; num_predict = 40; temperature = 0; seed = 42 } } | ConvertTo-Json -Depth 5
+    try {
+        $r = Invoke-RestMethod "$api/api/chat" -Method Post -Body $body -ContentType 'application/json'
+        "No error. PromptTok $($r.prompt_eval_count) at num_ctx ${NumCtx}; answer: $("$($r.message.content)".Trim())"
+    } catch { "ERROR: $($_.ErrorDetails.Message)" }
+    return
 }
 
 Write-Progress -Activity "chat-overflow: $Model" -Status "Step 1 of 2: counting tokens at num_ctx $countCtx" -PercentComplete 0
