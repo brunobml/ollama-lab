@@ -1,0 +1,5 @@
+# Lab 04+ Python dependencies. Install into the project venv (Python 3.12):
+#   py -3.12 -m venv .venv
+#   .\.venv\Scripts\python -m pip install -r requirements.txt
+ollama==0.6.3
+pydantic==2.14.1
