@@ -4,6 +4,7 @@ param(
     [int]$Runs = 3,                       # runs per sampled condition (greedy ones run once: deterministic)
     [int]$NumPredict = 4096,
     [int]$NumCtx = 8192,
+    [string[]]$Only,                      # run only these condition names, e.g. -Only greedy
     [string]$OutDir = 'results/raw'       # gitignored
 )
 
@@ -22,11 +23,15 @@ if (-not $q) { throw "Unknown question id '$QuestionId'" }
 
 # Options not listed fall back to the Modelfile (`ollama show $Model --parameters`)
 $conditions = @(
-    @{ Name = 'greedy';           Runs = 1;     Opts = @{ temperature = 0; seed = 42 } }
+    # presence_penalty must be set explicitly: the Modelfile default (1.5) applies otherwise.
+    # (The 2026-10-27 13:10 run lacked it here, so 'greedy' and 'greedy+presence' were identical.)
+    @{ Name = 'greedy';           Runs = 1;     Opts = @{ temperature = 0; seed = 42; presence_penalty = 0 } }
     @{ Name = 'greedy+presence';  Runs = 1;     Opts = @{ temperature = 0; seed = 42; presence_penalty = 1.5 } }
     @{ Name = 'defaults';         Runs = $Runs; Opts = @{} }                          # temp 1, top_k 20, top_p 0.95, presence 1.5
     @{ Name = 'defaults-presence';Runs = $Runs; Opts = @{ presence_penalty = 0 } }    # same, without the penalty
 )
+
+if ($Only) { $conditions = @($conditions | Where-Object { $_.Name -in $Only }) }
 
 function Get-LastSamplerParams {
     # llama.cpp logs the effective sampler settings for each request ("sampler params: ...")
