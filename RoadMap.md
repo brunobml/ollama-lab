@@ -46,7 +46,7 @@ CPU:                Intel Core i7-10700K @ 3.80GHz (8 cores, 16 threads)
 System Memory:      64 GB (≈44 GB free at idle)
 GPU:                NVIDIA GeForce RTX 3080, 10,240 MiB, compute capability 8.6
 NVIDIA Driver:      610.88 (Phase 2); 617.42 on 2026-10-12; 591.86 since ≤ 2026-10-22 (deliberate rollback, known NVIDIA issue)
-Inference Engine:   Ollama v0.40.2 (0.40.5 since ≤ 2026-10-22), user-level process started by the tray app (not a Windows service)
+Inference Engine:   Ollama v0.40.2 (0.40.5 by 2026-10-22; 0.40.8 on 2026-10-23; 0.40.10 on 2026-10-27), user-level process started by the tray app (not a Windows service)
                     Listening on 127.0.0.1:11434 only
 Ollama GPU detect:  library=CUDA compute=8.6 total="10.0 GiB" available="8.9 GiB" (server.log)
 VRAM in use idle:   ≈1,650 MiB (Windows desktop, virtual display adapters)
@@ -272,12 +272,21 @@ flowchart TD
   * MCP architecture: hosts, clients, servers.
   * Safety: read-only vs mutating tools; human-in-the-loop approval.
   * Local coding agents: configuring Codex to use Ollama models (Codex is not configured for Ollama today).
+  * `ollama launch <integration>` (listed in `ollama launch --help` on 0.40.8): starts a coding agent (`claude`, `codex`, `opencode`, …) wired to local Ollama. For `claude` it points Claude Code at Ollama's Anthropic-compatible API (`/v1/messages`) — mechanism from docs, verify in-lab.
 * **Hands-on Experiment:**
   * Agent with two mock, read-only tools: `get_cluster_nodes()` and `get_pod_logs(namespace, pod_name)`.
   * Approval gate that requires console confirmation before any mutating tool runs.
   * Compare `qwen3.5:4b`, `qwen3.5:9b`, and `qwen2.5-coder:7b` on tool-call accuracy.
+  * Claude Code on a local model via `ollama launch claude`:
+    * First run `ollama launch claude --config` and record exactly what it changes (env vars only, or config files?) and how `--restore` undoes it.
+    * Short session with `qwen3.5:4b` at 64K context on a throwaway sandbox repo; watch `ollama ps` and `scripts/check-vram.ps1`. Try `qwen3.5:9b` at 64K only if it stays within the 8.5 GB ceiling.
+    * Local models only — do not select `:cloud` models from the launch menu without explicit approval.
+* **Hypotheses to test:**
+  * Claude Code's system prompt + tool definitions need a large context (≈64K); at the 4,096 default the session degrades or fails — measure the actual prompt token count.
+  * A 4b–9b local model can drive simple agent tasks (read a file, run a read-only command) but makes more tool-call errors than it does in the mock-tool agent — count them.
 * **Verification Criteria:**
   * Tool calls are valid and use correct arguments; agent synthesizes a root cause from tool output.
+  * `ollama launch claude` session runs `100% GPU` within the VRAM ceiling, and the integration is restored to defaults afterwards.
 
 ---
 
