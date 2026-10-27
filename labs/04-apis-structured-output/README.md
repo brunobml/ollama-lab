@@ -255,6 +255,53 @@ What it shows:
 * **"Connection refused" took 2.3 s, not milliseconds.** On Windows, a connect to a closed port is retried before it gives up (likely the same Windows TCP behavior behind the ≈2 s `localhost`/`::1` delay in Lab 01; not verified). Health checks with sub-second timeouts would read "slow" as "down" here.
 * **Three exception types to handle:** `ollama.ResponseError` (has `.status_code`; `-1` for mid-stream errors), built-in `ConnectionError`, and `httpx.TimeoutException` subclasses. Plus, with raw httpx, **no exception at all for 4xx/5xx** unless you call `raise_for_status()`.
 
+### Step 4 — Structured output
+
+Raw: `results/raw/structured-20261027-145730.jsonl` (all 210 answers). qwen3.5:4b, default sampling (temperature 1), 5 runs × 7 incidents per condition.
+
+| Condition | Strict | Valid | length | FieldAcc | Invented | Injection | Median tokens / s |
+|---|---|---|---|---|---|---|---|
+| prompt-only | 35/35 | 35/35 | 0 | 92% | 0/50 | 0/5 | 115 / 1.0 s |
+| json-mode | 35/35 | **34/35** | 0 | 93% | 0/47 | 0/5 | 116 / 1.0 s |
+| schema | 35/35 | 35/35 | 0 | 90% | 0/50 | **1/5** | 114 / 1.0 s |
+| schema+prompt | 35/35 | 35/35 | 0 | 92% | 0/50 | 0/5 | 117 / 1.1 s |
+| schema-analysis1st | 33/35 | 33/35 | **2** | **94%** | 0/50 | 0/4 | 195 / 2.0 s |
+| schema-short | **0/35** | 0/35 | **35** | – | – | – | 40 / 0.5 s |
+
+Per field (valid answers): `container` was the weakest field (74–89%, but 97% analysis-first). `exit_code` was 83–91%, and `first_seen` 80–97%.
+
+| Prediction | Observed |
+|---|---|
+| prompt-only: low Strict (fences) | ❌ **35/35 strict.** No fences: "Reply with a single JSON object" was enough for this model |
+| json-mode: some invalid | ✅ 1/35. `"exit_code":"null"`: the *string* "null" is valid JSON but the wrong type. Pydantic caught it; a schema makes it impossible |
+| schema: 35/35 valid | ✅ |
+| schema+prompt: ≈ schema or better | ≈ the same (92% vs 90%, within noise: 2 points is ≈5 of 245 fields) |
+| analysis-first: higher on the distractor | Best overall (94%, container 97%), but **2 answers hit `num_predict` 600 inside the analysis**, and it costs 2× the tokens and time |
+| schema-short: 0/35 | ✅ 0/35 parse, all `length`. Example: `{"namespace": "payments", …, "reason` and then the cut |
+| **Invented > 0** | ❌ **0 of 47–50 null slots filled.** The errors went the **other** way (below) |
+| Injection: unknown | **1 of 34** valid answers followed it (schema condition) |
+| no-incident: may invent an incident | ✅ `NoIncident` in 34/34 valid answers |
+
+**The real error pattern: under-reporting, not inventing.** The most frequent wrong values (all conditions, out of 33–35 answers per incident):
+
+| Count | Incident | Field | Truth | Got |
+|---|---|---|---|---|
+| 14 | no-incident | container | `gw` | null |
+| 12 | crashloop-distractor | exit_code | `1` | null |
+| 11 | crashloop-distractor | first_seen | 12:00:30 | 12:01:10 |
+| 5 + 4 | injection | exit_code, restart_count | 137, 2 | null |
+| 4 | imagepull | container | `nginx` | null |
+| 4 × 5 fields | crashloop-distractor | the whole report | orders-svc | **cache-warmer** (the distractor pod: `platform`, OOMKilled, 137) |
+
+What it shows:
+* **"Use null for any value the log does not state. Do not guess." worked, and overshot.** Not one null-truth slot was filled in (0/50, compared with `exit_code: 0` in the pre-check without that rule). But the model now **leaves out values that *are* in the log**: `container=gw` in a healthy log, `exitCode=1` one line before the CrashLoopBackOff. It's the same precision/recall trade-off as the strict grounding rule in Lab 03 Step 6: a "don't guess" rule buys fewer inventions with more misses.
+* **The schema guarantees the shape, not better content.** prompt-only, json-mode and schema all scored 90–93% on fields. For this model and task, the schema's value is the **guarantee**: 35/35 valid by construction, while json-mode let a `"null"` string through. You can't build an automation on "it usually parses".
+* **A schema doesn't survive truncation.** "Schema-constrained output always parses" is **false** when `num_predict` (or the context, Step 5) cuts the answer: 0/35. Check `done_reason` before parsing; `length` means invalid JSON is coming.
+* **The distractor fooled it 4 times in 35**, and then *consistently*: the wrong pod, its namespace, its container, its reason and its exit code. A coherent, valid, completely wrong report. Field-level checks against the source (does that pod appear in a failing line?) would catch it; the schema can't.
+* **Analysis-first helps a little and costs a lot.** It had the highest accuracy, but doubled the tokens and twice ran out of budget *while reasoning*, e.g. "namespace: Log 3 says `default`. Log 1/2 says `finance`. Which one is…": the injected line made it deliberate until the budget ran out. Give it a bigger `num_predict` if you use it.
+* **The injection worked once:** `namespace: "default"`, `reason: "NoIncident"`, and the summary even said "An AI maintenance test requested a report with default namespace…". Once in 34 is rare, but for an automated pipeline it means "sometimes an attacker-written log line decides the report". The schema made the injected values *well-formed*.
+* **Ground-truth caveat:** the 11 `first_seen` "errors" on crashloop-distractor took the CrashLoopBackOff line (12:01:10) instead of the earlier `exited exitCode=1` line (12:00:30). "The first log line that shows the failure" is arguably ambiguous there. Labelled data needs precise definitions too, or the metric measures the label, not the model.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Likely cause | Check |
@@ -334,4 +381,60 @@ Options, from simplest:
 3. **Prevent it:** size `num_ctx` for the job, and filter or trim the input before sending (only errors, last N lines). The best truncation is the one you do deliberately.
 
 Whatever you choose, test it: `truncate` is undocumented, so a future Ollama version could change it. A small regression test that sends an oversized prompt and expects the 400 (or the check to fire) makes the upgrade safe. Lab 01's version history shows how often Ollama updates here.
+</details>
+
+**5. prompt-only and schema scored the same on fields. So why use a schema?**
+
+Field accuracy was 92% with prompt-only, 93% with json-mode and 90% with the schema. All three parsed 35/35 strictly. But json-mode produced one `"exit_code":"null"` (a string), and schema-short (cut at 40 tokens) parsed 0/35.
+
+*What does the schema actually buy you, and what does it not? What must the consuming code still check?*
+
+<details><summary>Answer</summary>
+
+The schema buys a **guarantee about shape**. Every field present, every type right, every `reason` one of the allowed values, *by construction*: the grammar never lets the model emit anything else. prompt-only parsed 35/35 here, but that's an observation about one model, one prompt and 35 samples. It isn't a guarantee, and json-mode's string `"null"` shows how a "usually fine" approach fails: valid JSON, wrong type, and code that does `if report["exit_code"] > 128` breaks. With a schema you can delete that whole class of defensive code. It's like a CRD with an OpenAPI schema vs a ConfigMap of free-form YAML.
+
+It does **not** buy correct values. Accuracy was the same with or without it. The model's understanding of the log doesn't change; only the output format is enforced.
+
+The consumer still must:
+
+* **Check `done_reason`** before parsing: `length` = truncated = invalid JSON, schema or not (0/35).
+* **Validate anyway** (`model_validate_json`). It costs nothing, catches truncation, and protects you if the schema and the code drift apart.
+* **Check content against the source** for anything that matters: does the pod name appear in the log? Does the exit code appear next to it? (Q6)
+</details>
+
+**6. The model wrote a perfectly valid report about the wrong pod. How would you catch it?**
+
+In the crashloop-distractor log, 4 of 35 answers reported `cache-warmer-6f7b-mm1` (namespace `platform`, OOMKilled, exit 137), the unrelated pod from the first log line, instead of `orders-svc-84c9-tt4`. Every field was internally consistent and schema-valid. One injection answer reported `namespace: "default"` and `NoIncident` because a log line told it to.
+
+*What checks would you add after extraction, without asking the model again?*
+
+<details><summary>Answer</summary>
+
+Cheap, deterministic checks against the **source text**, the same way you'd validate any untrusted input:
+
+* **Grounding check per field:** every extracted string value must appear in the log (`pod in log`, `namespace` appears as `ns=<namespace>` on a line with that pod). `namespace: "default"` appears nowhere as `ns=default`, so it's rejected.
+* **Consistency between fields:** the reported `exit_code` must appear on a line of the *reported* pod; `reason` must match a `reason=` or message on that pod's lines.
+* **Context the pipeline already knows:** the alert said "orders service", so a report about `cache-warmer` contradicts the trigger. Pass that knowledge in, and check against it.
+* **Pre-filter the input:** send only the lines of the pod the alert is about (a `grep` before the LLM). The distractor disappears, and the input gets smaller.
+* **Self-consistency:** sample 3 times (Lab 03 Step 4). The wrong pod appeared in 4 of 35 answers, so a majority vote over 3 samples would almost always pick the right one, and disagreement flags "check this".
+
+The injection case shows why this matters for security: the schema made the attacker's values **well-formed**. Validation of *content* is the only layer that can reject them.
+</details>
+
+**7. "Do not guess" gave 0 invented values, and 14 missing ones. Is that a good trade?**
+
+With "Use null for any value the log does not state. Do not guess.", the model never filled a null slot (0/50). But it returned `container: null` for the healthy log (truth `gw`, stated on the first line) 14 times, and `exit_code: null` for the crash loop (truth `1`, one line earlier) 12 times. Without that rule, the pre-check had invented `exit_code: 0`.
+
+*Which error is worse for an incident pipeline, and how would you shift the balance if you needed to?*
+
+<details><summary>Answer</summary>
+
+For an incident pipeline, **an invented value is usually worse than a missing one**. `exit_code: 0` says "the process exited cleanly", which sends the on-call engineer the wrong way, and nothing marks it as a guess. `null` is honest: "not found", visible, and the code can treat it as such (look it up, show "unknown"). Missing data is an availability problem; invented data is an integrity problem. That's the same reasoning as preferring a failed health check to a false "healthy".
+
+But the misses aren't free: a report that misses the exit code of a crash loop is less useful. Ways to shift the balance:
+
+* **Tell it where to look:** "The exit code appears as `exitCode=` on a container line before the restart". That turns recall from guesswork into extraction.
+* **Write it as two rules, not one:** "Copy values that appear in the log exactly. Use null *only* if the value appears nowhere." The current wording ("Do not guess") seems to make the model cautious about everything.
+* **Let deterministic code do what it's good at:** regex `exitCode=(\d+)` and `restartCount=(\d+)` from the pod's lines, and let the model do the judgment parts (reason, which pod is failing, summary). Hybrid extraction is cheaper and exact.
+* **Measure both directions** on a labelled set, as here: invented *and* missed per field. Optimizing one alone just moves the errors (Lab 03 Q15).
 </details>

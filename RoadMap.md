@@ -381,5 +381,5 @@ Open decisions (to settle when the phase starts):
 | 1 — Foundations | Done — see `labs/01-foundations`, `docs/architecture.md` |
 | 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
-| 4 — APIs | In progress — Steps 1 (streaming) and 3 (Python client, failure modes) done; Step 4 (structured output) set up; Python venv ready (D-07) |
+| 4 — APIs | In progress — Steps 1 (streaming) and 3 (Python client, failure modes) done; Step 4 (structured output) done; Python venv ready (D-07) |
 | 5–9 | Not started |
