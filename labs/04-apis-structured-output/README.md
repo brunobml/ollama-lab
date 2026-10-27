@@ -17,7 +17,7 @@ Until now we used Ollama as an experiment target. This lab treats it as what it 
 
 * Labs 01–03. `qwen3.5:4b` (≈4 GB VRAM at 4K context). One model at a time.
 * **Python (from Step 2):** Python 3.12 via the launcher, `py -3.12`. Plain `python` on this machine is a **3.9** from the Microsoft Store, which Pydantic 2.14 doesn't support (needs ≥ 3.10). See Step 2 for the virtual environment.
-* Scripts: `scripts/stream.ps1` (Step 1), `scripts/client_basics.py` (Step 3), `scripts/structured.py` with data in `incidents.json` (Step 4).
+* Scripts: `scripts/stream.ps1` (Step 1), `scripts/client_basics.py` (Step 3), `scripts/structured.py` with data in `incidents.json` (Step 4), `scripts/openai_compat.py` and `Modelfile.ctx8k` (Step 5).
 
 ## 3. Architecture
 
@@ -199,9 +199,56 @@ And for content, in every schema condition:
 
 The hypothesis from the roadmap, in two parts: *"schema-constrained output always parses"* (test: schema vs schema-short) and *"valid JSON is not the same as correct values"* (test: Valid vs FieldAcc and Invented).
 
+### Step 5 — The OpenAI-compatible API
+
+Most AI tooling (SDKs, agents, Codex, IDE plugins) speaks **OpenAI's API format**. Ollama serves it at `/v1/...` next to its native `/api/...`, so those tools can use local models just by changing `base_url`. That's the whole reason it exists. But it's a translation layer: Ollama features without an OpenAI equivalent either get mapped or are lost. Analogy: MinIO's S3 API. Every S3 tool works, but MinIO-specific settings aren't in the S3 protocol, so you set them another way.
+
+**Verified before the experiment (2026-10-27):**
+* `GET /v1/models` lists both models in OpenAI's format (`"object": "list"`, `"owned_by": "library"`).
+* Docs: supported `/v1/chat/completions` fields include `response_format`, `seed`, `max_tokens`, `stream_options`, `tools`, **`reasoning_effort`** and **`reasoning.effort`** ("control model thinking"). Not supported: `tool_choice`, `logit_bias`, `user`, `n`, logprobs. And: "The OpenAI API does not have a way of setting the context size for a model".
+* `/api/show` for qwen3.5:4b: `"thinking": {"values": [false, true], "default": true}`. So **a `/v1` client that doesn't ask otherwise gets thinking**, and pays for it in tokens and time (Lab 03 Step 1).
+
+`openai_compat.py` uses raw httpx, so you see exactly what an OpenAI SDK sends (no new package needed):
+
+* **Part 1, thinking:** the same question via `/api/chat` (`think: false`, reference) and via `/v1` with no reasoning field, `reasoning_effort` `"none"` and `"low"`, `reasoning: {effort: "none"}`, and the native `think: false` smuggled into a `/v1` body.
+* **Part 2, response shape:** keys, `usage`, `finish_reason`, and what `/api/chat` has that `/v1` doesn't.
+* **Part 3, context:** the ≈5,800-token prompt from Lab 03 Step 5 (cluster name at the top) via `/v1`. Default, then with an extra native `options: {num_ctx: 8192}`, then with `truncate: false`, and with the **Modelfile variant** `qwen3.5:4b-ctx8k` if it exists (see below).
+* **Part 4, structured output:** `response_format` `json_object` and `json_schema`.
+* **Part 5, streaming:** the wire format.
+
+**Optional, needs approval: the Modelfile variant.** The documented way to give `/v1` clients a bigger context is a model whose Modelfile sets it:
+
+```powershell
+ollama create qwen3.5:4b-ctx8k -f labs\04-apis-structured-output\Modelfile.ctx8k
+```
+
+This downloads nothing. It writes a small manifest that reuses the existing weights (the same blobs, Lab 01), plus a parameter layer with `num_ctx 8192`. Remove it with `ollama rm qwen3.5:4b-ctx8k` (the weights stay, because `qwen3.5:4b` still uses them). Like a Helm values override: the same chart, a different default. Without it, Part 3 skips that case.
+
+```powershell
+.\.venv\Scripts\python scripts\openai_compat.py      # ≈1 minute; unloads at the end
+```
+
+**Predictions:**
+
+| Case | Prediction | Why |
+|---|---|---|
+| v1, no reasoning field | **thinks**: hundreds of completion tokens, several seconds; the thinking text in an extra message field (`reasoning`?) | Model default `thinking: true`; OpenAI's format has no `think` |
+| v1, reasoning_effort "none" | no thinking, **same answer** as `/api/chat` think=false | Mapped to `think: false` |
+| v1, reasoning_effort "low" | thinks | qwen3.5 only has on/off (`values: [false, true]`), so any effort probably means "on" |
+| v1, reasoning {effort: "none"} | like reasoning_effort "none" | Documented alias |
+| v1, `think: false` | **unknown**: ignored, or honored | Not an OpenAI field |
+| Part 2 | `id, object, created, model, choices, usage`; **no durations**; `finish_reason: "length"` at `max_tokens` 5 | OpenAI's shape: token counts yes, timings no |
+| Part 3, v1 default | HTTP 200, `prompt_tokens` ≈ **2,050**, wrong answer (`prod`?) | Silent truncation (Lab 03 Step 5a), and `/v1` clients can't change `num_ctx` |
+| Part 3, + options num_ctx | **unknown** | Docs say there's no way; is the native field ignored or quietly honored? |
+| Part 3, + truncate: false | **unknown** | Native field again |
+| Part 3, ctx8k variant | `prompt_tokens` ≈ 5,800, **blue-falcon** | The model's own default is 8K |
+| Part 4 | both valid JSON; json_schema with exactly `kind`, `api_group` | Docs: structured outputs "via `response_format`" |
+| Part 5 | `text/event-stream`, lines `data: {…}`, ending `data: [DONE]`; a usage chunk before it | OpenAI's SSE format, not NDJSON |
+
+Why this matters for Phase 6: a coding agent like Codex talks `/v1`. If it can't turn thinking off and can't raise `num_ctx`, then **every request may think, and every long file may be silently cut to 2,050 tokens**. Lab 03 showed what a model does with half the input.
+
 ### Later steps
 
-* Step 5 — The OpenAI-compatible API with the `openai` library: what's the same, what's missing (`num_ctx`), and why it matters for tools like Codex (Phase 6).
 * Step 6 — Errors, timeouts and concurrency: unknown model, oversized input (`truncate: false`), client timeouts vs cold starts, and what happens to 4 simultaneous requests with one slot (`n_slots = 1`, queued). Testing `OLLAMA_NUM_PARALLEL` > 1 is a server setting change: approval first.
 
 ## 5. Hypotheses → Observed Metrics

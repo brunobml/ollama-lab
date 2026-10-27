@@ -1,0 +1,5 @@
+# qwen3.5:4b with an 8K context, for clients that can't set num_ctx (the OpenAI-compatible API).
+# Create:  ollama create qwen3.5:4b-ctx8k -f labs\04-apis-structured-output\Modelfile.ctx8k
+# Remove:  ollama rm qwen3.5:4b-ctx8k    (removes only this manifest; the weights stay shared with qwen3.5:4b)
+FROM qwen3.5:4b
+PARAMETER num_ctx 8192
