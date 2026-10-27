@@ -60,6 +60,7 @@ Ollama's own `SIZE` estimate was 3.1 GB — plan with measured values.
 * Default `num_ctx` is 4,096. Longer prompts are **silently truncated from the front** (Lab 02: 5,064 → 2,050 tokens, no error).
 * Truncation rule (Lab 03 Step 5a, 0.40.10): **kept = 4 + (num_ctx − 4) / 2**: the first 4 tokens plus the end of the prompt, leaving half the context for the answer. Ollama does it itself (`WARN … msg="truncating input prompt" limit=2050 … keep=4 new=2050` in `server.log`); llama-server reports `truncated = 0`. The response is a normal 200.
 * Undocumented `truncate: false` (request field) returns an error instead: `request (N tokens) exceeds the available context size (4096 tokens), try increasing it`.
+* `/api/chat` trims differently (Lab 03 Step 5b): it drops **whole oldest messages** and keeps the system message, filling the context almost completely (3,970 of 4,096). No log line at the default level.
 * qwen3.5: context shift is disabled by the runner (`KV cache shifting is not supported for this context`), so generation stops when prompt + output reach `num_ctx` (`done_reason: length` before `num_predict`).
 * KV cache is allocated at load for the full `num_ctx`: ≈32 KiB/token for qwen3.5 (hybrid), plus a fixed 50 MiB recurrent state.
 * Changing `num_ctx` starts a new runner (≈4–6 s load).

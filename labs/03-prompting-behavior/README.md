@@ -494,6 +494,35 @@ Part 3, generation overflow (75 lines ≈ 3,644 prompt tokens, `num_predict 3000
 * **Generation stops exactly when the context is full**, here after 452 of the 3,000 allowed tokens. Both modes were identical because **context shift is off for this model**: the runner logged `KV cache shifting is not supported for this context, disabling KV cache shifting`, even though Ollama starts it with `--context-shift`. Likely reason: qwen3.5 is hybrid (Lab 01). Its recurrent layers keep a running state, not per-token entries that could be dropped and shifted. Not verified with a full-attention model.
 * **`done_reason: length` has two meanings:** `num_predict` reached, *or* context full. Here the answer was cut at 452 tokens, far below `num_predict`. Check `prompt_eval_count + eval_count` against `num_ctx` to tell which.
 
+Re-run at 13:43 with the log fix (`context-overflow-20261027-134358.md`): every number and answer identical, and the script now shows both `truncating input prompt` lines.
+
+### Step 5b — One long chat
+
+Raw: `results/raw/chat-overflow-20261027-134507.md`. 28 messages: system (`ORCA-7`), turn 1 (`INC-4821`), 12 log batches of ≈974 tokens each, final question.
+
+| num_ctx | PromptTok | Answer |
+|---|---|---|
+| 16384 | 11,687 (all) | code=ORCA-7 ticket=INC-4821 lowest=**0** |
+| 4096 | **3,970** | code=**ORCA-7** ticket=**INC-2026-10-27-13** lowest=9 |
+
+**Hypothesis A confirmed: `/api/chat` drops whole old messages and keeps the system message.**
+* PromptTok 3,970 ≈ system + batches 9–12 (4 × 974) + question, with the model reporting lowest=9. The oldest messages went: turn 1 (the ticket) and batches 1–8. It is *not* the 5a rule (that would give 2,050).
+* ✅ **The system message survived** at the front, so instructions in the system role outlast a long chat. Facts mentioned in early *user* turns don't.
+* ❌ **The lost ticket was invented, again from what was visible:** `INC-2026-10-27-13` is built from the log timestamps (`2026-10-27T13:…`). That's the same failure as `cluster=prod` in 5a.
+* **Even quieter than 5a:** no `truncating input prompt` warning, nothing in `server.log` at the default log level (0 matching lines). llama-server saw a normal 3,996-token request (`truncated = 0`). The only evidence is PromptTok far below what you sent.
+* **It fills the context almost completely**: 3,970 of 4,096, leaving 126 tokens for the answer (5a left half). A short answer fits. A long one hits the full-context stop from Part 3 (`done_reason: length`).
+* Small aside: with everything visible (16K), it said lowest=**0**; batches start at 1. Even with full context, a 4b model miscounts.
+
+| | One long prompt (5a) | One long chat (5b) |
+|---|---|---|
+| What's dropped | Tokens from the **front** of the prompt (after the first 4) | **Whole oldest messages** |
+| System message | Lost if it's at the front | **Kept** |
+| Size after | 4 + (num_ctx − 4) / 2: half the context | As many messages as fit: ≈ full context |
+| Log trace | `WARN truncating input prompt` | none |
+| Room left for the answer | ≈ half the context | whatever is left (here 126 tokens) |
+
+Not tested: whether `truncate: false` also makes `/api/chat` return an error instead of trimming.
+
 Aside: the same log window shows `llama-server GPU discovery watchdog timed out` warnings at runner start. The runs completed normally. Keep an eye on `ollama ps` (`100% GPU`) after the next loads, in case GPU discovery is struggling with driver 591.86.
 
 ### Lessons
@@ -694,4 +723,58 @@ All three remove unlikely tokens **before** temperature reshapes the odds (the c
 * **min_p = relative to the best token.** Keep tokens with at least `min_p` × the top probability. When the model is sure, only the top one survives (no risk); when it's unsure, alternatives that are nearly as good survive (variety where it's safe).
 
 The broader rule: **temperature sets how adventurous the picks are; the filters decide what's too unlikely to pick at all.** High temperature without filters gives you junk, as seen here. For varied but valid output, use moderate temperature (0.7–1) plus a filter. Here top_k 5 gave the most variety while staying valid; min_p is the adaptive choice when some steps must be exact. For model-specific work, start from the publisher's tuned set (Qwen's are the Ollama defaults) and change one setting at a time, as in this experiment.
+</details>
+
+**11. How would you know the model didn't see your whole input?**
+
+In 5a, the 120-line prompt (5,823 tokens) at `num_ctx 4096` came back as a normal HTTP 200 with `cluster=prod`: the real name, at the top of the prompt, had been cut. The only traces were `prompt_eval_count: 2050` in the response and a `WARN` line in `server.log`.
+
+*In a script that sends logs to the model, how do you detect this, and how do you prevent it?*
+
+<details><summary>Answer</summary>
+
+**Detect:** compare `prompt_eval_count` with what you expected to send. Truncation shows up as a suspiciously round, *constant* number (2,050 at 4,096: 4 + (num_ctx − 4) / 2) whatever the input size. If you count tokens beforehand (or measure once, as the script did at 16K), a mismatch is proof. On the server side, alert on `msg="truncating input prompt"` in `server.log`, like alerting on OOMKilled.
+
+**Prevent:**
+
+* **`truncate: false`:** Ollama returns an error (`request (12063 tokens) exceeds the available context size (4096 tokens)`) instead of answering from half the input. It's undocumented, so re-check after upgrades, but it turns a silent wrong answer into a visible failure. Like `set -euo pipefail`.
+* **Size `num_ctx` for the job:** prompt + expected answer (+ thinking). Lab 02's VRAM math tells you what fits.
+* **Send less:** filter the logs first (errors only, last N minutes, `grep` before the LLM). Cheaper, faster, and the model is better with less noise.
+* **Put the instructions and key facts last, or repeat them at the end:** the end of the prompt is what survives front truncation.
+
+The core lesson: the model can't tell you what it didn't see. It answered `prod` with full confidence, because to the model the cut text never existed.
+</details>
+
+**12. Why did the long chat keep the system message but lose the ticket?**
+
+At `num_ctx 4096`, the 28-message chat kept 3,970 tokens. The answer had the right rotation code (system message) but an invented ticket, `INC-2026-10-27-13`. The real ticket was in the first user message.
+
+*What did Ollama do differently from 5a? What does that mean for designing a long-running assistant (an on-call bot, say)?*
+
+<details><summary>Answer</summary>
+
+For `/api/chat`, Ollama trims at **message boundaries before rendering**. It keeps the system message and the newest messages and drops the oldest ones until the rest fits, so 3,970 tokens, almost the whole context. In 5a there was one big message, so it could only cut tokens from the rendered prompt (keep the first 4, cut the front, keep half).
+
+That gives a clear design rule:
+
+* **Anything that must persist goes in the system message.** Rules, persona, and key facts (the cluster, the ticket, the on-call code). The system message is the one part that survives.
+* **Facts from early user turns expire silently.** Like a sliding window: the bot "forgets" what you told it an hour ago, and as we saw, it may then invent a plausible replacement instead of saying it doesn't know.
+* **Manage history in the client:** summarize old turns into the system message, or keep a structured state (ticket, cluster, findings) and re-send it each turn. The server won't do it for you (Step 3: stateless), and it won't tell you when it drops something (no log line here at all).
+* **Leave room for the answer:** message trimming filled 3,970 of 4,096, leaving 126 tokens. A longer answer would be cut by the full context (`done_reason: length`), so size `num_ctx` for history + answer.
+</details>
+
+**13. "length" means the answer was too long. True?**
+
+In 5a Part 3, generation stopped after 452 tokens with `done_reason: length`, but `num_predict` was 3,000.
+
+*What else can `length` mean, and how do you tell which one happened?*
+
+<details><summary>Answer</summary>
+
+`length` means "stopped because a limit was reached", and there are two limits:
+
+1. **`num_predict`:** the output cap you set. `eval_count` = `num_predict`.
+2. **The context window:** prompt + output reached `num_ctx`. Here 3,644 + 452 = 4,096 exactly. Many models can *shift* the context (drop old tokens and keep going), but the runner disabled that for qwen3.5 (`KV cache shifting is not supported for this context`), likely because its hybrid layers keep a running state that can't be shifted.
+
+To tell them apart: if `eval_count` equals `num_predict`, it was the output cap; if `prompt_eval_count + eval_count` equals `num_ctx`, the context was full. The fixes differ: raise `num_predict` or ask for shorter output in the first case, raise `num_ctx` or send a shorter prompt in the second. Either way, a `length` answer is incomplete and should be handled as such (Q2).
 </details>
