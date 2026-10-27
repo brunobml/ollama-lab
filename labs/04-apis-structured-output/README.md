@@ -85,7 +85,9 @@ py -3.12 -m venv .venv                          # project-local, gitignored; no 
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` pins `ollama==0.6.3` and `pydantic==2.14.1` (≈5 MB of downloads with dependencies, e.g. `httpx`). Everything stays inside `.venv\`; deleting that folder removes it all. **Not run yet: waiting for your approval.**
+`requirements.txt` pins `ollama==0.6.3` and `pydantic==2.14.1` (≈5 MB of downloads with dependencies, e.g. `httpx`). Everything stays inside `.venv\`; deleting that folder removes it all.
+
+**Done 2026-10-27 (approved):** Python 3.12.1 venv, 27.7 MB on disk. Installed `ollama 0.6.3`, `pydantic 2.14.1`, `httpx 0.28.1` (the HTTP client underneath `ollama`) plus 9 small dependencies. Check: `Client(host='http://127.0.0.1:11434').list()` returns both models; `git status` stays clean (`.venv/` is gitignored). Always call the venv's interpreter: `.\.venv\Scripts\python`.
 
 ### Later steps
 

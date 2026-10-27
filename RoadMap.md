@@ -363,6 +363,7 @@ flowchart TD
 | D-04 | 2026-10-10 | Phase 9 compares Ollama, llama.cpp, LM Studio; vLLM optional | Matches the original brief; like-for-like GGUF comparison |
 | D-05 | 2026-10-10 | Verification criteria are written as hypotheses to test | No predetermined results; never fabricate benchmarks |
 | D-06 | 2026-10-10 | Container ports bind to `127.0.0.1:11435` | Avoids LAN exposure and the port clash with Windows Ollama |
+| D-07 | 2026-10-27 | Python 3.12 venv on Windows (`.venv\`, `py -3.12`), pinned `requirements.txt` | Follows D-03; default `python` is a Store 3.9, too old for Pydantic 2.14; project-local, no system changes |
 
 Open decisions (to settle when the phase starts):
 
@@ -380,5 +381,5 @@ Open decisions (to settle when the phase starts):
 | 1 — Foundations | Done — see `labs/01-foundations`, `docs/architecture.md` |
 | 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
-| 4 — APIs | In progress — lab set up (Step 1: streaming); Python venv pending approval |
+| 4 — APIs | In progress — lab set up (Step 1: streaming); Python venv ready (D-07) |
 | 5–9 | Not started |
