@@ -54,7 +54,7 @@ function Invoke-Measured([bool]$stream, [bool]$think, [string]$label) {
         Mode        = $label
         HTTP        = [int]$resp.StatusCode
         TTFT        = [math]::Round($firstAny, 2)       # first text (thinking or answer)
-        FirstAnswer = [math]::Round($firstAnswer, 2)    # first answer text
+        FirstAnswer = if ($null -ne $firstAnswer) { [math]::Round($firstAnswer, 2) } else { $null }   # first answer text; blank = none arrived
         Total       = [math]::Round($total, 2)
         LoadS       = [math]::Round($last.load_duration / 1e9, 2)
         PromptS     = [math]::Round($last.prompt_eval_duration / 1e9, 3)
@@ -76,16 +76,13 @@ $runs = @(
     @{ Stream = $false; Think = $false; Label = 'no stream, warm' }
     @{ Stream = $true;  Think = $true;  Label = 'stream, think, warm' }
 )
-$i = 0
-$rows = foreach ($r in $runs) {
-    Write-Progress -Activity "stream: $Model" -Status "Run $($i + 1) of $($runs.Count): $($r.Label)" -PercentComplete ([int](100 * $i / $runs.Count)); $i++
-    Invoke-Measured $r.Stream $r.Think $r.Label
-}
-Write-Progress -Activity "stream: $Model" -Completed
+# No Write-Progress here: the live text is the progress, and the bar's redraws dropped characters
+# at line wraps in the live output (2026-10-27; the received text itself was intact)
+$rows = foreach ($r in $runs) { Invoke-Measured $r.Stream $r.Think $r.Label }
 $http.Dispose()
 
 "`n"
-$rows | Select-Object Mode, HTTP, TTFT, FirstAnswer, Total, LoadS, PromptS, Chunks, EvalCount, TokS, Done | Format-Table -AutoSize
+$rows | Select-Object Mode, Done, TTFT, FirstAnswer, Total, LoadS, PromptS, Chunks, EvalCount, TokS, HTTP | Format-Table -AutoSize
 "Same answer text, streamed vs not (warm, thinking off): $($rows[1].Text -eq $rows[2].Text)"
 "`nWire format, 'stream, warm' (first 2 lines and the final line):"
 $rows[1].Raw[0..1] + $rows[1].Raw[-1] | ForEach-Object { '  ' + $_.Substring(0, [math]::Min(230, $_.Length)) }

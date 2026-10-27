@@ -142,7 +142,54 @@ The last case is the one to watch. If the server keeps working for a client that
 
 ## 5. Hypotheses → Observed Metrics
 
-*(Filled in after running.)*
+### Step 1 — Streaming vs non-streaming
+
+Raw: `results/raw/stream-20261027-144742.md`. qwen3.5:4b, Ollama 0.40.10, temperature 0.
+
+| Run | TTFT | FirstAnswer | Total | Load | Chunks | EvalCount | tok/s |
+|---|---|---|---|---|---|---|---|
+| stream, cold | 4.21 s | 4.21 s | 5.39 s | 4.08 s | 136 | 136 | 114 |
+| stream, warm | **0.10 s** | 0.10 s | 1.28 s | 0.01 s | 136 | 136 | 115 |
+| no stream, warm | **1.18 s** (= Total) | 1.18 s | 1.18 s | 0.01 s | 1 | 136 | 122 |
+| stream, think, warm | 0.06 s | **none** | 3.51 s | 0.01 s | 359 | **400** (= `num_predict`) | 116 |
+
+| Prediction | Observed |
+|---|---|
+| Cold TTFT ≈ 4–6 s | ✅ 4.21 s, of which 4.08 s was loading |
+| Warm TTFT ≈ 0.1–0.3 s | ✅ 0.10 s |
+| No stream: TTFT = Total, same total time | ✅ 1.18 s vs 1.28 s. The same work, delivered at once |
+| Think: FirstAnswer ≫ TTFT | **More than that: no answer at all.** The thinking used all 400 tokens of `num_predict` and stopped mid-sentence (Lab 03 Step 1 again: thinking needs a bigger budget) |
+| Chunks ≈ EvalCount + 1 | **Chunks = EvalCount** (136): one line per token. The final `done` line carries no text, probably the end-of-turn token |
+| Same text, streamed vs not | ✅ True |
+
+* **Streaming changes perceived latency by ≈12×** (0.10 s vs 1.18 s until the user sees anything) at **no cost in throughput**: the totals are within 0.1 s and tok/s is the same.
+* **Cold starts dominate.** 4.08 s of loading vs 0.05 s of prompt processing. For an interactive tool, `keep_alive` (keep the model loaded) matters more than any streaming optimization, like keeping a minimum of one replica warm instead of scaling to zero.
+* **Thinking streamed 359 lines for 400 tokens.** Some chunks seem to carry more than one token in thinking mode, possibly where the parser buffers text while it looks for the `</think>` tag. Not verified.
+* **A display artifact, not a data problem:** the live console output showed "Unlike th LivenessProbe" and "rotatio until", but the received text (saved file, `SameText`) is intact. Characters were lost at line wraps, likely through the progress bar's redraws (since removed from `stream.ps1`; Python's `print` lost none). Lesson: verify with the data, not with the screen.
+
+### Step 3 — Python client and failure modes
+
+Raw: `results/raw/client-basics-20261027-144842.md`; `server.log` 14:48.
+
+* **Part 1:** ✅ `ollama._types.ChatResponse` vs `dict`, the same answer, and both attribute and dict access work. Durations are integers in nanoseconds. Wall time: library 1.27 s, raw 1.47 s (one sample each; the library's `Client` reuses its connection, `httpx.post` opens a new one. Not measured further).
+* **Part 2:** ✅ TTFT 0.06 s, 136 chunks, the same text, and no lost characters with `print`.
+
+| Case | Predicted | Observed |
+|---|---|---|
+| unknown model | `ResponseError` 404 | ✅ 404 `model 'qwen3.5:404b' not found` |
+| unknown model, stream=True | raised on first `next()` | ✅ "call returned a generator without raising; raised on first next()" |
+| oversized, library | silent, 2,050 tokens | ✅ `prompt_eval_count=2050`, no exception, answer "Based on the log entries provided, the c…". Same `WARN truncating input prompt … prompt=5790` in the log |
+| oversized, raw `truncate: false` | HTTP 400, no exception | ✅ `HTTP 400: {"error":"request (5790 tokens) exceeds the available context size (4096 tokens)…"}`. httpx returned it as a normal response |
+| `temperature: "hot"` | unknown | **`ResponseError` 500**: `option "temperature" must be of type float32` |
+| server not running | `ConnectionError` < 1 s | `ConnectionError` ✅, but after **2.30 s** ❌ |
+| 1 s timeout, cold model | `httpx.ReadTimeout` ≈ 1 s | ✅ after 1.34 s |
+| `/api/ps` 8 s later | unknown | **`[]`: the load was cancelled** |
+
+What it shows:
+* **The server cancels work for a client that left.** `server.log`: `WARN msg="client connection closed before llama-server finished loading, aborting load"`, then `Load failed`. Good news for retry storms: abandoned requests don't pile up. But it also means **a client timeout shorter than the cold start can never succeed**. Every retry starts the load again and cancels it again. It's the same trap as a liveness probe that fires before the app has started: set the first-request timeout above the load time (≈4–6 s here), or warm the model first.
+* **A wrong option *type* is a 500, a wrong option *name* is ignored** (Lab 03 Step 4: `bogus_option` → only a WARN). Two inconsistencies to know: a client error reported as a **server** error (500, not 400), and typos that pass silently. Don't retry 5xx from Ollama blindly: this one fails identically every time.
+* **"Connection refused" took 2.3 s, not milliseconds.** On Windows, a connect to a closed port is retried before it gives up (likely the same Windows TCP behavior behind the ≈2 s `localhost`/`::1` delay in Lab 01; not verified). Health checks with sub-second timeouts would read "slow" as "down" here.
+* **Three exception types to handle:** `ollama.ResponseError` (has `.status_code`; `-1` for mid-stream errors), built-in `ConnectionError`, and `httpx.TimeoutException` subclasses. Plus, with raw httpx, **no exception at all for 4xx/5xx** unless you call `raise_for_status()`.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -158,4 +205,69 @@ The last case is the one to watch. If the server keeps working for a client that
 
 ## 8. Check Your Understanding
 
-*(Added after the results.)*
+Try to answer each one before opening the answer.
+
+**1. Streaming made the first text appear 12× sooner. Did it make the model faster?**
+
+Warm, the streamed run showed text after 0.10 s and finished at 1.28 s. The non-streamed run showed nothing until 1.18 s, then everything. tok/s was ≈115–122 in both.
+
+*What did streaming change, and what didn't it? When would you not bother streaming?*
+
+<details><summary>Answer</summary>
+
+Streaming changes **delivery**, not **generation**. The model produces tokens one at a time either way, at the same speed. Without streaming, Ollama collects them and sends one JSON body at the end; with streaming, it flushes each token as an NDJSON line. Total time and throughput are the same (within noise); only the *time until the client sees something* changes.
+
+Use it when a human is waiting (chat, CLI tools), or when you want to watch and cancel early: a thinking loop or a runaway answer is visible after a second, not after 40 (Lab 03 Step 1). Skip it when a program consumes the whole result anyway (batch jobs, structured JSON you'll parse at the end). There, streaming only adds parsing work. Analogy: `kubectl logs -f` vs `kubectl logs` after the job finished. Same logs, different moment you see them.
+</details>
+
+**2. The client gave up after 1 s, and the server aborted the load. Good or bad?**
+
+With a 1 s timeout on a cold model, the client got `httpx.ReadTimeout`. The server logged "client connection closed before llama-server finished loading, aborting load", and 8 s later no model was loaded.
+
+*What happens if a script has a 1 s timeout and retries 5 times? How would you set timeouts for an Ollama client?*
+
+<details><summary>Answer</summary>
+
+The good part: Ollama doesn't keep working for clients that are gone, so retries don't stack up hidden loads on the GPU (no retry storm on the server side).
+
+The bad part: with a 1 s timeout and a ≈4 s cold start, **every attempt fails**. Each retry starts a new load, times out, and makes the server abort that load. Five retries, five cancelled loads, no answer ever. It's the same trap as a liveness probe that kills a container before it finishes starting: the check is shorter than the startup.
+
+Setting timeouts:
+
+* **Separate connect and read timeouts** (httpx supports `httpx.Timeout(connect=…, read=…)`): connect short-ish (the server is local, though Windows takes ≈2.3 s to refuse), read long enough for **cold load + prompt + generation**.
+* **Or warm the model first** (a tiny request, or `keep_alive` so it stays loaded), then use tighter timeouts.
+* **Retry with backoff only on retryable errors:** connection errors and timeouts, not 4xx and not this 500 (Q3).
+* **Never leave the library default (`None`)** in automation: a hung server would block forever.
+</details>
+
+**3. Which of these errors would you retry?**
+
+From Part 3: `ResponseError` 404 (unknown model), HTTP 400 (context exceeded, raw httpx), `ResponseError` 500 (`option "temperature" must be of type float32`), `ConnectionError`, `httpx.ReadTimeout`.
+
+*Sort them into "retry", "don't retry", and "fix the request". Why is the 500 surprising?*
+
+<details><summary>Answer</summary>
+
+* **Retry (with backoff):** `ConnectionError` (the server may be restarting; Ollama's tray app restarts it) and `ReadTimeout` (if the timeout was reasonable; see Q2, otherwise fix the timeout).
+* **Don't retry, fix the request or the setup:** 404 (pull the model or fix the name: retrying won't make it exist), 400 context exceeded (shrink the input or raise `num_ctx`; this is the error you *want* from `truncate: false`).
+* **The 500:** by HTTP convention, 5xx means "the server failed, the request may be fine", which generic retry logic treats as retryable. Here it's really a client error (a string where a number belongs) reported as 500, so a naive retry policy retries a request that fails identically every time. Lesson: classify errors by *what they mean*, not only by the status code class. And validate requests on the client side: Pydantic models or typed options would have caught `"hot"` before it was sent.
+
+Also remember the asymmetry with Lab 03: a misspelled option *name* doesn't error at all. The 500 only protects you from wrong *types*.
+</details>
+
+**4. The library doesn't have `truncate`. What would you do?**
+
+`client.chat()` has no `truncate` parameter, so an oversized prompt is silently cut to 2,050 tokens (the answer then comes from half the input). Raw httpx with `truncate: false` got a clear HTTP 400.
+
+*How would you get fail-loudly behavior in a Python integration that uses the `ollama` library?*
+
+<details><summary>Answer</summary>
+
+Options, from simplest:
+
+1. **Check after the fact:** compare `response.prompt_eval_count` with the expected size. Truncation shows as a constant `4 + (num_ctx − 4) / 2` (2,050 at 4,096). Raise an error yourself when it matches, or when it's far below what you sent (count tokens once, as Lab 03 did, or estimate ≈4 characters per token for English).
+2. **Call that endpoint with httpx directly** and send `truncate: false` (as Part 3 did). Handle `400` explicitly, and remember `raise_for_status()`.
+3. **Prevent it:** size `num_ctx` for the job, and filter or trim the input before sending (only errors, last N lines). The best truncation is the one you do deliberately.
+
+Whatever you choose, test it: `truncate` is undocumented, so a future Ollama version could change it. A small regression test that sends an oversized prompt and expects the 400 (or the check to fire) makes the upgrade safe. Lab 01's version history shows how often Ollama updates here.
+</details>
