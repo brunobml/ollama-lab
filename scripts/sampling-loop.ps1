@@ -39,8 +39,13 @@ function Get-LastSamplerParams {
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $report = Join-Path $OutDir "sampling-loop-$(Get-Date -Format 'yyyyMMdd-HHmmss').md"
 
+$total = ($conditions | ForEach-Object { $_.Runs } | Measure-Object -Sum).Sum
+$n = 0
 $rows = foreach ($c in $conditions) {
     for ($i = 1; $i -le $c.Runs; $i++) {
+        # Updates between requests only: a single request can take ≈35 s when it loops
+        Write-Progress -Activity "sampling-loop: $Model, $QuestionId" -Status "Request $($n + 1) of ${total}: $($c.Name), run $i of $($c.Runs)" -PercentComplete ([int](100 * $n / $total))
+        $n++
         $opts = @{ num_predict = $NumPredict; num_ctx = $NumCtx } + $c.Opts
         $body = @{ model = $Model; prompt = $q.Q; stream = $false; think = $true; options = $opts } | ConvertTo-Json -Depth 4
         $r = Invoke-RestMethod "$api/api/generate" -Method Post -Body $body -ContentType 'application/json'
@@ -66,5 +71,6 @@ $rows = foreach ($c in $conditions) {
         }
     }
 }
+Write-Progress -Activity "sampling-loop: $Model, $QuestionId" -Completed
 $rows | Format-Table -AutoSize
 "Answers saved to $report"

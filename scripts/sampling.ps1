@@ -36,10 +36,14 @@ $conditions = @(
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $report = Join-Path $OutDir "sampling-$(Get-Date -Format 'yyyyMMdd-HHmmss').md"
 
+$total = $conditions.Count * $prompts.Count * $Runs
+$n = 0
 $rows = foreach ($c in $conditions) {
     $opts = if ($null -eq $c.Set) { @{} } else { $o = $raw.Clone(); foreach ($k in $c.Set.Keys) { $o[$k] = $c.Set[$k] }; $o }
     foreach ($p in $prompts) {
         $answers = for ($i = 1; $i -le $Runs; $i++) {
+            Write-Progress -Activity "sampling: $Model" -Status "Request $($n + 1) of ${total}: $($c.Name) / $($p.Id), run $i of $Runs" -PercentComplete ([int](100 * $n / $total))
+            $n++
             $body = @{ model = $Model; prompt = $p.Q; stream = $false; think = $false; options = $opts + @{ num_predict = 40 } } | ConvertTo-Json -Depth 4
             (Invoke-RestMethod "$api/api/generate" -Method Post -Body $body -ContentType 'application/json').response.Trim()
         }
@@ -55,5 +59,6 @@ $rows = foreach ($c in $conditions) {
         }
     }
 }
+Write-Progress -Activity "sampling: $Model" -Completed
 $rows | Format-Table -AutoSize
 "Answers saved to $report"
