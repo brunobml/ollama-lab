@@ -121,10 +121,49 @@ And:
 * **qwen3 vs gemma: unknown.** Step 1 couldn't separate them; 33 questions still can't separate small differences (one question = 3 points), so only a gap of ≈4+ questions means something.
 * The distractors: k = 3 retrieval will often contain **both** near-duplicates, and the chat model will have to pick (Step 4).
 
+### Step 3 — Chunking: what is the retrieval unit?
+
+So far a whole runbook was one unit. Real documents are longer than an embedding model's context (Step 1: the end gets dropped) and longer than you want in a prompt, so they're cut into **chunks**, and only the best chunks go to the chat model. How you cut decides what can be found: a chunk is all the search engine and the chat model ever see. Analogy: log aggregation. Index a whole day's log as one document and every search "finds" it but tells you nothing; index line by line and a stack trace is split into meaningless pieces.
+
+**New questions first (Step 2 found author bias):**
+* **18 `on-call` questions**, one per topic, written the way you'd type during an incident, from the topic list only, and deliberately **not** in the runbooks' words: "java app gets OOM'd even though grafana says the box has 20 gigs free", "tf in CI refuses to run, says someone else is holding it", "load balancer gives bad gateway for the checkout service". Caveat: written by the same author (me), so the bias is reduced, not removed. Questions from someone who hasn't read the runbooks would still be the better test.
+* **3 `no-answer` questions** whose topic isn't in the corpus at all (etcd space exceeded, port-forward drops, rotating AWS keys). Search always returns *something*; the question is whether its score gives that away.
+* Total: 51 answerable questions + 3 no-answer. Each answerable question has a labelled section (where the answer is: Symptoms, Cause or Fix).
+
+**Five chunking strategies** (`chunking_eval.py`) on the same 18 runbooks:
+
+| Strategy | Chunks | Idea |
+|---|---|---|
+| `doc` | 18 | one chunk per runbook: the Step 2 baseline |
+| `section` | 54 | one chunk per `##` section, with only the section heading ("## Fix …") |
+| `section+title` | 54 | the same, plus the runbook's `#` title in front: a **contextual header** |
+| `fixed-60` | 49 | 60-word windows over the file, ignoring headings |
+| `fixed-60/20` | 58 | 60-word windows overlapping by 20 words |
+
+Searched with BM25, both embedding models (no prefixes; Step 2 found no effect), and the two hybrids. Scored at two levels:
+* **Doc level:** the top chunk comes from the right runbook (enough to find the document).
+* **Section level:** the top chunk *is* the labelled section of the right runbook, e.g. its Fix. That's what a RAG prompt actually needs: a chunk from the right runbook that doesn't contain the answer is useless to the chat model.
+
+```powershell
+.\.venv\Scripts\python scripts\chunking_eval.py      # ≈1–2 minutes; stops both models at the end
+```
+
+**Predictions:**
+
+| Question | Prediction | Why |
+|---|---|---|
+| on-call questions vs Step 2's (doc strategy) | **lower for every method, BM25 most** | No borrowed vocabulary: the author-bias test |
+| `section` vs `doc`, doc level | **lower**: a Fix section alone ("Raise `timeoutSeconds` …") lacks the topic's words | The chunk lost its context |
+| `section+title` vs `section` | **higher**, close to `doc` at doc level | The title puts the topic back into every chunk |
+| Section level vs doc level | **much lower**, ≈55–75% Hit@1 | Symptoms, Cause and Fix of one runbook share vocabulary; picking the right one of three is harder than picking the runbook |
+| Section Hit@3 | high (≈85–95%) | With *k* = 3, the right runbook's three sections often all fit in |
+| `fixed-60` vs `section+title` | **lower** | Windows cut through sections and have no title (except the first) |
+| `fixed-60/20` vs `fixed-60` | slightly higher | Overlap keeps sentences that sit on a boundary in one chunk |
+| hybrid | still the best in every strategy | Uncorrelated errors (Step 2) |
+| no-answer top score | **lower** than most answerable questions, but **not below all of them** | No clean threshold (Q2): you can't reliably say "nothing found" from the score |
+
 ### Later steps (planned)
 
-* **Questions you write:** 8–10 questions in your own words, from real on-call experience, written **without reading the runbooks** (only the list of topics). They go into `questions.json` as their own type, and they're the fix for the author bias Step 2 found.
-* Step 3 — Chunking: fixed size vs Markdown headers, chunk size and overlap, measured on the same questions.
 * Step 4 — RAG end to end: retrieve top-*k*, build the prompt (Lab 03 Step 6 rules), answer with `qwen3.5:4b`, and check whether the answer is right *and* cites the right section. What happens when retrieval misses.
 * Step 5 — A vector store (ChromaDB or sqlite-vec, decided then): what it adds over the numpy array (persistence, metadata filters, approximate search) and what it doesn't change (the vectors).
 

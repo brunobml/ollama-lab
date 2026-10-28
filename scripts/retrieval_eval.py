@@ -94,8 +94,8 @@ paths = sorted((LAB / 'corpus').glob('*.md'))
 names = [p.stem for p in paths]
 texts = [p.read_text(encoding='utf-8') for p in paths]
 titles = [t.splitlines()[0].lstrip('# ').strip() for t in texts]
-questions = json.loads((LAB / 'questions.json').read_text(encoding='utf-8'))
-types = ['paraphrase', 'identifier', 'distractor', 'knowledge']
+questions = [q for q in json.loads((LAB / 'questions.json').read_text(encoding='utf-8')) if q['docs']]  # no-answer: Step 3
+types = list(dict.fromkeys(q['type'] for q in questions))
 say(f'# retrieval_eval: {len(names)} runbooks, {len(questions)} questions '
     f'({", ".join(f"{t} {sum(q["type"] == t for q in questions)}" for t in types)})\n')
 

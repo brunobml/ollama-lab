@@ -34,5 +34,28 @@
   {"id": "k04", "type": "knowledge", "q": "the Let's Encrypt renewal didn't happen", "docs": ["cert-expired"], "section": "Cause"},
   {"id": "k05", "type": "knowledge", "q": "kubectl top says metrics are not available", "docs": ["hpa-not-scaling"], "section": "Symptoms"},
   {"id": "k06", "type": "knowledge", "q": "pods on one node have shown Unknown for several minutes", "docs": ["node-notready"], "section": "Symptoms"},
-  {"id": "k07", "type": "knowledge", "q": "two people ran apply at the same time and one of them got an error", "docs": ["terraform-state-lock"], "section": "Cause"}
+  {"id": "k07", "type": "knowledge", "q": "two people ran apply at the same time and one of them got an error", "docs": ["terraform-state-lock"], "section": "Cause"},
+
+  {"id": "o01", "type": "on-call", "q": "pager went off, payments pods flapping all night and the current logs show nothing useful", "docs": ["crashloopbackoff"], "section": "Fix"},
+  {"id": "o02", "type": "on-call", "q": "java app gets OOM'd even though grafana says the box has 20 gigs free", "docs": ["oomkilled"], "section": "Cause"},
+  {"id": "o03", "type": "on-call", "q": "half the batch jobs on node-7 vanished overnight with status Failed", "docs": ["evicted"], "section": "Symptoms"},
+  {"id": "o04", "type": "on-call", "q": "new deploy stuck at ErrImagePull, it's from our private harbor", "docs": ["imagepullbackoff"], "section": "Fix"},
+  {"id": "o05", "type": "on-call", "q": "scaled to 12 replicas but 4 of them just sit there unscheduled", "docs": ["pending-insufficient"], "section": "Symptoms"},
+  {"id": "o06", "type": "on-call", "q": "postgres statefulset won't come up, its disk never gets created", "docs": ["pvc-pending"], "section": "Cause"},
+  {"id": "o07", "type": "on-call", "q": "rolled out v2 and the new pods never join the load balancer, the old ones keep serving", "docs": ["readiness-probe"], "section": "Cause"},
+  {"id": "o08", "type": "on-call", "q": "spring boot needs 3 minutes to boot and k8s kills it before it's done", "docs": ["liveness-probe"], "section": "Fix"},
+  {"id": "o09", "type": "on-call", "q": "calling the payments service by IP works but by its name it fails from inside the cluster", "docs": ["coredns"], "section": "Cause"},
+  {"id": "o10", "type": "on-call", "q": "chrome screams that the site's https is invalid since this morning", "docs": ["cert-expired"], "section": "Symptoms"},
+  {"id": "o11", "type": "on-call", "q": "the release we pushed an hour ago is broken, how do I get the old one back fast", "docs": ["helm-rollback"], "section": "Fix"},
+  {"id": "o12", "type": "on-call", "q": "pipeline got killed mid-deploy and now helm refuses to touch that release", "docs": ["helm-upgrade-failed"], "section": "Cause"},
+  {"id": "o13", "type": "on-call", "q": "argo keeps saying my app drifted but nobody changed the repo", "docs": ["argocd-outofsync"], "section": "Cause"},
+  {"id": "o14", "type": "on-call", "q": "tf in CI refuses to run, says someone else is holding it", "docs": ["terraform-state-lock"], "section": "Symptoms"},
+  {"id": "o15", "type": "on-call", "q": "one of the workers went dark and everything scheduled on it looks frozen", "docs": ["node-notready"], "section": "Symptoms"},
+  {"id": "o16", "type": "on-call", "q": "autoscaling does nothing, stuck at 2 pods while CPU is pegged", "docs": ["hpa-not-scaling"], "section": "Symptoms"},
+  {"id": "o17", "type": "on-call", "q": "namespace delete has been hanging since yesterday", "docs": ["stuck-terminating"], "section": "Symptoms"},
+  {"id": "o18", "type": "on-call", "q": "load balancer gives bad gateway for the checkout service", "docs": ["ingress-5xx"], "section": "Symptoms"},
+
+  {"id": "n01", "type": "no-answer", "q": "etcd says database space exceeded and writes are failing", "docs": [], "section": null},
+  {"id": "n02", "type": "no-answer", "q": "kubectl port-forward drops every few minutes", "docs": [], "section": null},
+  {"id": "n03", "type": "no-answer", "q": "how do I rotate the AWS access keys our CI runners use", "docs": [], "section": null}
 ]
