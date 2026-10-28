@@ -50,13 +50,13 @@ SCHEMAS = {t['function']['name']: t['function']['parameters'] for t in TOOLS}
 PY_TYPES = {'string': str, 'boolean': bool}
 
 
-def validate(name, args):
+def validate(name, args, schemas=SCHEMAS):
     """The runtime's contract check, like an admission webhook: unknown tool, wrong/missing/extra arguments."""
-    if name not in SCHEMAS:
+    if name not in schemas:
         return f'unknown tool {name!r}'
     if not isinstance(args, dict):
         return f'arguments are {type(args).__name__}, not an object'
-    props, req = SCHEMAS[name]['properties'], SCHEMAS[name]['required']
+    props, req = schemas[name]['properties'], schemas[name]['required']
     missing = [k for k in req if k not in args]
     extra = [k for k in args if k not in props]
     wrong = [k for k, v in args.items() if k in props and not isinstance(v, PY_TYPES[props[k]['type']])]
@@ -101,9 +101,9 @@ TASKS = [
 ]
 
 
-def chat(model, messages, think):
+def chat(model, messages, think, tools=TOOLS):
     r = httpx.post(f'{HOST}/api/chat', timeout=300, json={
-        'model': model, 'messages': messages, 'tools': TOOLS, 'stream': False, 'think': think, 'truncate': False,
+        'model': model, 'messages': messages, 'tools': tools, 'stream': False, 'think': think, 'truncate': False,
         'options': {'num_predict': 2000}})
     r.raise_for_status()
     return r.json()
