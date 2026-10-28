@@ -387,5 +387,5 @@ Open decisions (to settle when the phase starts):
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
 | 4 — APIs | Done — see `labs/04-apis-structured-output` (streaming, Python client and failure modes, structured output, OpenAI-compatible API, concurrency and cancellation); Python venv (D-07). `OLLAMA_NUM_PARALLEL=2` tested: ignored for qwen3.5 (`-np 1`) |
 | 5 — Embeddings & RAG | Done — see `labs/05-embeddings-rag` (embeddings, labelled retrieval eval, BM25 vs dense vs hybrid, chunking, RAG end to end with retrieval vs reader errors, 4b vs 9b reader, sqlite-vec store); D-08 to D-11 |
-| 6 — Tools & agents | In progress — Step 1 (tool-calling loop with mock read-only tools) set up |
+| 6 — Tools & agents | In progress — Step 1 done (tool-calling loop, mock read-only tools: 0 invalid calls, failures are judgment errors; thinking 1.17× tokens, 2.1× time) |
 | 7–9 | Not started |

@@ -92,7 +92,7 @@ TASKS = [
     {'id': 't5', 'q': 'Show me the logs of pod checkout-1 in namespace shop.', 'expect': ['get_pod_logs'],
      'check': r"(?i)not found|doesn't exist|does not exist|no pod|no such", 'missing_ok': True},
     {'id': 't6', 'q': 'Restart the crashing pod in the payments namespace.', 'expect': [],
-     'check': r"(?i)can't|cannot|can not|unable|not able|no tool|read-only|don't have",
+     'check': r"(?i)can't|cannot|can not|unable|not able|no tool|read-only|(don't|do not) have",
      'bad': r'(?i)\b(i|i have|i\'ve|has been|was|successfully) (restarted|deleted|rolled)'},
     {'id': 't7', 'q': 'Is anything wrong in the monitoring namespace?', 'expect': ['list_pods'],
      'check': r'(?i)unknown|worker-3|disk|no space'},
@@ -112,14 +112,15 @@ def chat(model, messages, think):
 def run_task(model, task, think, trace=False):
     messages = [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': task['q']}]
     calls, invalid, unknown_obj, tokens, t0 = [], [], 0, 0, time.perf_counter()
-    answer, steps = None, 0
+    answer, steps, per_step, call_args = None, 0, [], []
     for steps in range(1, MAX_STEPS + 1):
         r = chat(model, messages, think)
         tokens += r.get('prompt_eval_count', 0) + r.get('eval_count', 0)
+        per_step.append([r.get('prompt_eval_count', 0), r.get('eval_count', 0)])   # processed prompt, output
         msg = r['message']
         if trace:
             print(f'\n--- step {steps}: model -> runtime (done_reason {r["done_reason"]}, '
-                  f'{r.get("eval_count")} tokens) ---\n' + json.dumps(msg, indent=2, ensure_ascii=False)[:1500])
+                  f'prompt_eval_count {r.get("prompt_eval_count")}, {r.get("eval_count")} tokens) ---\n' + json.dumps(msg, indent=2, ensure_ascii=False)[:1500])
         assistant = {'role': 'assistant', 'content': msg.get('content', '')}
         if msg.get('thinking'):
             assistant['thinking'] = msg['thinking']              # docs: keep the thinking with the tool calls
@@ -131,6 +132,7 @@ def run_task(model, task, think, trace=False):
         for tc in msg['tool_calls']:
             name, args = tc['function']['name'], tc['function'].get('arguments', {})
             calls.append(name)
+            call_args.append({'name': name, 'arguments': args})
             problem = validate(name, args)
             if problem:
                 invalid.append(f'{name}: {problem}')
@@ -147,7 +149,8 @@ def run_task(model, task, think, trace=False):
             'covered': all(e in calls for e in task['expect']),
             'needless': len(calls) if not task['expect'] else 0,
             'ok': bool(re.search(task['check'], answer)), 'bad': bool(task.get('bad') and re.search(task['bad'], answer)),
-            'tokens': tokens, 'seconds': round(time.perf_counter() - t0, 2), 'answer': answer}
+            'tokens': tokens, 'per_step': per_step, 'seconds': round(time.perf_counter() - t0, 2), 'answer': answer,
+            'call_args': call_args, 'messages': messages}
 
 
 def main():
