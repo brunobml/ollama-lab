@@ -184,7 +184,7 @@ The same pairs, scored by the two models: jargon vs plain words 0.36 vs 0.56, un
 
 <details><summary>Answer</summary>
 
-Similarity values have no absolute meaning; each model has its own scale. qwen3's unrelated floor (0.30) is above gemma's jargon match (0.36 is barely above it, but 0.56 for qwen3). 0.6 would reject the right jargon match for gemma and accept "Helm install" for a rollback question with both. And the threshold would silently change meaning the day you switch models.
+Similarity values have no absolute meaning; each model has its own scale. qwen3's score for an unrelated pair (0.30) is almost as high as gemma's score for a correct jargon match (0.36). 0.6 would reject the right jargon match for gemma and accept "Helm install" for a rollback question with both. And the threshold would silently change meaning the day you switch models.
 
 Instead:
 
