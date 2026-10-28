@@ -1,6 +1,7 @@
 """Lab 04 Step 6. Concurrency, queueing and cancellation, with the server as it is (OLLAMA_NUM_PARALLEL 1).
 
 Run with the venv's interpreter:  .\\.venv\\Scripts\\python scripts\\concurrency.py      (≈2 minutes)
+                 only Part A:     .\\.venv\\Scripts\\python scripts\\concurrency.py --parts A --label "NUM_PARALLEL 2"
 
 Part A: 4 requests at the same moment to one model with one slot (n_slots = 1), cold and warm.
         Queued or parallel? Does the server's total_duration include the time spent waiting?
@@ -9,6 +10,7 @@ Part B: 2 models at the same moment (qwen3.5:4b and qwen3.5:4b-ctx8k, the same w
 Part C: a client that disconnects mid-generation. Does the server stop generating?
         Measured by how long the next request has to wait.
 """
+import argparse
 import json
 import subprocess
 import threading
@@ -96,27 +98,39 @@ def table(recs):
             f'{r.get("eval_count") or 0:>6} {tps:>6.0f}')
 
 
-say(f'# concurrency ({MODEL}, OLLAMA_NUM_PARALLEL 1)\n')
+ap = argparse.ArgumentParser()
+ap.add_argument('--parts', default='ABC', help='which parts to run, e.g. A')
+ap.add_argument('--label', default='OLLAMA_NUM_PARALLEL 1', help='server setting under test, for the report')
+args = ap.parse_args()
+
+say(f'# concurrency ({MODEL}, {args.label})\n')
 say('Times in seconds from the moment all requests were released. Wall = End - Sent (client view), '
     'Server = total_duration, Wait = Wall - Server.\n')
 
 # --- Part A: 4 requests, one model, one slot ---
 jobs = [(MODEL, f'{PROMPT} (request {k})', 200) for k in range(1, 5)]
-say('## Part A1: 4 simultaneous requests, cold model\n')
-unload_all()
-table(run_together(jobs))
-say('\n## Part A2: the same, warm\n')
-table(run_together(jobs))
-say('\n## Part A3: the same 4, one after another (baseline)\n')
-seq, t0 = [], time.perf_counter()
-for m, p, n in jobs:
-    stream_request(m, p, n, t0, seq)
-table(seq)
-say(f'\nsequential total {seq[-1]["end"]:.2f} s')
+if 'A' in args.parts:
+    say('## Part A1: 4 simultaneous requests, cold model\n')
+    unload_all()
+    base = vram_used()
+    table(run_together(jobs))
+    ps = httpx.get(f'{HOST}/api/ps').json()['models']
+    say(f'\nloaded: {[(m["name"], m.get("context_length"), round(m["size_vram"] / 2**20)) for m in ps]} (MiB); '
+        f'nvidia-smi +{vram_used() - base} MiB over {base} MiB idle')
+    say('\n## Part A2: the same, warm\n')
+    table(run_together(jobs))
+    say('\n## Part A3: the same 4, one after another (baseline)\n')
+    seq, t0 = [], time.perf_counter()
+    for m, p, n in jobs:
+        stream_request(m, p, n, t0, seq)
+    table(seq)
+    say(f'\nsequential total {seq[-1]["end"]:.2f} s')
 
 # --- Part B: 2 models at once ---
 have_variant = any(m['name'] == VARIANT for m in httpx.get(f'{HOST}/api/tags').json()['models'])
-if have_variant:
+if 'B' not in args.parts:
+    pass
+elif have_variant:
     say(f'\n## Part B: {MODEL} and {VARIANT} at the same moment (same weights, two names)\n')
     unload_all()
     base = vram_used()
@@ -132,20 +146,21 @@ else:
     say(f'\n({VARIANT} not found: Part B skipped)')
 
 # --- Part C: client disconnects mid-generation ---
-say('\n## Part C: request 1 (num_predict 3000) disconnects 1 s after its first token; request 2 is sent right after\n')
-unload_all()
-httpx.post(f'{HOST}/api/generate', json={'model': MODEL, 'prompt': 'hi', 'stream': False,
-                                         'options': {'num_predict': 1}}, timeout=120)   # warm, so only generation is measured
-t0 = time.perf_counter()
-first = []
-stream_request(MODEL, PROMPT, 3000, t0, first, cancel_after=1.0)
-second = []
-stream_request(MODEL, 'What is a Kubernetes Pod? One sentence.', 50, t0, second)
-c1, c2 = first[0], second[0]
-say(f'request 1: first token {c1["first"]:.2f} s, disconnected at {c1["cancelled"]:.2f} s')
-say(f'request 2: sent {c2["sent"]:.2f} s, first token {c2["first"]:.2f} s '
-    f'(waited {c2["first"] - c2["sent"]:.2f} s), server total {c2["total_duration"] / 1e9:.2f} s')
-say('If the server kept generating request 1 (≈3000 tokens at ≈115 tok/s ≈ 26 s), request 2 would wait ≈25 s.')
+if 'C' in args.parts:
+    say('\n## Part C: request 1 (num_predict 3000) disconnects 1 s after its first token; request 2 is sent right after\n')
+    unload_all()
+    httpx.post(f'{HOST}/api/generate', json={'model': MODEL, 'prompt': 'hi', 'stream': False,
+                                             'options': {'num_predict': 1}}, timeout=120)   # warm, so only generation is measured
+    t0 = time.perf_counter()
+    first = []
+    stream_request(MODEL, PROMPT, 3000, t0, first, cancel_after=1.0)
+    second = []
+    stream_request(MODEL, 'What is a Kubernetes Pod? One sentence.', 50, t0, second)
+    c1, c2 = first[0], second[0]
+    say(f'request 1: first token {c1["first"]:.2f} s, disconnected at {c1["cancelled"]:.2f} s')
+    say(f'request 2: sent {c2["sent"]:.2f} s, first token {c2["first"]:.2f} s '
+        f'(waited {c2["first"] - c2["sent"]:.2f} s), server total {c2["total_duration"] / 1e9:.2f} s')
+    say('If the server kept generating request 1 (≈3000 tokens at ≈115 tok/s ≈ 26 s), request 2 would wait ≈25 s.')
 
 unload_all()
 out = Path('results/raw') / f'concurrency-{datetime.now():%Y%m%d-%H%M%S}.md'

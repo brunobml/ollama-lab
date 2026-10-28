@@ -282,6 +282,34 @@ Errors and timeouts were covered in Step 3 (error types, retry classes, a timeou
 
 Not tested here: the 503 when the queue is full (it needs 512+ waiting requests, or a lower `OLLAMA_MAX_QUEUE`), and `OLLAMA_NUM_PARALLEL` > 1. Both are server environment changes, so they're optional extras that **need approval**: restart Ollama with the variable set, rerun Part A, and compare (expected: overlapping generation, lower tok/s per request, more VRAM for the KV cache).
 
+#### Optional extra: `OLLAMA_NUM_PARALLEL=2`, without a permanent change
+
+The tray app starts `ollama serve` with your user's environment. Instead of setting a user variable (persistent, affects every later session), stop the tray app and run the server **in a terminal, with the variable set only for that process**. Closing the terminal ends the experiment, and nothing on the system has changed. Like `kubectl run` with an env override instead of editing the Deployment.
+
+1. Right-click the Ollama tray icon → **Quit Ollama**. Check: `Get-Process ollama*` returns nothing (otherwise port 11434 is still taken).
+2. In a **new** PowerShell window (it stays open; the server logs go to this window, not to `server.log`):
+   ```powershell
+   $env:OLLAMA_NUM_PARALLEL = '2'; ollama serve
+   ```
+   Check the startup line `server config` for `OLLAMA_NUM_PARALLEL:2`. It's still bound to `127.0.0.1:11434` (the default `OLLAMA_HOST`).
+3. In your usual window:
+   ```powershell
+   .\.venv\Scripts\python scripts\concurrency.py --parts A --label "OLLAMA_NUM_PARALLEL 2"
+   ```
+   In the server window, look for the llama-server lines with `n_slots = 2` and `n_ctx_slot` (and copy them with the output).
+4. Back to normal: **Ctrl+C** in the server window, then start **Ollama** from the Start menu (the tray app comes back with the defaults). Check: `Get-Process ollama*` shows `ollama app` and `ollama` again.
+
+**Predictions (Part A with 2 slots):**
+
+| Measure | 1 slot (measured) | 2 slots (prediction) | Why |
+|---|---|---|---|
+| First tokens, warm | 0.56 / 2.24 / 3.92 / 5.61 s | requests 1+2 together (≈0.1 s), 3+4 when those finish | Two slots generate at once; the rest still queue |
+| tok/s per request | 122 | **lower**, ≈70–100 | Both share one GPU |
+| Combined tok/s | 122 | **higher**, ≈150–200 | Token generation is limited by memory bandwidth (Lab 02): reading the weights once for 2 tokens is almost free |
+| Total for 4 requests | 7.25 s | ≈4.5–6 s | Follows from combined throughput |
+| VRAM | ≈3,860 MiB at 4K | **+≈130 MiB or more** | The FAQ says the context is multiplied: 2 × 4,096 = 8,192 total, so twice the KV cache (32 KiB/token) |
+| `n_ctx_slot` | 4,096 | **4,096** (unknown: or 2,048?) | Does each slot keep the full context, or is it split? |
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 — Streaming vs non-streaming
