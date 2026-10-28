@@ -77,9 +77,52 @@ flowchart LR
 
 What this means for RAG: if Part 4 shows silent truncation, **every chunk longer than the context loses its end without an error**, so chunk size must stay below the embedding model's context, and `truncate: false` (or counting `prompt_eval_count`) is the safety check.
 
+### Step 2 — Retrieval quality on a labelled corpus
+
+Step 1 had 6 queries: one miss moved the score by 17 points, so it couldn't compare anything. Step 2 builds a small **labelled evaluation set**, the retrieval equivalent of a test suite: questions whose right answer is known, so any change (model, prefix, chunking later) gets a number instead of an impression.
+
+**The data (written for this lab, no private documents):**
+* `corpus/*.md`: **18 synthetic runbooks**, ≈120–200 words each, all in the same shape (`# Title`, `## Symptoms`, `## Cause`, `## Fix`). Topics: CrashLoopBackOff, OOMKilled, eviction, ImagePullBackOff, Pending (resources), PVC Pending, readiness, liveness, DNS, expired certificates, Helm rollback, Helm "another operation in progress", Argo CD OutOfSync, Terraform state lock, node NotReady, HPA not scaling, stuck Terminating, ingress 502/503. The facts are standard Kubernetes/Helm/Terraform behavior; error strings are written as the tools print them.
+* **Deliberate near-duplicates**, as in real runbook collections: readiness vs liveness, OOMKilled vs eviction, Helm rollback vs Helm "operation in progress", PVC Pending vs Pending for CPU, and "137" in both the OOM and the liveness runbooks.
+* `questions.json`: **33 questions** in four types, each labelled with its runbook(s) and section (the section is for Step 3):
+
+| Type | N | What it tests | Example |
+|---|---|---|---|
+| paraphrase | 10 | the same problem in other words, no shared keywords | "a worker machine dropped out of the cluster" → node NotReady |
+| identifier | 10 | an exact error string or code, copied from the runbook | `TARGETS <unknown>/80%` → HPA |
+| distractor | 6 | a near-identical runbook exists | "health check keeps failing while it is still starting up" → liveness, not readiness |
+| knowledge | 7 | needs an inference the text doesn't spell out | "two people ran apply at the same time" → Terraform state lock |
+
+One question has **two acceptable answers** (k01 "pod is up but gets no traffic": readiness *or* ingress 502/503), so the label doesn't punish a defensible answer (Lab 04 Step 4's ground-truth caveat).
+
+**Methods** (`retrieval_eval.py`), one retrieval unit = one whole runbook (chunking is Step 3):
+* **BM25**, the classic keyword ranking behind Elasticsearch/OpenSearch, implemented in ≈20 lines in the script so nothing is hidden: rare words that match count a lot, common words little, long documents are normalized.
+* **Each embedding model, with and without the model card's prefixes** (gemma's document prefix uses the runbook's real title).
+* **Hybrid:** BM25 and one embedding ranking merged with **reciprocal rank fusion** (RRF): each method adds `1/(60 + rank)` per runbook. It uses ranks, not scores, so it doesn't care that BM25 scores and cosine similarities have different scales (Step 1 Q2).
+* Runbooks are embedded with `truncate: false`, so one that exceeded the context would fail instead of being cut silently (the Step 1 lesson).
+
+**Metrics:** Hit@1 (right runbook first), **Hit@3** (it's in the top 3, i.e. in the prompt of a RAG system with *k* = 3), MRR (mean of 1/rank). Each Hit@1 is also split by question type, and every miss is listed with what came first.
+
+```powershell
+.\.venv\Scripts\python scripts\retrieval_eval.py      # ≈1 minute; stops both models at the end
+```
+
+**Predictions:**
+
+| Method | paraphrase | identifier | distractor | knowledge | Overall Hit@1 / Hit@3 |
+|---|---|---|---|---|---|
+| BM25 | **weak**, ≈3–5/10 | **≈10/10** | ≈3–4/6 | weak, ≈2–3/7 | ≈55–65% / ≈75% |
+| embeddings (either) | **≈8–9/10** | ≈7–9/10 (blurs exact codes, Step 1) | ≈3–5/6 | ≈4–5/7 | ≈70–80% / ≈90% |
+| + prefixes | small gain or none | | | | ±1–2 questions (noise at 33) |
+| hybrid | ≈ the better of the two per type | **≈10/10** | | | **the best overall**, Hit@3 ≈95% |
+
+And:
+* **Hit@3 well above Hit@1** for every method: retrieval is often "close", which is why RAG passes several chunks, not one.
+* **qwen3 vs gemma: unknown.** Step 1 couldn't separate them; 33 questions still can't separate small differences (one question = 3 points), so only a gap of ≈4+ questions means something.
+* The distractors: k = 3 retrieval will often contain **both** near-duplicates, and the chat model will have to pick (Step 4).
+
 ### Later steps (planned)
 
-* Step 2 — A labelled corpus: ≈15–25 synthetic runbook documents written for this lab (no private documents), with ≈20–30 questions whose right passage is known. Hit rate and MRR per model, the effect of prefixes, and BM25 keyword search as the baseline (the search equivalent of "does the fancy thing beat `grep`?").
 * Step 3 — Chunking: fixed size vs Markdown headers, chunk size and overlap, measured on the same questions.
 * Step 4 — RAG end to end: retrieve top-*k*, build the prompt (Lab 03 Step 6 rules), answer with `qwen3.5:4b`, and check whether the answer is right *and* cites the right section. What happens when retrieval misses.
 * Step 5 — A vector store (ChromaDB or sqlite-vec, decided then): what it adds over the numpy array (persistence, metadata filters, approximate search) and what it doesn't change (the vectors).

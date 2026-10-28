@@ -1,0 +1,38 @@
+[
+  {"id": "p01", "type": "paraphrase", "q": "my service restarts over and over and the wait between restarts keeps growing", "docs": ["crashloopbackoff"], "section": "Symptoms"},
+  {"id": "p02", "type": "paraphrase", "q": "a whole bunch of pods got kicked off a machine that ran out of RAM", "docs": ["evicted"], "section": "Symptoms"},
+  {"id": "p03", "type": "paraphrase", "q": "the new pod has been waiting forever and never gets assigned to a machine", "docs": ["pending-insufficient"], "section": "Symptoms"},
+  {"id": "p04", "type": "paraphrase", "q": "the app is up but users can't reach it and it never shows as ready", "docs": ["readiness-probe"], "section": "Symptoms"},
+  {"id": "p05", "type": "paraphrase", "q": "services can't find each other by name", "docs": ["coredns"], "section": "Symptoms"},
+  {"id": "p06", "type": "paraphrase", "q": "go back to the chart version we had yesterday", "docs": ["helm-rollback"], "section": "Fix"},
+  {"id": "p07", "type": "paraphrase", "q": "the autoscaler isn't adding replicas even though load is high", "docs": ["hpa-not-scaling"], "section": "Symptoms"},
+  {"id": "p08", "type": "paraphrase", "q": "a worker machine dropped out of the cluster", "docs": ["node-notready"], "section": "Symptoms"},
+  {"id": "p09", "type": "paraphrase", "q": "the storage request never gets a disk", "docs": ["pvc-pending"], "section": "Symptoms"},
+  {"id": "p10", "type": "paraphrase", "q": "deleting the namespace never finishes", "docs": ["stuck-terminating"], "section": "Symptoms"},
+
+  {"id": "i01", "type": "identifier", "q": "exit code 137", "docs": ["oomkilled"], "section": "Symptoms"},
+  {"id": "i02", "type": "identifier", "q": "x509: certificate has expired or is not yet valid", "docs": ["cert-expired"], "section": "Symptoms"},
+  {"id": "i03", "type": "identifier", "q": "Error acquiring the state lock", "docs": ["terraform-state-lock"], "section": "Symptoms"},
+  {"id": "i04", "type": "identifier", "q": "toomanyrequests", "docs": ["imagepullbackoff"], "section": "Symptoms"},
+  {"id": "i05", "type": "identifier", "q": "UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress", "docs": ["helm-upgrade-failed"], "section": "Symptoms"},
+  {"id": "i06", "type": "identifier", "q": "TARGETS <unknown>/80%", "docs": ["hpa-not-scaling"], "section": "Symptoms"},
+  {"id": "i07", "type": "identifier", "q": "pod has unbound immediate PersistentVolumeClaims", "docs": ["pvc-pending"], "section": "Symptoms"},
+  {"id": "i08", "type": "identifier", "q": "0/3 nodes are available: 3 Insufficient cpu", "docs": ["pending-insufficient"], "section": "Symptoms"},
+  {"id": "i09", "type": "identifier", "q": "lookup orders-db on 10.96.0.10:53: no such host", "docs": ["coredns"], "section": "Symptoms"},
+  {"id": "i10", "type": "identifier", "q": "kubernetes.io/pvc-protection", "docs": ["stuck-terminating"], "section": "Cause"},
+
+  {"id": "d01", "type": "distractor", "q": "my container gets restarted because the health check keeps failing while it is still starting up", "docs": ["liveness-probe"], "section": "Cause"},
+  {"id": "d02", "type": "distractor", "q": "the container was killed for using too much memory itself, the node had plenty free", "docs": ["oomkilled"], "section": "Cause"},
+  {"id": "d03", "type": "distractor", "q": "helm says another upgrade is still running but nothing is running", "docs": ["helm-upgrade-failed"], "section": "Symptoms"},
+  {"id": "d04", "type": "distractor", "q": "Argo CD shows the replica count changing back and forth after every sync", "docs": ["argocd-outofsync"], "section": "Symptoms"},
+  {"id": "d05", "type": "distractor", "q": "502 bad gateway from the ingress although the pods are ready", "docs": ["ingress-5xx"], "section": "Cause"},
+  {"id": "d06", "type": "distractor", "q": "pod is Pending and the event mentions a volume claim, not CPU", "docs": ["pvc-pending"], "section": "Symptoms"},
+
+  {"id": "k01", "type": "knowledge", "q": "pod is up but gets no traffic", "docs": ["readiness-probe", "ingress-5xx"], "section": "Cause"},
+  {"id": "k02", "type": "knowledge", "q": "our Java service dies at every traffic peak; heap is 4 GB and the container limit is 4Gi", "docs": ["oomkilled"], "section": "Fix"},
+  {"id": "k03", "type": "knowledge", "q": "after a CI job was cancelled halfway, every deploy of the release is blocked", "docs": ["helm-upgrade-failed"], "section": "Cause"},
+  {"id": "k04", "type": "knowledge", "q": "the Let's Encrypt renewal didn't happen", "docs": ["cert-expired"], "section": "Cause"},
+  {"id": "k05", "type": "knowledge", "q": "kubectl top says metrics are not available", "docs": ["hpa-not-scaling"], "section": "Symptoms"},
+  {"id": "k06", "type": "knowledge", "q": "pods on one node have shown Unknown for several minutes", "docs": ["node-notready"], "section": "Symptoms"},
+  {"id": "k07", "type": "knowledge", "q": "two people ran apply at the same time and one of them got an error", "docs": ["terraform-state-lock"], "section": "Cause"}
+]
