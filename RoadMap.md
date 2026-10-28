@@ -369,10 +369,10 @@ flowchart TD
 | D-08 | 2026-10-27 | Phase 5 Python stays in the Windows venv (revises D-03's "move to WSL2 before Phase 5") | D-07's venv works against `127.0.0.1`; WSL2 would need a `.wslconfig` networking change for no learning gain yet |
 | D-09 | 2026-10-27 | Embedding models: `embeddinggemma:300m` and `qwen3-embedding:0.6b` (≈1.26 GB together) | Two small models to compare retrieval quality; the chat model can't embed on this runner (`/api/embed` → 501) |
 | D-10 | 2026-10-27 | Vectors in a numpy array (brute-force cosine) first; a vector DB only in a later step | A few hundred chunks need no index; learn what a DB adds before adding it |
+| D-11 | 2026-10-28 | Phase 5 vector store: sqlite-vec 0.1.9 (one SQLite file, pip in the venv) | Small, embeddable, no server; ChromaDB's larger dependency tree isn't needed for 54 chunks. Pre-v1: expect breaking changes |
 
 Open decisions (to settle when the phase starts):
 
-* Phase 5 Step 5: vector store (ChromaDB vs SQLite-vec).
 * Phase 8: kind vs k3s.
 
 ---
@@ -386,5 +386,5 @@ Open decisions (to settle when the phase starts):
 | 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
 | 4 — APIs | Done — see `labs/04-apis-structured-output` (streaming, Python client and failure modes, structured output, OpenAI-compatible API, concurrency and cancellation); Python venv (D-07). Optional: `OLLAMA_NUM_PARALLEL` > 1 (needs approval) |
-| 5 — Embeddings & RAG | In progress — Step 1 (what an embedding is) done; Step 2 (labelled retrieval eval: BM25 vs embeddings vs hybrid) done; Step 3 (chunking, on-call and no-answer questions) done; Step 4 (RAG end to end: retrieval vs reader errors; 4b vs 9b reader) done; models pulled (D-09) |
+| 5 — Embeddings & RAG | In progress — Step 1 (what an embedding is) done; Step 2 (labelled retrieval eval: BM25 vs embeddings vs hybrid) done; Step 3 (chunking, on-call and no-answer questions) done; Step 4 (RAG end to end: retrieval vs reader errors; 4b vs 9b reader) done; Step 5 (sqlite-vec vector store) set up; models pulled (D-09) |
 | 6–9 | Not started |

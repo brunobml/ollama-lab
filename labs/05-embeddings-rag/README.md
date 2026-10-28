@@ -205,6 +205,42 @@ And:
 * **No-answer questions:** the model should abstain with `parents`, but may answer from a loosely related runbook ("port-forward drops" → crash loop) for at least one.
 * `parents` costs ≈2× the prompt tokens of `chunks`, ≈0.1–0.2 s more per answer (prompt processing is fast, Lab 02).
 
+### Step 5 — A vector store: sqlite-vec
+
+Until now the "index" was a numpy array rebuilt on every run: embed 54 chunks, multiply, sort. That's fine for a lab, but a real system needs the vectors to **persist** (embed once, query for months), to sit **next to their metadata** (which runbook, which section, the text), and to be **queried by other programs**. A vector store does that. Analogy: the numpy array is an in-memory cache built at startup; the vector store is the database behind it.
+
+**Verified before the experiment (2026-10-28):**
+* Installed `sqlite-vec==0.1.9` in the venv (D-11, pinned in `requirements.txt`). SQLite 3.43.1 (Python 3.12's bundled one); `vec_version()` = `v0.1.9`. The README says "`sqlite-vec` is a pre-v1, so expect breaking changes!"
+* `vec0` virtual tables: vectors as `float[N]`, `int8[N]` or `bit[N]`; **metadata columns** that can be filtered in a KNN query's `WHERE` (only `=`, `!=`, `>`, `>=`, `<`, `<=`); **auxiliary columns** (`+text`) that are stored but not filterable; queries use `emb match ? and k = N`. Tested here: `distance_metric=cosine` works, a `kind = 'b'` metadata filter works, and `vec_quantize_int8(v, 'unit')` / `vec_quantize_binary(v)` produce 8-byte / 1-byte vectors for 8 dims.
+* **Not stated in the docs:** whether KNN is exhaustive or approximate. Part F measures it indirectly (time vs size, and top-1 = exact top-1).
+* `*.db` is gitignored, so the index file (`labs/05-embeddings-rag/index.db`) stays out of Git, like weights and raw results.
+
+`vector_store.py` (embedding model: `qwen3-embedding:0.6b`, dense search only, no BM25):
+
+* **Part A, build:** embed the 54 section+title chunks once, insert them with `doc` and `section` as metadata and the text as an auxiliary column, plus three tables (float32, int8, bit), and a `meta` table that records **which model and chunking built the index**. File size, embedding time vs insert time.
+* **Part B, same answers?** For all 54 questions: is sqlite-vec's ranking identical to numpy's dot product, and how far apart are the distances (`distance` = 1 − cosine)?
+* **Part C, persistence:** close the file, reopen, answer without re-embedding. Then query with a 768-dim vector (embeddinggemma's size) against the 1,024-dim index.
+* **Part D, metadata filter:** for the questions labelled "Fix", search only `section = 'Fix'`. When the question type is known ("how do I fix…"), does a filter beat the vector's own choice of section (Step 3's weak spot)?
+* **Part E, quantized vectors:** float32 (4,096 bytes per vector) vs int8 (1,024) vs bit (128), and the common pattern **bit search for 30 candidates, then exact float32 re-ranking**. Doc and section Hit@1 / Hit@3.
+* **Part F, scale:** 50,000 random 1,024-dim vectors in memory: insert rate, query time (float32 vs bit vs a numpy matrix product), and whether sqlite-vec's top-1 is the exact top-1.
+
+```powershell
+.\.venv\Scripts\python scripts\vector_store.py      # ≈1–2 minutes; stops the embedding model after Part A
+```
+
+**Predictions:**
+
+| Part | Prediction | Why |
+|---|---|---|
+| A | file ≈0.5–1 MB; insert ≪ embedding time (milliseconds vs seconds) | Storing vectors is cheap; computing them is the expensive part |
+| B | **identical rankings** (maybe a near-tie swapped), distance diff ≈1e-7 | The same cosine math, float32 vs numpy's float32/float64 mix |
+| C | reopens in milliseconds; **the 768-dim query fails with an error** | vec0 knows its dimension; but a same-sized vector from another model would pass |
+| D | section Hit@1 **rises clearly** for Fix questions | The filter removes the Symptoms/Cause sections that compete with the Fix |
+| E | int8 ≈ float32 (±1); **bit clearly worse**; bit + re-rank ≈ float32 | Lab 02's quantization trade-off, applied to vectors; re-ranking recovers the precision on a short candidate list |
+| F | sqlite-vec float32 a few tens of ms/query at 50k, slower than numpy; bit several times faster; top-1 exact 20/20 | A full scan (exhaustive search) in C over rows vs one BLAS matrix product; that would also be the signal that it's not an approximate index |
+
+What the vector store is **not** expected to change: retrieval quality. The vectors are the same, so Steps 2–4's numbers hold; the store adds persistence, metadata, and speed/size options.
+
 ### Later steps (planned)
 * Step 5 — A vector store (ChromaDB or sqlite-vec, decided then): what it adds over the numpy array (persistence, metadata filters, approximate search) and what it doesn't change (the vectors).
 
