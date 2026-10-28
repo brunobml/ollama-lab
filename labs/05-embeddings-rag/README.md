@@ -86,7 +86,60 @@ What this means for RAG: if Part 4 shows silent truncation, **every chunk longer
 
 ## 5. Hypotheses → Observed Metrics
 
-*(Filled in after each run.)*
+### Step 1 — What an embedding is
+
+Raw: `results/raw/embed-basics-20261027-225633.md`. Ollama 0.40.10. The losing passages were looked up afterwards with the same code and texts (not saved).
+
+| Model | Dims | Norm | Load | Tokens for "The pod keeps restarting." | Same twice | Batch vs single | ms/text (batch of 48) |
+|---|---|---|---|---|---|---|---|
+| embeddinggemma:300m | 768 | 1.0000 | 2.51 s | 7 | identical | **max diff 0.0** | 17.3 |
+| qwen3-embedding:0.6b | 1,024 | 1.0000 | 1.59 s | 6 | identical | **max diff 0.0** | 14.8 |
+
+| Pair | gemma | qwen3 |
+|---|---|---|
+| identical | 1.000 | 1.000 |
+| paraphrase ("keeps restarting" / "stuck in a crash loop") | 0.617 | 0.666 |
+| jargon vs plain words (`ImagePullBackOff` / "cannot download the image") | **0.361** | 0.558 |
+| **negation** ("ready" / "not ready") | **0.833** | **0.890** |
+| same topic, other task (Helm rollback / install) | 0.628 | 0.680 |
+| other language (Portuguese) | 0.758 | 0.648 |
+| unrelated (baking bread) | 0.193 | 0.296 |
+
+| Retrieval (6 passages, 6 queries) | Hits@1 | Mean margin | Missed |
+|---|---|---|---|
+| gemma, no prefixes | 5/6 | 0.135 | "pod is up but gets no traffic" → **pending** (0.537) over readiness (0.433) |
+| gemma, prefixes | 5/6 | 0.145 | the same |
+| qwen3, no prefixes | 4/6 | 0.098 | "no traffic" → pending; "my app keeps dying and coming back" → **oom** (0.568) over crashloop (0.448) |
+| qwen3, prefix | 4/6 | 0.117 | "no traffic" → pending; "container killed, exit status 137" → **crashloop 0.601 vs oom 0.598** |
+
+| Long input (19,158 chars) | Tokens embedded | `truncate: false` | Similarity to start / end |
+|---|---|---|---|
+| gemma (num_ctx 2,048) | 2,048, no error | HTTP 400 "the input length exceeds the context length" | **0.985** / 0.844 |
+| qwen3 (num_ctx 4,096) | 4,095, no error | HTTP 400 | **0.980** / 0.830 |
+
+| Prediction | Observed |
+|---|---|
+| Norm 1.0000 | ✅ |
+| Same text twice: identical | ✅ |
+| Batch vs single: tiny differences | ❌ **exactly identical** (0.0). Unlike generation in Lab 03, batching didn't change a single bit here |
+| ≈5–20 ms/text, gemma faster | ✅ range; ❌ qwen3 was a little faster (14.8 vs 17.3). gemma is BF16, qwen3 Q8_0: both ≈600 MB of weights to read, so "fewer parameters" didn't mean less work |
+| paraphrase ≈0.7–0.9 | ❌ lower: **0.62 / 0.67** |
+| **negation higher than the paraphrase** | ✅ **0.83 / 0.89**, the highest non-identical pair in both models |
+| unrelated not 0 (≈0.1–0.4) | ✅ 0.19 / 0.30 |
+| other language fairly high | ✅ 0.76 / 0.65: gemma rates the Portuguese translation **above** the English paraphrase |
+| different scales per model | ✅ qwen3 is higher across the board (floor 0.30 vs 0.19) |
+| hits@1 5–6/6; prefixes raise the margin more than hits | ≈ 5/6 and 4/6; prefixes raised the margin a little (+0.01, +0.02) and didn't change hits |
+| Part 4: no error, 2,048 / 4,096 tokens | ✅ 2,048 / **4,095** (one less; probably a token the model appends itself, not verified). qwen3 uses the 4,096 default, not its 32K |
+| Part 4: the start is kept | ✅ start 0.98 vs end 0.83–0.84: **the end of the text is dropped**, the opposite of chat truncation (Lab 03 kept the end) |
+
+What it shows:
+* **An embedding measures "about the same thing", not "means the same thing".** "The pod is ready" and "The pod is not ready" were closer than a real paraphrase in both models. For retrieval that's mostly fine: both sentences belong in the same runbook. For anything that depends on *polarity* (is this a success or a failure log line?), similarity is the wrong tool; that's the chat model's job, or a filter.
+* **Scores are relative, not absolute.** The same pair got 0.36 from one model and 0.56 from the other; the unrelated floor is 0.19 vs 0.30. A threshold like "similarity > 0.6 means relevant" is model-specific, like a latency SLO that only makes sense for one service. And "same topic, other task" (rollback vs install, 0.63–0.68) scored like the paraphrase: a question about rolling back will also pull up install docs.
+* **Dense embeddings blur exact tokens.** "container killed, exit status 137" vs a passage that literally contains "exit code 137": qwen3 with the prefix ranked it second by **0.003**. A keyword search (BM25) would have found it instantly. Error codes, pod names and flags are exactly what engineers search for, so Step 2 measures BM25 next to the embeddings (hybrid search is the usual fix).
+* **The hard query was one that needs knowledge, not words:** "pod is up but gets no traffic" means "removed from the Service endpoints", which is in the readiness passage. Both models sent it to the *Pending* passage (pod + something wrong). The embedding can only match what the text says, not what an engineer infers.
+* **6 queries can't rank the models.** gemma 5/6 vs qwen3 4/6 is one query, and the prefix moved qwen3's miss from one query to another. That's noise at this size; Step 2's labelled set (20–30 questions) is there to measure it properly.
+* **Long chunks lose their end silently.** Default `truncate: true` dropped everything after 2,048 (gemma) or 4,095 (qwen3) tokens, without an error and with HTTP 200. A runbook chunk whose fix is in its last paragraph would be indexed **without the fix**. Keep chunks well below the embedding model's context, and check `prompt_eval_count`, or use `truncate: false` while indexing so oversized chunks fail loudly.
+* **Deterministic and batch-invariant:** the same text always gives the same vector, so an index can be rebuilt reproducibly, and batching while indexing is safe.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -102,4 +155,77 @@ What this means for RAG: if Part 4 shows silent truncation, **every chunk longer
 
 ## 8. Check Your Understanding
 
-*(Added after the results.)*
+Try to answer each one before opening the answer.
+
+**1. "The pod is ready" vs "The pod is not ready" scored 0.83–0.89, higher than a real paraphrase (0.62–0.67). Is the embedding broken?**
+
+The paraphrase pair was "The pod keeps restarting." / "The container is stuck in a crash loop."
+
+*What does cosine similarity actually measure, and where would this behavior hurt you in a RAG system or a log pipeline?*
+
+<details><summary>Answer</summary>
+
+It isn't broken; it's doing what it was trained for. An embedding places texts by **what they're about**: the same words, the same subject, the same context of use. "Ready" and "not ready" share almost every token and appear in exactly the same documents (readiness probes, pod status), so they land close together. The paraphrase uses different words ("restarting" vs "crash loop") and has to be matched by learned meaning, which is a harder and weaker signal.
+
+For retrieval this is mostly what you want: a question about a pod that isn't ready *should* find the readiness runbook. It hurts where the **polarity** matters:
+
+* Classifying log lines as success/failure by similarity to examples: "deployment succeeded" and "deployment failed" will look alike.
+* Deduplicating alerts by similarity: "disk usage is below 80%" and "disk usage is above 80%" would merge.
+* A RAG answer that needs "when does it NOT restart": retrieval brings the right passage, but the **chat model** has to read the "not" (Lab 03 Step 6 showed it can).
+
+Rule: use embeddings to find *candidates* by topic, and use exact filters or the chat model for logic. It's like a search index: it finds the right file, but `grep -v` is still a separate step.
+</details>
+
+**2. A teammate proposes "anything above 0.6 similarity is relevant". What's wrong with that?**
+
+The same pairs, scored by the two models: jargon vs plain words 0.36 vs 0.56, unrelated 0.19 vs 0.30, same topic but other task 0.63 vs 0.68.
+
+*Why doesn't a fixed threshold work, and what would you do instead?*
+
+<details><summary>Answer</summary>
+
+Similarity values have no absolute meaning; each model has its own scale. qwen3's unrelated floor (0.30) is above gemma's jargon match (0.36 is barely above it, but 0.56 for qwen3). 0.6 would reject the right jargon match for gemma and accept "Helm install" for a rollback question with both. And the threshold would silently change meaning the day you switch models.
+
+Instead:
+
+* **Rank, don't threshold:** take the top-*k* (Step 2 measures which *k*) and let the chat model ignore what's irrelevant.
+* If you need a cut-off (to answer "I don't know" when nothing matches), **calibrate it per model on labelled data**: the scores of right vs wrong passages for real questions. Store the model name next to the threshold.
+* Look at the **margin** (best minus second best) as well as the score: a top result that barely beats the rest is a weak match.
+
+It's the same as alert thresholds: a CPU threshold tuned on one instance type doesn't carry over to another; you set it from that system's own baseline.
+</details>
+
+**3. "container killed, exit status 137" didn't reliably find the passage that contains "exit code 137". Why, and what's the fix?**
+
+qwen3 with the prefix ranked the OOM passage second, 0.598 vs 0.601. The other model found it, and it's the one query that shares an exact token with its passage.
+
+*Why are dense embeddings weak at exact identifiers, and why does that matter for engineering docs in particular?*
+
+<details><summary>Answer</summary>
+
+An embedding compresses a whole text into 768–1,024 numbers that represent its overall meaning. One token like "137" is a small part of that, and numbers carry little meaning on their own, so it barely moves the vector. "container killed" pulled the query toward "a container exits repeatedly" just as strongly.
+
+Engineering search is full of exact identifiers: exit codes, error strings (`ImagePullBackOff`), flags (`--previous`), resource names, versions. Keyword search (BM25, the algorithm behind Elasticsearch/OpenSearch scoring) is excellent at exactly those and weak at paraphrases. Embeddings are the opposite. So the standard fix is **hybrid search**: run both, and merge the rankings (for example with reciprocal rank fusion). Step 2 adds BM25 as a baseline to measure how often each one wins on this lab's questions.
+
+Analogy: label selectors vs free-text search. When you know the exact label, you don't want "something similar".
+</details>
+
+**4. A 19,000-character text was embedded with HTTP 200 and no warning. What did the index actually store?**
+
+gemma embedded 2,048 tokens and qwen3 4,095. The long text's vector was 0.98 similar to its first 3,000 characters and 0.83–0.84 to its last 3,000. With `truncate: false`, both returned HTTP 400.
+
+*What does this mean for chunking, and how would you make the indexing job fail loudly?*
+
+<details><summary>Answer</summary>
+
+The index stored a vector for **the beginning of the text only**. Everything after the context limit was dropped, and nothing in the response says so except `prompt_eval_count`. Note that this is the opposite of chat truncation (Lab 03 kept the end and dropped the start), so "which part gets lost" depends on the endpoint.
+
+For RAG, that means a question about something in the dropped part can never retrieve this chunk, however good the model is. A runbook section with the symptoms first and the fix last would be found for the symptoms but would be indexed **without its fix**, so the retrieved text could still contain it (if you store the full text) but its vector doesn't represent it.
+
+Making it fail loudly:
+
+* **Chunk below the limit:** sizes measured in tokens, with a margin (Step 3), not in characters.
+* **`truncate: false` while indexing:** an oversized chunk becomes an HTTP 400, and the job fails or splits it, like a schema validation step in CI.
+* **Check `prompt_eval_count`** against the limit (2,048 / 4,095 here) and log it.
+* Remember that qwen3's "32K" is only on the card: it loaded with **4,096**, the server default (Lab 04 Step 6).
+</details>
