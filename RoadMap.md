@@ -78,7 +78,7 @@ Sizes are download sizes from the ollama.com library (checked 2026-10-10). VRAM 
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **`qwen3.5:4b`** | 3.3 GB (Q4_K_M, pulled) | 256K | text + image | 1–7 | **First model.** Verified via `ollama show`: 4.2B params, completion, vision, tools, thinking (on by default) |
 | `qwen3.5:9b` | 6.6–7.6 GB | 256K | text + image | 2, 3, 6 | Same family, larger: clean size comparison and CPU-spill experiments |
-| `qwen2.5-coder:7b` | 4.7 GB (Q4_K_M) | 32K | text | 6 | Older code-specialized model; compare against qwen3.5 for DevOps code tasks |
+| `qwen2.5-coder:7b` | 4.7 GB (Q4_K_M, pulled) | 32K | text | 6 | Older code-specialized model. Verified: 7.6B, capabilities completion, tools, insert, **no thinking**; 4,535 MiB at 4K. Writes tool calls as untagged JSON text (Lab 06 Step 3) |
 | `embeddinggemma:300m` | 621 MB (BF16, pulled) | 2K | text | 5 | Embeddings (768 dims); the model in Ollama's embedding docs |
 | `qwen3-embedding:0.6b` | 639 MB (Q8_0, pulled) | 32K (loads at 4,096) | text | 5 | Embeddings (1,024 dims); comparison model with a long context |
 
@@ -387,5 +387,5 @@ Open decisions (to settle when the phase starts):
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
 | 4 — APIs | Done — see `labs/04-apis-structured-output` (streaming, Python client and failure modes, structured output, OpenAI-compatible API, concurrency and cancellation); Python venv (D-07). `OLLAMA_NUM_PARALLEL=2` tested: ignored for qwen3.5 (`-np 1`) |
 | 5 — Embeddings & RAG | Done — see `labs/05-embeddings-rag` (embeddings, labelled retrieval eval, BM25 vs dense vs hybrid, chunking, RAG end to end with retrieval vs reader errors, 4b vs 9b reader, sqlite-vec store); D-08 to D-11 |
-| 6 — Tools & agents | In progress — Step 1 done (tool-calling loop, mock read-only tools: 0 invalid calls, failures are judgment errors; thinking 1.17× tokens, 2.1× time); Step 2 done (gate held; injection followed 1/24 and denied; only hardened prompt + thinking recognized it 3/3; invented pod names approved by a rubber-stamp operator) |
+| 6 — Tools & agents | In progress — Step 1 done (tool-calling loop, mock read-only tools: 0 invalid calls, failures are judgment errors; thinking 1.17× tokens, 2.1× time); Step 2 done (gate held; injection followed 1/24 and denied; only hardened prompt + thinking recognized it 3/3; invented pod names approved by a rubber-stamp operator); Step 3 (4b vs 9b vs qwen2.5-coder) set up |
 | 7–9 | Not started |

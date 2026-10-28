@@ -101,6 +101,33 @@ TASKS = [
 ]
 
 
+def think_settings(model):
+    """(False, True) if the model can think, else (False,): sending think=true to a model without the capability
+    is an error (Lab 03), and qwen2.5-coder has no thinking."""
+    caps = httpx.post(f'{HOST}/api/show', json={'model': model}, timeout=60).json().get('capabilities', [])
+    if 'tools' not in caps:
+        raise SystemExit(f'{model} has no "tools" capability: {caps}')
+    return (False, True) if 'thinking' in caps else (False,)
+
+
+def text_call(answer):
+    """A tool call written into the answer text instead of message.tool_calls: the runtime never sees it."""
+    return bool(re.search(r'"name"\s*:\s*"(get_cluster_nodes|list_pods|get_pod_logs|delete_pod)"', answer))
+
+
+def parse_text_calls(content, schemas=SCHEMAS):
+    """Runtime fallback (--parse-text-calls): accept an answer that is ONLY a JSON tool call naming a known tool.
+    qwen2.5-coder writes calls without the <tool_call> tags its template asks for, so Ollama leaves them in content.
+    A trade-off: the runtime now executes text, so the check is strict (whole content, known name, object args)."""
+    try:
+        obj = json.loads(content.strip())
+    except ValueError:
+        return None
+    if isinstance(obj, dict) and obj.get('name') in schemas and isinstance(obj.get('arguments', {}), dict):
+        return [{'function': {'name': obj['name'], 'arguments': obj.get('arguments', {})}}]
+    return None
+
+
 def chat(model, messages, think, tools=TOOLS):
     r = httpx.post(f'{HOST}/api/chat', timeout=300, json={
         'model': model, 'messages': messages, 'tools': tools, 'stream': False, 'think': think, 'truncate': False,
@@ -109,10 +136,10 @@ def chat(model, messages, think, tools=TOOLS):
     return r.json()
 
 
-def run_task(model, task, think, trace=False):
+def run_task(model, task, think, trace=False, parse_text=False):
     messages = [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': task['q']}]
     calls, invalid, unknown_obj, tokens, t0 = [], [], 0, 0, time.perf_counter()
-    answer, steps, per_step, call_args = None, 0, [], []
+    answer, steps, per_step, call_args, text_parsed = None, 0, [], [], 0
     for steps in range(1, MAX_STEPS + 1):
         r = chat(model, messages, think)
         tokens += r.get('prompt_eval_count', 0) + r.get('eval_count', 0)
@@ -124,6 +151,8 @@ def run_task(model, task, think, trace=False):
         assistant = {'role': 'assistant', 'content': msg.get('content', '')}
         if msg.get('thinking'):
             assistant['thinking'] = msg['thinking']              # docs: keep the thinking with the tool calls
+        if parse_text and not msg.get('tool_calls') and (parsed := parse_text_calls(msg.get('content', ''))):
+            msg['tool_calls'], assistant['content'], text_parsed = parsed, '', text_parsed + 1
         if not msg.get('tool_calls'):
             answer = msg.get('content', '')
             break
@@ -149,7 +178,7 @@ def run_task(model, task, think, trace=False):
             'covered': all(e in calls for e in task['expect']),
             'needless': len(calls) if not task['expect'] else 0,
             'ok': bool(re.search(task['check'], answer)), 'bad': bool(task.get('bad') and re.search(task['bad'], answer)),
-            'tokens': tokens, 'per_step': per_step, 'seconds': round(time.perf_counter() - t0, 2), 'answer': answer,
+            'text_call': text_call(answer), 'text_parsed': text_parsed, 'tokens': tokens, 'per_step': per_step, 'seconds': round(time.perf_counter() - t0, 2), 'answer': answer,
             'call_args': call_args, 'messages': messages}
 
 
@@ -158,36 +187,39 @@ def main():
     ap.add_argument('--model', default='qwen3.5:4b')
     ap.add_argument('--runs', type=int, default=3)
     ap.add_argument('--trace', help='run one task id once (think off) and print every message')
+    ap.add_argument('--parse-text-calls', action='store_true', help='runtime fallback: execute JSON calls written as text')
     args = ap.parse_args()
 
     if args.trace:
         task = next(t for t in TASKS if t['id'] == args.trace)
-        r = run_task(args.model, task, False, trace=True)
+        r = run_task(args.model, task, False, trace=True, parse_text=args.parse_text_calls)
         print(f'\nfinal answer: {r["answer"]}\ncalls {r["calls"]}, invalid {r["invalid"]}, {r["tokens"]} tokens, '
               f'{r["seconds"]} s')
         return
 
+    thinks = think_settings(args.model)
     stamp = f'{datetime.now():%Y%m%d-%H%M%S}'
-    raw = Path('results/raw') / f'tool-loop-{args.model.replace(":", "-")}-{stamp}.jsonl'
+    tag = args.model.replace(':', '-') + ('-textparse' if args.parse_text_calls else '')
+    raw = Path('results/raw') / f'tool-loop-{tag}-{stamp}.jsonl'
     raw.parent.mkdir(parents=True, exist_ok=True)
-    rows, total, n = [], len(TASKS) * 2 * args.runs, 0
+    rows, total, n = [], len(TASKS) * len(thinks) * args.runs, 0
     with raw.open('w', encoding='utf-8') as f:
-        for think in (False, True):
+        for think in thinks:
             for task in TASKS:
                 for _ in range(args.runs):
                     n += 1
                     print(f'\r  {n}/{total}  think={think!s:<5} {task["id"]}   ', end='', flush=True)
-                    r = run_task(args.model, task, think)
+                    r = run_task(args.model, task, think, parse_text=args.parse_text_calls)
                     rows.append(r)
                     f.write(json.dumps(r) + '\n')
     print('\r' + ' ' * 50 + '\r', end='')
     httpx.post(f'{HOST}/api/generate', json={'model': args.model, 'keep_alive': 0}, timeout=60)
 
-    report = [f'# tool_loop: {args.model}, {args.runs} runs per task and think setting, default sampling, '
+    report = [f'# tool_loop: {args.model}{" (+ text-call parsing)" if args.parse_text_calls else ""}, {args.runs} runs per task and think setting, default sampling, '
               f'max {MAX_STEPS} steps\n']
     report.append(f'{"Think":<6} {"Task":<5} {"Answer ok":>9} {"Bad claim":>9} {"Expected tools":>14} {"Calls (median)":>14} '
                   f'{"Invalid":>7} {"Unknown obj":>11} {"Max steps":>9} {"Tokens":>7} {"Sec":>5}')
-    for think in (False, True):
+    for think in thinks:
         for task in TASKS:
             rs = [r for r in rows if r['id'] == task['id'] and r['think'] == think]
             k = len(rs)
@@ -202,6 +234,8 @@ def main():
                       f'{sum(r["covered"] for r in rs):>11}/{len(rs)} {"":>14} {sum(len(r["invalid"]) for r in rs):>7} '
                       f'{sum(r["unknown_obj"] for r in rs):>11} {sum(r["hit_max"] for r in rs):>9} '
                       f'{statistics.median(r["tokens"] for r in rs):>7.0f} {statistics.median(r["seconds"] for r in rs):>5.1f}\n')
+    report.append(f'Tool calls written as answer text (never executed): {sum(r["text_call"] for r in rows)}/{len(rows)} runs; '
+                  f'parsed from text and executed: {sum(r["text_parsed"] for r in rows)} calls\n')
     report.append('Tool sequences (think off, first run of each task):')
     for task in TASKS:
         r = next(r for r in rows if r['id'] == task['id'] and not r['think'])
