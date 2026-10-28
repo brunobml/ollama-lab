@@ -350,6 +350,38 @@ What it shows:
 * **Real questions are much harder than author questions.** The on-call set (same author, but without the runbook's words) lowered BM25 from 82% to 56% and the embeddings from ≈90% to 72%. At section level, on-call was 2–8 of 18. Step 2's 100% was the ceiling effect plus author bias, as suspected. **Measure with the questions your users ask.**
 * **"Nothing found" can't be read from the score.** The no-answer questions landed among the answerable ones. A cut-off at 0.45 would have rejected two of three no-answer questions for gemma, but also several real ones, and still let "port-forward drops" (0.57) through. Saying "I don't know" must come from the chat model reading the chunks (Lab 03 Step 6's strict rule), not from retrieval alone.
 
+### Step 4 — RAG end to end
+
+#### Run 1: the prompt's example became the answer
+
+Raw: `results/raw/rag-answer-20261027-233533.jsonl` (213 answers).
+
+| Condition | In context | Cited ok (as scored) | Abstained (as scored) | No-answer abstained (as scored) | Unsupported items | Prompt tokens | s/answer |
+|---|---|---|---|---|---|---|---|
+| closed-book | – | – | – | – | **130/174** | 55 | 0.9 |
+| chunks | 49/51 | 37/51 | 2/51 | 1/3 | 6/103 | 368 | 0.7 |
+| parents | 50/51 | 36/51 | 1/51 | 1/3 | 2/114 | 714 | 0.8 |
+| oracle | 51/51 | **35/51** | 0/51 | – | 3/127 | 323 | 0.8 |
+
+The oracle, with *only* the right runbook in the prompt, scored the **lowest**. Reading the replies showed why: **all 16 oracle misses cited `[oomkilled]`**, the id used as the example in the rules ("for example [oomkilled]"), and the oomkilled runbook wasn't in a single one of those prompts. The same happened in 9 (chunks) and 10 (parents) answers. Most of those replies then answered from the right runbook ("[oomkilled] Run `helm history <release> -n <namespace>` …"). A second scoring gap: the model refused in its own words ("[not in runbooks]", "The provided runbooks do not contain …") instead of the exact phrase, so the check `"NOT IN RUNBOOKS" in reply` missed it.
+
+Recounted from the saved replies, with refusals in any phrasing:
+
+| Condition | Cited ok | Cited the example, answered anyway | Refused although the right runbook was in the prompt | No-answer refused |
+|---|---|---|---|---|
+| chunks | 37 | 5 | 4 | **3/3** |
+| parents | 36 | 8 | 2 | **3/3** |
+| oracle | 35 | 9 | **7** | – |
+
+What run 1 shows:
+* **A concrete example in the instructions is a default the model falls back on.** When unsure (or when refusing), the 4B model reached for the one id it had been shown. It's few-shot prompting by accident: Lab 03 found that order and wording change answers, and here a single example token became the most common "citation". Use a placeholder description ("copied exactly from the line above that runbook"), not a real value, or show several varied examples.
+* **A metric that depends on output format measures format compliance first.** "Cited ok" and "abstained" were both partly measuring whether the model followed the bracket/phrase format. Reading the raw answers (not only the table) is what caught it, the same habit as the scorer fixes in Lab 03.
+* **Over-refusal is real and was hidden:** with the oracle runbook in the prompt, the model still said "do not contain" 7 times, including i05, where the exact error string `UPGRADE FAILED: another operation …` is in the runbook ("uses different terminology and does not match"). With 3 runbooks (parents) it refused only twice. The strict rule from Lab 03 Step 6 still over-abstains.
+* **No-answer questions: refused 3/3 in substance** with chunks and parents, but in three different formats ("[not in runbooks]", "[readiness-probe] The provided runbooks do not contain …", "[terraform-state-lock] NOT IN RUNBOOKS"): even a refusal came with a citation. Closed-book answered all three confidently (`etcdctl snapshot status`, `aws configure`).
+* **Grounding works for the commands:** 75% of closed-book items (130/174) aren't in our runbooks: mostly real commands, but not the documented ones (`kubectl drain`, `kill -9`, `docker network inspect`, `openssl x509 -noout -dates` where the runbook says `-enddate`). With retrieval, 2–5% (2–6 per ≈110). The answers quote the runbooks instead of the model's general knowledge.
+
+**v2 (`rag_answer.py`, for run 2):** no concrete id in the rules ("in square brackets, copied exactly from the line above that runbook"); a refusal is `[none] NOT IN RUNBOOKS`; refusals are detected in any phrasing (`not in runbooks`, "do/does not contain/address/cover/match/mention/include"); a new column **"cited not in prompt"** counts citations of a runbook that wasn't there (the anchoring signature). Everything else is unchanged, so run 2 shows what the prompt fix changes.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Likely cause | Check |

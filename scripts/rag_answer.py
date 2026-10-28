@@ -28,10 +28,14 @@ from rag_lib import BM25, embed, http, load_corpus, load_questions, ranking, rrf
 
 CHAT = 'qwen3.5:4b'
 EMBED = 'qwen3-embedding:0.6b'
+# Run 1 (2026-10-27 23:35) said "for example [oomkilled]": the model then cited [oomkilled] in 9-16 answers per
+# condition, never with that runbook in the prompt. v2 has no concrete id in the instructions.
 RULES = """You are an on-call assistant. Answer the engineer's question using only the runbooks provided.
-- Start your reply with the id of the runbook you used, in square brackets, for example [oomkilled].
+- Start your reply with the id of the runbook you used, in square brackets, copied exactly from the line above that runbook.
 - Then answer in at most 4 sentences, including the commands from the runbook that apply.
-- If none of the runbooks answers the question, reply exactly: NOT IN RUNBOOKS"""
+- If none of the runbooks answers the question, reply with only: [none] NOT IN RUNBOOKS"""
+# Refusals in any phrasing (run 1: "[not in runbooks]", "The provided runbooks do not contain ...")
+REFUSAL = re.compile(r"not in runbooks|(do|does|did)(n't| not) (contain|address|cover|match|mention|include)", re.I)
 CLOSED = "You are an on-call assistant. Answer the engineer's question in at most 4 sentences, including the commands that apply."
 
 
@@ -115,11 +119,14 @@ with raw_path.open('w', encoding='utf-8') as raw:
         items = backticked(reply)
         row = {'cond': cond, 'id': q['id'], 'type': q['type'], 'want': q['docs'], 'in_prompt': in_prompt,
                'in_context': any(d in in_prompt for d in q['docs']), 'cited': m.group(1) if m else None,
-               'abstained': 'NOT IN RUNBOOKS' in reply, 'items': len(items),
+               'abstained': (m is not None and m.group(1) == 'none') or bool(REFUSAL.search(reply)),
+               'items': len(items),
                'unsupported': [i for i in items if not supported(i, ctx)],
                'prompt_tokens': r['prompt_eval_count'], 'tokens': r['eval_count'],
                'seconds': round(time.perf_counter() - t, 2), 'reply': reply}
         row['cited_ok'] = row['cited'] in q['docs']
+        # a citation of a runbook that wasn't in the prompt is a format/anchoring error, not a choice
+        row['cited_absent'] = row['cited'] not in (None, 'none') and row['cited'] not in in_prompt
         rows.append(row)
         raw.write(json.dumps(row) + '\n')
 print('\r' + ' ' * 60 + '\r', end='')
@@ -136,9 +143,10 @@ def say(text=''):
 ans = [q for q in allq if q['docs']]
 say(f'# rag_answer: {CHAT}, retrieval {EMBED} + BM25 hybrid on section+title chunks; '
     f'{len(ans)} answerable + {len(allq) - len(ans)} no-answer questions\n')
-say(f'{"Condition":<12} {"In context":>10} {"Cited ok":>9} {"Abstained":>10} {"No-answer":>10} {"Unsupported":>12} '
-    f'{"Prompt tok":>11} {"Sec":>5}')
-say(f'{"":<12} {"(answerable)":>10} {"":>9} {"(wrongly)":>10} {"abstained":>10} {"items":>12} {"(median)":>11} {"":>5}')
+say(f'{"Condition":<12} {"In context":>10} {"Cited ok":>9} {"Abstained":>10} {"No-answer":>10} {"Cited not":>10} '
+    f'{"Unsupported":>12} {"Prompt tok":>11} {"Sec":>5}')
+say(f'{"":<12} {"(answerable)":>10} {"":>9} {"(wrongly)":>10} {"abstained":>10} {"in prompt":>10} {"items":>12} '
+    f'{"(median)":>11} {"":>5}')
 for c in conds:
     a = [r for r in rows if r['cond'] == c and r['want']]
     na = [r for r in rows if r['cond'] == c and not r['want']]
@@ -148,7 +156,8 @@ for c in conds:
     co = '-' if c == 'closed-book' else f'{sum(r["cited_ok"] for r in a)}/{len(a)}'
     ab = '-' if c == 'closed-book' else f'{sum(r["abstained"] for r in a)}/{len(a)}'
     nab = '-' if c in ('closed-book', 'oracle') else f'{sum(r["abstained"] for r in na)}/{len(na)}'
-    say(f'{c:<12} {ic:>10} {co:>9} {ab:>10} {nab:>10} {f"{uns}/{items}":>12} '
+    cna = '-' if c == 'closed-book' else f'{sum(r["cited_absent"] for r in a + na)}'
+    say(f'{c:<12} {ic:>10} {co:>9} {ab:>10} {nab:>10} {cna:>10} {f"{uns}/{items}":>12} '
         f'{np.median([r["prompt_tokens"] for r in rows if r["cond"] == c]):>11.0f} '
         f'{np.median([r["seconds"] for r in rows if r["cond"] == c]):>5.1f}')
 
