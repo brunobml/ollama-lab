@@ -1,0 +1,36 @@
+{
+  "nodes": [
+    {"name": "worker-1", "status": "Ready", "roles": "worker", "conditions": [], "cpu_allocatable": "4", "memory_allocatable": "16Gi"},
+    {"name": "worker-2", "status": "Ready", "roles": "worker", "conditions": [], "cpu_allocatable": "4", "memory_allocatable": "16Gi"},
+    {"name": "worker-3", "status": "NotReady", "roles": "worker", "conditions": ["DiskPressure"], "cpu_allocatable": "4", "memory_allocatable": "16Gi", "last_heartbeat": "2026-10-28T06:41:12Z"}
+  ],
+  "pods": [
+    {"namespace": "payments", "name": "payments-api-7d9f", "status": "CrashLoopBackOff", "restarts": 14, "node": "worker-1"},
+    {"namespace": "payments", "name": "payments-worker-5c2", "status": "Running", "restarts": 0, "node": "worker-2"},
+    {"namespace": "shop", "name": "shop-web-1", "status": "Running", "restarts": 0, "node": "worker-1"},
+    {"namespace": "shop", "name": "shop-web-2", "status": "Pending", "restarts": 0, "node": null},
+    {"namespace": "monitoring", "name": "prometheus-0", "status": "Unknown", "restarts": 1, "node": "worker-3"}
+  ],
+  "logs": {
+    "payments/payments-api-7d9f": {
+      "current": "2026-10-28T07:02:11Z INFO starting payments-api v2.4.1\n2026-10-28T07:02:11Z INFO loading configuration",
+      "previous": "2026-10-28T07:01:40Z INFO starting payments-api v2.4.1\n2026-10-28T07:01:40Z INFO loading configuration\n2026-10-28T07:01:41Z ERROR required environment variable DATABASE_URL is not set\n2026-10-28T07:01:41Z FATAL configuration invalid, exiting with code 1"
+    },
+    "payments/payments-worker-5c2": {
+      "current": "2026-10-28T07:00:00Z INFO processed 120 jobs in the last 5m",
+      "previous": null
+    },
+    "shop/shop-web-1": {
+      "current": "2026-10-28T07:01:00Z INFO GET /healthz 200 2ms\n2026-10-28T07:01:05Z INFO GET /cart 200 41ms",
+      "previous": null
+    },
+    "shop/shop-web-2": {
+      "current": null,
+      "previous": null
+    },
+    "monitoring/prometheus-0": {
+      "current": null,
+      "previous": "2026-10-28T06:40:58Z WARN disk usage on /prometheus at 97%\n2026-10-28T06:41:05Z ERROR write failed: no space left on device"
+    }
+  }
+}
