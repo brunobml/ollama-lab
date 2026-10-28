@@ -503,6 +503,36 @@ What it shows:
 * **Not monotonic:** the same 9b that refused o07 invented an explanation for a no-answer question in `chunks`. One run per question at temperature 0 can't separate "the 9b is safer" from "the 9b is different on these few questions": the flips are 1–4 per condition.
 * **The unsupported-items check has false positives** that show up more with a chattier model: `node-7` comes from the *question*, `READY 0/1` is the runbook's "READY shows `0/1`" re-quoted. A real check would compare against the question and the prompt as a whole, or normalize quoting.
 
+### Step 5 — sqlite-vec
+
+Raw: `results/raw/vector-store-20261028-000335.md`. sqlite-vec v0.1.9, SQLite 3.43.1, qwen3-embedding:0.6b, dense search only (no BM25).
+
+| Part | Observed |
+|---|---|
+| A, build | 54 chunks, 3,752 tokens. Embedding **3.54 s** (incl. load) vs insert **0.070 s**. File **5,452 KiB**, while the float32 vectors are 216 KiB |
+| B, same answers | identical full ranking **54/54**, identical top 3 54/54; largest distance difference 1.07e-6. Dense Hit@1: doc 45/51, section 24/51, **exactly Step 3's numbers** for qwen3 on section+title |
+| C, persistence | reopened and answered in **13.9 ms**, `meta` intact. 768-dim query: `OperationalError: Dimension mismatch for query vector for the "emb" column. Expected 1024 dimensions but received 768.` |
+| D, filter (6 Fix questions) | section Hit@1 **2/6 → 5/6** with `section = 'Fix'`; doc Hit@3 6/6 → 5/6 |
+| E, quantized | float32 45/47/24/44 (doc@1, doc@3, sec@1, sec@3); **int8 45/48/24/44**; **bit 41/46/23/43**; **bit top 30 + float32 re-rank 45/47/24/44** |
+| F, 50,000 vectors | insert 1.5 s (32,789/s). Query: sqlite-vec float32 **91.4 ms**, sqlite-vec bit **1.9 ms**, numpy **8.7 ms**. Top-1 = exact 20/20 |
+
+| Prediction | Observed |
+|---|---|
+| A: file ≈0.5–1 MB, insert ≪ embedding | ❌ **5.3 MB**; ✅ insert 50× faster than embedding |
+| B: identical rankings, diff ≈1e-7 | ✅ identical; diff 1e-6 (float32 rounding) |
+| C: reopens in ms, 768-dim query fails | ✅ both |
+| D: section Hit@1 rises clearly | ✅ 2/6 → 5/6 |
+| E: int8 ≈ float32, bit worse, bit + re-rank ≈ float32 | ✅ all three (bit −4 at doc Hit@1, fully recovered by re-ranking) |
+| F: tens of ms, slower than numpy, bit several× faster, top-1 exact | ✅ but slower than expected: **91 ms**, 10× numpy; bit 48× faster than float32 |
+
+What it shows:
+* **The store changed nothing about quality**, as expected: the same rankings as numpy, to 1e-6, and the same Hit rates as Step 3. Vectors in, the same vectors out. Retrieval quality comes from the embedding model, the chunking and the search method, never from the database.
+* **What it adds is operational:** embed once (3.5 s) and query forever (a reopen + query in 14 ms); the metadata lives with the vectors; and the index **knows its dimension** and rejects a 768-dim query. But a different 1,024-dim model would pass that check: only the `meta.model` row protects against mixing models, so a real index should verify it on every open, like a schema version check before a migration.
+* **The file is 25× bigger than its vectors.** 5,452 KiB for 216 KiB of float32. The numbers fit a storage layout that reserves space in blocks of 1,024 rows per table: 1,024 × 4,096 B (float32) + 1,024 × 1,024 B (int8) + 1,024 × 128 B (bit) = 5,248 KiB, plus ≈200 KiB of SQLite pages for text and metadata. That's an inference from the arithmetic, not from the docs. It's a fixed cost: at 1,000 chunks the file would hardly grow. Same lesson as Lab 01's `SIZE` column: measure the real footprint.
+* **Filters fix what similarity can't.** Step 3's weak spot (the right runbook, the wrong section) mostly disappears when the query says what kind of section it wants: 2/6 → 5/6. Only 6 questions, but a large effect. The catch: something has to *know* that the question is a "how do I fix" question, which in a real system means classifying the query first (a rule, or the chat model). Metadata filters are the vector-search equivalent of a label selector.
+* **Vector quantization works like weight quantization in Lab 02:** int8 (4× smaller) lost nothing, bit (32× smaller) lost 4 of 51 at Hit@1, and **bit search + float32 re-ranking of 30 candidates lost nothing** while scanning 128 bytes per vector instead of 4,096. That two-stage pattern is the standard trick for large indexes.
+* **sqlite-vec scans everything**, and at 50,000 vectors it shows: 91 ms per query, linear in the number of rows (every probe's exact top-1 was found, 20/20, consistent with exhaustive search; not proof). numpy does the same work in 8.7 ms as one BLAS matrix product. For this lab's 54 chunks none of this matters (sub-millisecond), but at a million chunks float32 would be ≈2 s per query: that's where approximate indexes (HNSW, IVF) or the bit pre-filter come in. Right-size the tool: a full scan is the simplest correct index, like a sequential scan in Postgres for a small table.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Likely cause | Check |
@@ -762,4 +792,39 @@ If wrong answers are expensive, the 9b's caution looks attractive. But the evide
 Until then, the evidence supports the 4b: same score, 1.4× faster, ≈2.4 GB less VRAM (room for the embedding model and a longer context next to it). And the cheaper fix for confident wrong answers is on the system side: show the cited runbook so the engineer can check it (Q13), and improve recall so the right runbook is there.
 
 It's like comparing two alerting rules with the same accuracy: you look at false positives vs false negatives separately, because they don't cost the same.
+</details>
+
+**15. sqlite-vec gave exactly numpy's rankings, and the same Hit rates as Step 3. So what is a vector store for?**
+
+It reopened and answered in 14 ms without re-embedding, rejected a 768-dim query against a 1,024-dim index, and filtered by `section = 'Fix'` (section Hit@1 2/6 → 5/6). Its file was 5.3 MB for 216 KiB of vectors.
+
+*What does the store change, what doesn't it, and what would you still have to build yourself?*
+
+<details><summary>Answer</summary>
+
+It changes **operations**, not **quality**:
+
+* **Persistence:** embed once at indexing time, query many times. Embedding was 98% of the build time (3.54 s vs 0.07 s), so this is what makes queries cheap.
+* **Metadata next to the vectors:** document, section, text, filters in the same query. That's what fixed Step 3's wrong-section problem when the query type was known.
+* **A shared, queryable index** for other programs (an agent's tool in Phase 6, a CLI), with SQL around it.
+* **Size/speed options:** int8 and bit vectors.
+
+It doesn't change the vectors, so it can't fix retrieval quality: that's the embedding model, chunking, hybrid search and the eval set (Steps 1–4).
+
+What you still build yourself: **index versioning** (record and check the model and chunking: the dimension check only catches a different *size*), **re-indexing** when documents or the model change, **hybrid search** (sqlite-vec is dense only; BM25 would be SQLite's FTS5 next to it), and the **eval set** that tells you whether a change helped. It's a database, not a search system, the same way Postgres isn't an application.
+</details>
+
+**16. Bit vectors were 32× smaller and 48× faster to search, but lost 4 of 51 at Hit@1. Bit search for 30 candidates plus float32 re-ranking lost nothing. Why does the two-stage version work?**
+
+At 50,000 vectors: float32 91 ms per query, bit 1.9 ms. The re-ranking step computes exact cosine only for 30 vectors.
+
+*What does each stage need to be good at, and where else have you seen this pattern?*
+
+<details><summary>Answer</summary>
+
+The first stage only has to be good at **recall**: get the right answer somewhere into the top 30, cheaply. 1-bit vectors keep only the sign of each of the 1,024 dimensions, which is too coarse to order close candidates (hence −4 at Hit@1) but plenty to separate "roughly similar" from "unrelated" (doc Hit@3 barely moved). The second stage only has to be good at **precision** on a tiny set: exact cosine on 30 vectors costs microseconds. Together they get float32 quality at close to bit cost.
+
+Requirements: the candidate list must be large enough that the right item is almost always in it (30 of 54 here is generous; at a million vectors you'd tune it), and you must still have the float32 vectors for re-ranking, so storage isn't actually 32× smaller unless they live somewhere cheaper (on disk vs in RAM).
+
+The same pattern appears everywhere a cheap filter precedes an expensive check: Bloom filters before a disk lookup, a fast health check before a deep one, `grep` before a parser, and in RAG itself: retrieval (cheap, recall) before the chat model (expensive, precision), and BM25/embeddings before a cross-encoder reranker.
 </details>

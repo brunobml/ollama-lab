@@ -385,6 +385,6 @@ Open decisions (to settle when the phase starts):
 | 1 — Foundations | Done — see `labs/01-foundations`, `docs/architecture.md` |
 | 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
-| 4 — APIs | Done — see `labs/04-apis-structured-output` (streaming, Python client and failure modes, structured output, OpenAI-compatible API, concurrency and cancellation); Python venv (D-07). Optional: `OLLAMA_NUM_PARALLEL` > 1 (needs approval) |
-| 5 — Embeddings & RAG | In progress — Step 1 (what an embedding is) done; Step 2 (labelled retrieval eval: BM25 vs embeddings vs hybrid) done; Step 3 (chunking, on-call and no-answer questions) done; Step 4 (RAG end to end: retrieval vs reader errors; 4b vs 9b reader) done; Step 5 (sqlite-vec vector store) set up; models pulled (D-09) |
+| 4 — APIs | Done — see `labs/04-apis-structured-output` (streaming, Python client and failure modes, structured output, OpenAI-compatible API, concurrency and cancellation); Python venv (D-07). `OLLAMA_NUM_PARALLEL=2` tested: ignored for qwen3.5 (`-np 1`) |
+| 5 — Embeddings & RAG | Done — see `labs/05-embeddings-rag` (embeddings, labelled retrieval eval, BM25 vs dense vs hybrid, chunking, RAG end to end with retrieval vs reader errors, 4b vs 9b reader, sqlite-vec store); D-08 to D-11 |
 | 6–9 | Not started |
