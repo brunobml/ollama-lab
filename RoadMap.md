@@ -381,5 +381,5 @@ Open decisions (to settle when the phase starts):
 | 1 — Foundations | Done — see `labs/01-foundations`, `docs/architecture.md` |
 | 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
-| 4 — APIs | In progress — Steps 1 (streaming) and 3 (Python client, failure modes) done; Step 4 (structured output) done; Step 5 (OpenAI-compatible API) done; Step 6 (concurrency, queueing, cancellation) set up; Python venv ready (D-07) |
+| 4 — APIs | Done — see `labs/04-apis-structured-output` (streaming, Python client and failure modes, structured output, OpenAI-compatible API, concurrency and cancellation); Python venv (D-07). Optional: `OLLAMA_NUM_PARALLEL` > 1 (needs approval) |
 | 5–9 | Not started |

@@ -35,10 +35,12 @@ flowchart LR
 1. Client sends `POST /api/generate` or `/api/chat`.
 2. Server resolves the model's manifest and merges params: Modelfile `PARAMETER` overrides base model params (verified); request `options` override both (documented, not yet tested here).
 3. Server formats the conversation with a **built-in renderer** for the model family (`renderer=qwen3.5`), not the template layer.
-4. If a runner with the **same weights blob** is loaded, the request goes to it (even for a different model name); otherwise the scheduler starts a new `llama-server`.
+4. If a runner with the **same weights blob** is loaded, the request goes to it (even for a different model name); otherwise the scheduler starts a new `llama-server`. If the same blob is loaded with a **different `num_ctx`**, the scheduler waits until that runner is idle, unloads it and loads it again: two names with one blob were not loaded side by side, although both would have fit (Lab 04 Step 6, one observation).
+4a. With `OLLAMA_NUM_PARALLEL` 1 (`n_slots = 1`), requests to one model are served **one at a time, FIFO** (queue limit `OLLAMA_MAX_QUEUE` 512, then 503 per the FAQ). `total_duration` counts from arrival, so it **includes queue time**; `load_duration` is reported by every request that waited for a load (Lab 04 Step 6).
 5. The runner evaluates the prompt (reusing cached prefix tokens: `prompt eval cached`) and generates tokens.
 6. A **parser** splits output into thinking / content / tool calls.
 7. `keep_alive` expiry is reset.
+8. If the client disconnects, the server aborts the load (Lab 04 Step 3) or stops generating (Step 6), and the slot is free within ≈0.3 s.
 
 ## Memory of a loaded model (qwen3.5:4b, 4,096 context)
 

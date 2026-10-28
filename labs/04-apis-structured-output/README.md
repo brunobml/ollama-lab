@@ -276,7 +276,7 @@ Errors and timeouts were covered in Step 3 (error types, retry classes, a timeou
 | A2: `Wait` (Wall − Server) | **unknown**: does `total_duration` include queue time? If not, request 4 shows ≈5 s that the server never reports | Matters for monitoring: server-side latency may look fine while clients wait |
 | A2: tok/s per request | ≈115, as solo | Each request has the GPU to itself while it runs |
 | A1 cold | **one** load (≈4 s, in one request's `load_duration`), then like A2 | The scheduler loads a model once and queues the others |
-| B | **both loaded**: two entries in `/api/ps`, VRAM +≈7.8 GB, i.e. the weights twice | Two names = two runners; sharing on disk is not sharing in VRAM |
+| B | **both loaded**: two entries in `/api/ps`, VRAM +≈7.8 GB, i.e. the weights twice | Two names = two runners; sharing on disk is not sharing in VRAM (❌ wrong, see §5: I missed the Lab 02 rule "same weights blob → same runner") |
 | B: overlap | **> 0**, both generating at once, each **slower** than 115 tok/s | Two processes share one GPU's compute |
 | C | request 2 waits **< 1 s**; generation of request 1 is stopped | Step 3 showed a load being aborted when the client left; generation probably too |
 
@@ -421,6 +421,37 @@ What it shows:
 * **But you can detect it:** `usage.prompt_tokens` = 2,050 is the truncation constant `4 + (4096 − 4) / 2` (Q4). A client can compare it with what it sent.
 * **`/v1` hides the performance data.** No durations, so no tok/s, no load time: only token counts. For benchmarks and monitoring (Phase 8), use `/api` or measure at the client. It does show cache hits (`cached_tokens`), which `/api` calls `prompt_eval_cached_count`.
 * **For Phase 6 (Codex, Claude Code):** before trusting a coding agent on local Ollama, check two things in its requests or in `server.log`: does it send `reasoning_effort` (or will every turn think), and is the model's `num_ctx` big enough (or every long file loses its beginning: only the first 4 and the last ≈2,046 tokens are kept). The fix is the same for both: a Modelfile variant with `num_ctx` set, and an agent config that sets the reasoning effort, or a model without default thinking.
+
+### Step 6 — Concurrency, queueing and cancellation
+
+Raw: `results/raw/concurrency-20261027-222942.md`; `server.log` 22:29. qwen3.5:4b, `OLLAMA_NUM_PARALLEL` 1, temperature 0, 200 tokens per request (400 in Part B). Times in seconds from the moment the threads were released.
+
+| Part A2 (warm, 4 at once) | Sent | 1st token | End | Server `total_duration` | tok/s |
+|---|---|---|---|---|---|
+| 1 | 0.47 | 0.56 | 2.20 | 1.72 | 122 |
+| 2 | 0.47 | 2.24 | 3.88 | 3.41 | 122 |
+| 3 | 0.47 | 3.92 | 5.57 | 5.09 | 122 |
+| 4 | 0.47 | **5.61** | 7.25 | **6.77** | 122 |
+
+A1 (cold): the same staircase shifted by the load: first tokens 4.95 / 6.68 / 8.40 / 10.14 s, and **every one of the 4 requests reported `load_duration` 4.32 s**. A3 (one after another): 1.68–1.74 s each, 7.92 s in total (A2: 7.25 s).
+
+| Prediction | Observed |
+|---|---|
+| A2: staggered first tokens ≈1.7 s apart | ✅ 0.56 / 2.24 / 3.92 / 5.61: exactly one request's generation time (1.68 s) apart. Queued, in order |
+| A2: total ≈ sequential | ✅ 7.25 s vs 7.92 s. The 0.67 s difference is client-side: A3 sends each request ≈0.27 s after the previous one ended (creating a new `httpx.Client`, which also explains the ≈0.3–0.5 s before the first `Sent`) |
+| A2: does `total_duration` include the queue? unknown | **Yes.** Wall − Server = 0.00 for every request; request 4's `total_duration` is 6.77 s for 1.64 s of generation |
+| tok/s as solo | ✅ 120–123 in every case |
+| A1: one load | ✅ one load (one `llama-server started in 3.27 seconds` at 22:28:47 in the log), but **all 4 requests report it** in `load_duration` (4.32 s each: they all waited for it) |
+| B: both loaded, VRAM +≈7.8 GB | ❌ **Never loaded together.** `qwen3.5:4b` ran first (first token 4.80, end 8.08). `ctx8k` reported `load_duration` **13.17 s** and its first token came at 13.71. `/api/ps` afterwards: only `ctx8k` (8,192 context, 3,209 MiB `size_vram`); `nvidia-smi` +4,116 MiB over the 2,524 MiB idle |
+| B: overlap > 0 | ❌ **−5.63 s**: one after the other, with a reload in between |
+| C: request 2 waits < 1 s | ✅ **0.10 s** to its first token, `total_duration` 0.40 s. The 3,000-token generation stopped when its client left |
+
+What it shows:
+* **One slot = a FIFO queue, and the queue is invisible in the stats.** The server is busy 100% of the time and each request runs at full speed, but the 4th client waits 5 s before its first token. `total_duration` includes that wait; there is no `queue_duration`. To see it, subtract: `total_duration − load_duration − prompt_eval_duration − eval_duration` ≈ 5.1 s for request 4. Monitoring that only graphs tok/s would say "everything's fine" while users wait. Same as a pod with a request queue in front: the pod's CPU looks healthy, the p99 latency at the load balancer doesn't.
+* **`load_duration` means "time this request waited for the runner to be ready", not "this request caused a load".** Summing `load_duration` over requests (4 × 4.32 s) overcounts the one real load (3.27 s in the log) four times.
+* **Same weights, different `num_ctx` = one runner, reloaded.** This wasn't new; I missed it: Lab 01/02 found that a request goes to a loaded runner with the same weights blob, and that changing `num_ctx` reloads the runner. When the `ctx8k` request arrived, the scheduler waited for the `4b` request to finish, unloaded the runner and loaded it again with 8,192 context. The log confirms it: at the second load, the GPU had `free="8.9 GiB"`, i.e. nothing loaded. The cost: 13.2 s of "load" for the second request: ≈7.7 s waiting for the first request to finish, then ≈5.5 s to unload and reload (log: the new `llama-server` started at 22:29:23.4, ≈1.2 s after the first request ended, and took 3.27 s). **So a Modelfile variant (Step 5) isn't free: traffic that alternates between the two names thrashes the runner.** Pick one context size per model and use it for every client.
+* **Cancellation works for generation too** (Step 3 showed it for a load): the server stopped the 3,000-token answer within ≈0.3 s of the disconnect, and the next request started at once. A client timeout really frees the GPU; abandoned requests don't keep the queue busy.
+* **Two VRAM numbers for the same model:** `/api/ps` `size_vram` 3,209 MiB vs the `nvidia-smi` delta 4,116 MiB. The ≈900 MiB difference is not explained here (CUDA context and compute buffers outside Ollama's estimate are likely; Lab 01 found ≈240 MiB of runtime overhead at 4K). Plan with `nvidia-smi`. Also: the idle desktop now uses 2,524 MiB (≈1,650 MiB in Phase 0), so the real headroom is smaller than the baseline says.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -584,7 +615,7 @@ All three requests saw 2,050 of 5,793 tokens and answered `prod`. On `/api`, an 
 
 The `/v1` layer only passes the OpenAI fields it knows, so the context size can't come from the request. It has to come from the server side:
 
-1. **A model variant** (`PARAMETER num_ctx 8192` in a Modelfile, as here). Only clients that ask for that model name get it, and it costs ≈1.2 KB of disk because the weights are shared. Like a Helm values override, or a separate Deployment of the same image with different env. Downside: one more name to manage, and a second copy in VRAM if both names are loaded at once.
+1. **A model variant** (`PARAMETER num_ctx 8192` in a Modelfile, as here). Only clients that ask for that model name get it, and it costs ≈1.2 KB of disk because the weights are shared. Like a Helm values override, or a separate Deployment of the same image with different env. Downside: one more name to manage, and **the two names can't be loaded at the same time** (Step 6 Part B): they share the weights blob, so Ollama uses one runner and reloads it with the other `num_ctx` on every switch. Mixed traffic to both names thrashes (≈3–4 s reload per switch).
 2. **`OLLAMA_CONTEXT_LENGTH`** for the whole server: every model and every client gets the bigger context, and the VRAM that goes with it (Lab 02: the KV cache grows with `num_ctx`). A system/environment change, so approval first here.
 3. **Use the native `/api/chat`** where you control the client, and keep `/v1` for tools you can't change.
 
@@ -604,4 +635,51 @@ And detect it either way: `usage.prompt_tokens` equal to `4 + (num_ctx − 4) / 
 * **(c) Your own pipeline: `/api`** (the `ollama` library or httpx). You get `think`, `options` (`num_ctx`, `num_predict`, `seed`), `format` with a schema, `truncate: false` (raw), and `done_reason`. You give up portability to other providers. If portability matters, `/v1` with `response_format` and a Modelfile variant is a valid choice, but test that every field you rely on actually arrives.
 
 Rule of thumb, as with S3-compatible storage: use the compatible API to connect tools you don't own, and the native API when you need the features that make the product different.
+</details>
+
+**11. Every request ran at 122 tok/s, yet the 4th one waited 5 s for its first token. Where would you see that in monitoring?**
+
+4 warm requests at once with one slot: first tokens at 0.56, 2.24, 3.92 and 5.61 s. The 4th request's `total_duration` was 6.77 s for 1.64 s of generation. No field in the response is called "queue".
+
+*Which metric would you alert on for a shared Ollama, and how do you compute the queue time?*
+
+<details><summary>Answer</summary>
+
+tok/s is a **throughput per request** metric: it only measures the time a request was being generated, so it stays at 122 no matter how long the line is. The user-facing metric is **latency from arrival**: TTFT and total time, which Ollama's `total_duration` happens to include, since it starts counting when the request arrives.
+
+Queue time = `total_duration − load_duration − prompt_eval_duration − eval_duration` (≈5.1 s for request 4). Watch it at the p95/p99 together with TTFT. With one slot, queue time grows linearly with the number of waiting requests: N clients × ≈1.7 s each here.
+
+Alert on queue time / TTFT, not on tok/s or GPU utilization. A fully busy GPU with a growing queue looks *healthy* on utilization graphs. It's the classic saturation signal (the "S" in USE): a pod at 100% CPU with a growing request backlog, where the fix is more capacity (more slots, `OLLAMA_NUM_PARALLEL`, or a second instance), not a faster pod.
+</details>
+
+**12. Two model names with the same weights ran one after the other, with a reload in between. Why, and why does it matter?**
+
+`qwen3.5:4b` (4K) and `qwen3.5:4b-ctx8k` (8K) were sent at the same moment. The second one reported `load_duration` 13.17 s; at its load, the GPU was empty (`free="8.9 GiB"`), and afterwards `/api/ps` showed only `ctx8k`.
+
+*What does the scheduler do, and what happens if Codex uses `ctx8k` while your scripts use `qwen3.5:4b`?*
+
+<details><summary>Answer</summary>
+
+The scheduler keys runners on the **weights blob**: a request for a model whose blob is already loaded goes to that runner (Lab 01/02). But a runner has one fixed `num_ctx` (the KV cache is allocated at load), and the request needs a different one, so the runner must be **restarted**: wait until it's idle, unload, load again with 8,192. It did not start a second runner next to the first, even though both would have fit in VRAM.
+
+With mixed traffic, every switch between the two names costs a reload (≈3–5 s here) and serializes everything behind it. An agent and a script that alternate would thrash, like Lab 02's two models that didn't fit, but here for a different reason. It's like two Deployments that share one node port: only one can run at a time.
+
+Fixes: use **one context size per model for all clients** (all `ctx8k`, or set `OLLAMA_CONTEXT_LENGTH`), or accept the reloads for rare switches. Check `/api/ps` (`context_length`) when latency suddenly jumps.
+</details>
+
+**13. A client disconnected after 1 s of a 3,000-token answer. What did the server do, and what does it mean for timeouts?**
+
+Request 2, sent right after the disconnect, got its first token 0.10 s later. If the 3,000-token generation had kept running, it would have waited ≈25 s.
+
+*Combine this with Step 3's cancelled load. What's the right timeout strategy for an Ollama client?*
+
+<details><summary>Answer</summary>
+
+The server **stopped generating** as soon as the client was gone, and the slot was free again within a fraction of a second. Step 3 showed the same for a load. So a client-side timeout or cancel really frees the GPU: there are no orphaned generations that keep the queue busy. This is the good behavior you'd want from any backend (like context cancellation in a Go service).
+
+The consequences for timeouts:
+
+* **Generous enough to finish:** a timeout shorter than load + queue + generation never succeeds, and each retry cancels and starts over (Step 3 Q2). With one slot, "queue" can be N × the generation time of whoever is ahead.
+* **Cancelling is cheap and useful:** stop a runaway answer (a thinking loop, Step 1) early; it frees the slot for others. Use `num_predict` as the hard budget, and streaming + cancel as the soft one.
+* **Measure from the client's side:** the server's `total_duration` includes the queue, but not the client's connection setup (≈0.3 s per new `httpx.Client` here). Reuse one client.
 </details>
