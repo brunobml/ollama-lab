@@ -164,7 +164,7 @@ Searched with BM25, both embedding models (no prefixes; Step 2 found no effect),
 
 ### Later steps (planned)
 
-* Step 4 — RAG end to end: retrieve top-*k*, build the prompt (Lab 03 Step 6 rules), answer with `qwen3.5:4b`, and check whether the answer is right *and* cites the right section. What happens when retrieval misses.
+* Step 4 — RAG end to end, using Step 3's answer: search **section chunks with the hybrid**, put the **parent runbooks** of the top hits into the prompt (Lab 03 Step 6 rules), answer with `qwen3.5:4b`, and check whether the answer is right *and* names the right runbook. Compared with sending only the top chunks, and with no retrieval at all. What the chat model does with the no-answer questions (abstain, or answer from the wrong runbook?).
 * Step 5 — A vector store (ChromaDB or sqlite-vec, decided then): what it adds over the numpy array (persistence, metadata filters, approximate search) and what it doesn't change (the vectors).
 
 ## 5. Hypotheses → Observed Metrics
@@ -261,6 +261,53 @@ What it shows:
 * **The prefixes didn't help here**, and both cost one identifier question: `task: search result | query: toomanyrequests` turns a one-word query into mostly prefix. The model cards measure on general benchmarks; on this corpus the effect is within noise (1 question). Test before adopting a "recommended" setting, as with the sampling defaults in Lab 03.
 * **The set is too easy to rank the embedding models.** Hit@3 is 32–33/33 everywhere, so every method would put the right runbook into a *k* = 3 prompt: a **ceiling effect**. 18 runbooks on 18 distinct topics are easy to tell apart. The difference between gemma and qwen3 (2 questions) is noise.
 * **Author bias in the questions: BM25 got all 7 "knowledge" questions.** I wrote the questions while looking at the runbooks, and the knowledge ones leaked words from them: "apply" (Terraform), "Let's Encrypt", "metrics are not available", "CI job cancelled", "Unknown", "heap". A real user wouldn't know the runbook's vocabulary. That's the same lesson as Lab 04 Step 4's ground-truth caveat: **an eval set measures the questions as much as the system**. Questions written by someone who hasn't read the documents are the better test (see the next step's plan).
+
+### Step 3 — Chunking
+
+Raw: `results/raw/chunking-eval-20261027-232525.md` (first run crashed on the fixed windows, fixed in `7a94621`; the numbers of the first three strategies were identical in both runs). 51 answerable questions, 3 no-answer. One question ≈ 2 points, so differences of 1–2 questions are noise.
+
+| Strategy | Chunks (tokens each) | Best doc Hit@1 | Best section Hit@1 | Best section Hit@3 | Section unreachable |
+|---|---|---|---|---|---|
+| doc | 18 (195) | 46/51 (hybrid gemma) | – | – | – |
+| section | 54 (63) | 46/51 (qwen3) | **35/51** (hybrid gemma) | 45/51 | 0 |
+| section+title | 54 (71) | 46/51 (hybrid qwen3) | 33/51 (hybrid qwen3) | 45/51 | 0 |
+| fixed-60 | 49 (70) | 42/51 (hybrid qwen3) | 22/51 (hybrid qwen3) | 30/51 | **12** |
+| fixed-60/20 | 58 (79) | 42/51 (hybrid qwen3) | 26/51 (hybrid qwen3) | 40/51 (qwen3) | **5** |
+
+The new questions (doc strategy, doc-level Hit@1):
+
+| Method | Step 2's types (33) | on-call (18) |
+|---|---|---|
+| BM25 | 27/33 (82%) | **10/18 (56%)** |
+| embeddinggemma | 31/33 (94%) | 13/18 (72%) |
+| qwen3-embedding | 29/33 (88%) | 13/18 (72%) |
+| hybrid BM25 + gemma | 32/33 (97%) | 14/18 (78%) |
+
+At section level (section+title), the on-call questions scored **2/18 (BM25) to 8/18 (hybrid qwen3)**.
+
+Of hybrid qwen3's 18 section-level misses, **13 had the right runbook but the wrong section** (Symptoms instead of Cause, etc.). The other 5 (the 51 − 46 doc-level misses): `toomanyrequests` → argocd; o05 "4 of them just sit there unscheduled" → argocd/Fix (rank 9); o07 "new pods never join the load balancer" → crashloop/Fix (rank 25); o08 "spring boot needs 3 minutes to boot and k8s kills it" → crashloop/Symptoms (rank 13); o12 → helm-rollback instead of helm-upgrade-failed.
+
+No-answer questions (section+title): top-1 similarity 0.46 / 0.57 / 0.41 (gemma) and 0.52 / 0.48 / 0.40 (qwen3), against answerable questions' top-1 of 0.35–0.77 (gemma) and 0.39–0.78 (qwen3). gemma's "port-forward drops" (0.572) scored **higher than 25 of the 51 answerable questions**, and went to crashloop/Cause.
+
+| Prediction | Observed |
+|---|---|
+| on-call lower for every method, BM25 most | ✅ BM25 82% → 56%, embeddings 88–94% → 72% |
+| `section` lower than `doc` at doc level | ≈ mixed: gemma 44 → 41, **qwen3 42 → 46**, hybrids ±1–2. Within noise, except that qwen3 did better on small chunks |
+| `section+title` higher than `section` | ❌ **no effect** (±2 either way) |
+| section level ≈55–75% Hit@1 | ✅ 47–69% for the section strategies |
+| section Hit@3 ≈85–95% | ✅ 78–88% for the section strategies (a bit lower) |
+| fixed-60 lower than section+title | ✅ clearly: 22 vs 33 at section level, and 12 sections had no window of their own |
+| overlap slightly higher | ✅ 22 → 26 at section level; unreachable sections 12 → 5 |
+| hybrid still the best | ✅ at section level in every strategy; at doc level it ties with qwen3 alone on `section` |
+| no-answer below most but not all | ✅ no threshold separates them (below) |
+
+What it shows:
+* **Finding the document is the easy part; finding the paragraph is hard.** Doc level reached 46/51 for every structured strategy, but the right *section* came first only 31–35 times, and 13 of 18 misses were the right runbook with the wrong section. Symptoms, Cause and Fix of one runbook share their vocabulary, so for a question that describes symptoms but needs the cause, the three sections score almost alike. Labels are part of it too: "postgres statefulset won't come up, its disk never gets created" was labelled Cause, but the Symptoms section is a defensible match (the Step 2 ground-truth caveat again).
+* **So: search small, return big.** Small chunks are where the match is precise, but the chat model needs the context around it. With runbooks of ≈195 tokens, the practical design is to search sections (hybrid) and **put the whole parent runbook in the prompt**: 3 runbooks ≈ 600 tokens, far below the 4,096 context. This is called parent-document or "small-to-big" retrieval. It would have turned 13 of the 18 misses into hits, because the parent runbook of the top chunk was right.
+* **Chunk on the document's structure, not on a word count.** Fixed 60-word windows were worse at both levels, and **12 labelled sections owned no window** (a short Symptoms section split between two windows is the majority of neither): that content can only be found as a fragment of something else. Overlap halved the damage (5) but didn't remove it. Markdown headings are free boundaries; use them.
+* **The contextual title did nothing here.** Probably because the topic was already identifiable (doc level was 46/51 with or without it), and the title is the same for all three sections of a runbook, so it can't help choose *between* them, which is where the misses were. It helps when chunks from different documents look alike without their title, which this corpus (one runbook per topic) rarely has.
+* **Real questions are much harder than author questions.** The on-call set (same author, but without the runbook's words) lowered BM25 from 82% to 56% and the embeddings from ≈90% to 72%. At section level, on-call was 2–8 of 18. Step 2's 100% was the ceiling effect plus author bias, as suspected. **Measure with the questions your users ask.**
+* **"Nothing found" can't be read from the score.** The no-answer questions landed among the answerable ones. A cut-off at 0.45 would have rejected two of three no-answer questions for gemma, but also several real ones, and still let "port-forward drops" (0.57) through. Saying "I don't know" must come from the chat model reading the chunks (Lab 03 Step 6's strict rule), not from retrieval alone.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -396,4 +443,54 @@ Treat it as a **hypothesis to test on your own data**, not a fact. The card's "1
 What the misses suggest is a plausible mechanism: a long instruction in front of a one-word query (`toomanyrequests`) makes the query's vector mostly "about" the instruction. That may matter for short, identifier-like queries, which is exactly what engineers type.
 
 How to decide: keep the setting that's **consistent between indexing and querying**, measure on a larger and harder set (Step 3), and choose by the numbers. And since the hybrid already covers identifiers with BM25, the prefix's effect on identifiers matters less in a hybrid system. It's the same discipline as Lab 03 with the sampling defaults: the vendor's recommendation is a starting point, the measurement decides.
+</details>
+
+**8. Section chunks found the right runbook 46/51 times, but the right section only 31–35 times. What would you put in the RAG prompt?**
+
+13 of the 18 section-level misses (hybrid qwen3, section+title) were the right runbook with the wrong section: "go back to the chart version we had yesterday" got helm-rollback/Symptoms instead of its Fix. Runbooks are ≈195 tokens each; the chat model's context is 4,096.
+
+*Search unit vs prompt unit: why separate them, and what decides the sizes?*
+
+<details><summary>Answer</summary>
+
+Search on **small** units and send **big** ones (small-to-big, or parent-document retrieval). Small chunks match precisely, because a 60-token section is "about" one thing, while a whole document's vector is an average of everything in it. But the answer often sits next to the matching text: the question describes the symptom, the fix is two paragraphs later. So use the top chunk to find *where* to look, and give the chat model the surrounding unit, here the whole runbook. Three parent runbooks ≈ 600 tokens, which leaves most of the 4,096 context for instructions and the answer.
+
+What decides the sizes:
+
+* **Search unit:** small enough to be about one thing, large enough to carry its own meaning (one section; not a 60-word window that cuts sentences).
+* **Prompt unit:** what the chat model needs to answer, limited by the context budget (`num_ctx`, Lab 02) and by Lab 03's lesson that irrelevant text dilutes the answer. With 5,000-token documents you'd send the matching section plus its neighbours, not the whole document.
+
+DevOps analogy: an index on a column finds the row (search unit), but the query returns the whole row (prompt unit). Nobody returns just the indexed value.
+</details>
+
+**9. Fixed 60-word windows left 12 labelled sections without a chunk of their own. Why, and when would you still use fixed windows?**
+
+Overlap (60 words, stride 40) reduced it to 5. Section-level Hit@1 was 22/51 for fixed-60 and 33–35 for the section strategies.
+
+*What goes wrong at a fixed boundary, and what does overlap fix and not fix?*
+
+<details><summary>Answer</summary>
+
+A fixed window ignores the text's structure: a short section (the 30-word Symptoms of a runbook) gets split between the end of one window and the start of the next. In each, it's a minority, mixed with the title or the Cause. Its content can then only be found as part of a chunk that is mostly about something else, so its vector doesn't represent it. That's why 12 sections were unreachable.
+
+Overlap repeats the boundary region in two windows, so a sentence that was cut in half is complete in at least one of them. It halved the problem (12 → 5) at the price of more chunks (49 → 58) and duplicated text in the results. It doesn't fix the deeper issue: the windows still don't align with meaning.
+
+Use fixed windows when the text has **no structure to follow**: chat transcripts, raw logs, OCR output, a PDF without headings. Then overlap is worth it. When the documents have headings (Markdown runbooks, Helm chart READMEs, Confluence pages), split on the headings, and only cut a section further if it's longer than the search unit should be.
+</details>
+
+**10. "kubectl port-forward drops every few minutes" isn't covered by any runbook, yet it scored higher than half of the real questions. What does the RAG system do with it?**
+
+gemma gave it a top-1 similarity of 0.572 (crashloop/Cause); answerable questions ranged from 0.35 to 0.77. The other two no-answer questions scored 0.40–0.52.
+
+*Where in the pipeline should "I don't know" come from?*
+
+<details><summary>Answer</summary>
+
+Retrieval always returns a top-*k*, ranked by "least far away", even when everything is far away. A similarity score measures how alike two texts are, not whether one answers the other, and "port-forward drops" is plausibly close to "a container exits repeatedly" (connection problems, restarts). So retrieval hands the chat model the crash-loop runbook with full confidence.
+
+A score threshold can catch the obvious cases (0.40 is low for both models), but there's no cut-off that separates all of these from real questions (0.35–0.39 was the lowest real one). So the decision has to be made where the text is **read**:
+
+* The **chat model**, with Lab 03 Step 6's rule: "answer only from the reference; if it doesn't contain the answer, say so". Here the crash-loop runbook says nothing about port-forward, so a well-instructed model should abstain (Step 4 tests it).
+* **Logging and feedback:** record questions with low top scores or abstentions. They're your missing documentation, like 404s in an access log.
+* A retrieval threshold as a cheap first filter only, calibrated per model on labelled questions, and set low.
 </details>
