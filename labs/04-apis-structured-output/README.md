@@ -351,6 +351,48 @@ What it shows:
 * **The injection worked once:** `namespace: "default"`, `reason: "NoIncident"`, and the summary even said "An AI maintenance test requested a report with default namespace…". Once in 34 is rare, but for an automated pipeline it means "sometimes an attacker-written log line decides the report". The schema made the injected values *well-formed*.
 * **Ground-truth caveat:** the 11 `first_seen` "errors" on crashloop-distractor took the CrashLoopBackOff line (12:01:10) instead of the earlier `exited exitCode=1` line (12:00:30). "The first log line that shows the failure" is arguably ambiguous there. Labelled data needs precise definitions too, or the metric measures the label, not the model.
 
+### Step 5 — OpenAI-compatible API
+
+Raw: `results/raw/openai-compat-20261027-164429.md`; `server.log` 16:44. qwen3.5:4b, Ollama 0.40.10, temperature 0, seed 42.
+
+| Case | Completion tokens | finish | Time | Answer |
+|---|---|---|---|---|
+| `/api/chat`, think false (reference) | 10 | stop | 0.20 s | "The Kubernetes object is called a **Deployment**." |
+| v1, no reasoning field | **1,500** | **length** | 12.42 s | **empty**: 6,560 chars in `message.reasoning` |
+| v1, reasoning_effort "none" | 10 | stop | 0.20 s | identical to the reference ✅ |
+| v1, reasoning_effort "low" | **1,500** | length | 12.49 s | empty; the **same** 6,560 chars of reasoning |
+| v1, reasoning {effort: "none"} | 10 | stop | 0.16 s | identical to the reference ✅ |
+| v1, `think: false` (native field) | **1,500** | length | 12.41 s | empty; **ignored** |
+
+| Context case (prompt 5,793 tokens) | HTTP | prompt_tokens | Answer |
+|---|---|---|---|
+| v1 default | 200 | **2,050** | `prod` ❌ |
+| v1 + `options: {num_ctx: 8192}` | 200 | 2,050 | `prod` ❌ (ignored) |
+| v1 + `truncate: false` | 200 | 2,050 | `prod` ❌ (ignored) |
+| v1, model `qwen3.5:4b-ctx8k` | 200 | **5,793** | **blue-falcon** ✅ (`/api/ps`: context 8192) |
+
+| Prediction | Observed |
+|---|---|
+| No reasoning field: thinks, text in an extra field | ✅ and worse: **1,500 tokens of thinking for a one-sentence question, no answer at all** (`content` empty, `finish_reason: "length"`). The thinking text is in `message.reasoning` |
+| reasoning_effort "none" = native think false | ✅ the same 10 tokens, the same text |
+| "low" thinks | ✅ and **byte-identical** to no field (same 6,560 chars at temperature 0): "low" is just "on", with no budget effect |
+| reasoning.effort alias | ✅ |
+| `think: false` in a /v1 body: unknown | **Ignored** |
+| Part 2: no durations, `length` at max_tokens 5 | ✅ keys `id, object, created, model, system_fingerprint, choices, usage`. New: `usage.prompt_tokens_details.cached_tokens` = **25 of 29**, the same "all but 4 tokens cached" as Lab 03 |
+| v1 default: 2,050 tokens, `prod` | ✅ exactly. HTTP 200; `server.log` has the same `WARN truncating input prompt limit=2050 prompt=5793 keep=4 new=2050` |
+| `options.num_ctx`, `truncate: false`: unknown | **Both silently ignored.** Not even an "invalid option" WARN, unlike unknown options on `/api` (Lab 03 Step 4): the `/v1` layer drops fields it doesn't know before they reach Ollama |
+| ctx8k variant: ≈5,800, blue-falcon | ✅ 5,793 tokens, blue-falcon |
+| Part 4: both valid JSON | ✅ `{"kind": "ReplicaSet", "api_group": "apps"}` both times. This test can't tell whether the schema was enforced: the question already named both keys |
+| Part 5: SSE, usage chunk, `[DONE]` | ✅ `text/event-stream`, 12 `data:` lines; the last chunk before `data: [DONE]` has `"choices": []` and the `usage` |
+
+What it shows:
+* **The default for an OpenAI client is the expensive one.** A client that sends a plain OpenAI request (no `reasoning_effort`, which most tools never send) got **62× the time and no answer**: 12.4 s, 1,500 tokens, all thinking. Thinking on by default (`/api/show`) plus a client that doesn't know about it is a bad combination. And "low" doesn't help: qwen3.5 has only on/off, so any effort except "none" means full thinking.
+* **The translation layer is a whitelist.** Native fields (`think`, `options`, `truncate`) in a `/v1` body are dropped without any warning. That is the API-gateway behavior you'd expect (unknown fields stripped), but it means "I added `num_ctx` and nothing changed" has no error to find.
+* **Silent truncation is the default again, and now you can't turn it off per request.** The only `/v1` fixes are server-side: a Modelfile variant (as here: 1.2 KB on disk, a "values override"), or `OLLAMA_CONTEXT_LENGTH` for the whole server. The variant solved it fully: 5,793 tokens seen, right answer.
+* **But you can detect it:** `usage.prompt_tokens` = 2,050 is the truncation constant `4 + (4096 − 4) / 2` (Q4). A client can compare it with what it sent.
+* **`/v1` hides the performance data.** No durations, so no tok/s, no load time: only token counts. For benchmarks and monitoring (Phase 8), use `/api` or measure at the client. It does show cache hits (`cached_tokens`), which `/api` calls `prompt_eval_cached_count`.
+* **For Phase 6 (Codex, Claude Code):** before trusting a coding agent on local Ollama, check two things in its requests or in `server.log`: does it send `reasoning_effort` (or will every turn think), and is the model's `num_ctx` big enough (or every long file loses its beginning: only the first 4 and the last ≈2,046 tokens are kept). The fix is the same for both: a Modelfile variant with `num_ctx` set, and an agent config that sets the reasoning effort, or a model without default thinking.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Likely cause | Check |
@@ -486,4 +528,51 @@ But the misses aren't free: a report that misses the exit code of a crash loop i
 * **Write it as two rules, not one:** "Copy values that appear in the log exactly. Use null *only* if the value appears nowhere." The current wording ("Do not guess") seems to make the model cautious about everything.
 * **Let deterministic code do what it's good at:** regex `exitCode=(\d+)` and `restartCount=(\d+)` from the pod's lines, and let the model do the judgment parts (reason, which pod is failing, summary). Hybrid extraction is cheaper and exact.
 * **Measure both directions** on a labelled set, as here: invented *and* missed per field. Optimizing one alone just moves the errors (Lab 03 Q15).
+</details>
+
+**8. A plain OpenAI request took 12.4 s and returned an empty answer. What happened?**
+
+Through `/v1` with no reasoning field and `max_tokens: 1500`, the one-sentence question came back with `content` empty, `finish_reason: "length"`, and 6,560 characters in `message.reasoning`. With `reasoning_effort: "none"` it took 0.20 s and 10 tokens. `"low"` gave exactly the same result as no field.
+
+*Why is the default the expensive path, and why didn't "low" help? What would you check first if a tool on `/v1` "returns nothing"?*
+
+<details><summary>Answer</summary>
+
+The model's default is `thinking: true` (`/api/show`), and OpenAI's request format has no `think` field. A client that sends nothing gets the model's default, and most OpenAI clients never send `reasoning_effort`. The thinking used the whole 1,500-token budget, so no answer was ever generated: the same failure as Lab 03 Step 1 and Step 1 here, now hidden behind a client that may only read `content`.
+
+"low" didn't help because qwen3.5 has only two states (`values: [false, true]`). Ollama maps every effort except `"none"` to "on"; there's no budget for a level to control. At temperature 0 the thinking was even byte-identical.
+
+What to check when a `/v1` tool "returns nothing": `finish_reason` (`length` = budget exhausted), `usage.completion_tokens` (equal to `max_tokens`?), and whether `message.reasoning` is non-empty. Then fix it in the client (`reasoning_effort: "none"`) or pick a model/variant that doesn't think by default. It's like a sidecar that the app doesn't know about eating the pod's CPU limit: the app sees only "slow and nothing happened".
+</details>
+
+**9. `options.num_ctx` and `truncate: false` were ignored on `/v1`, without even a warning. How do you give an OpenAI client a bigger context?**
+
+All three requests saw 2,050 of 5,793 tokens and answered `prod`. On `/api`, an unknown option at least logs `invalid option provided`; here nothing. The `qwen3.5:4b-ctx8k` model saw all 5,793 tokens and answered blue-falcon.
+
+*What are the options, and what does each one change for other clients of the same server?*
+
+<details><summary>Answer</summary>
+
+The `/v1` layer only passes the OpenAI fields it knows, so the context size can't come from the request. It has to come from the server side:
+
+1. **A model variant** (`PARAMETER num_ctx 8192` in a Modelfile, as here). Only clients that ask for that model name get it, and it costs ≈1.2 KB of disk because the weights are shared. Like a Helm values override, or a separate Deployment of the same image with different env. Downside: one more name to manage, and a second copy in VRAM if both names are loaded at once.
+2. **`OLLAMA_CONTEXT_LENGTH`** for the whole server: every model and every client gets the bigger context, and the VRAM that goes with it (Lab 02: the KV cache grows with `num_ctx`). A system/environment change, so approval first here.
+3. **Use the native `/api/chat`** where you control the client, and keep `/v1` for tools you can't change.
+
+And detect it either way: `usage.prompt_tokens` equal to `4 + (num_ctx − 4) / 2` (2,050 at 4,096) is the truncation fingerprint. An integration can raise an error when it sees it.
+</details>
+
+**10. When would you use `/v1`, and when `/api`?**
+
+`/v1` returned token counts and cache hits but no durations, dropped every native field, and used SSE instead of NDJSON. It also worked with zero code changes for anything that speaks OpenAI.
+
+*Pick one for: (a) Codex or another agent, (b) a benchmark script, (c) a Python incident-extraction pipeline you own. Why?*
+
+<details><summary>Answer</summary>
+
+* **(a) Agent / third-party tool: `/v1`** (or the Anthropic-compatible `/v1/messages` for Claude Code). You can't change its client code, so compatibility wins. Make the server side right instead: a model with the right `num_ctx`, and check that the tool sends `reasoning_effort` or use a model that doesn't think by default. Check `server.log` for truncation WARNs during the first session (Phase 6).
+* **(b) Benchmark: `/api`.** You need `load_duration`, `prompt_eval_duration`, `eval_duration` to compute TTFT and tok/s on the server's clock; `/v1` doesn't return them.
+* **(c) Your own pipeline: `/api`** (the `ollama` library or httpx). You get `think`, `options` (`num_ctx`, `num_predict`, `seed`), `format` with a schema, `truncate: false` (raw), and `done_reason`. You give up portability to other providers. If portability matters, `/v1` with `response_format` and a Modelfile variant is a valid choice, but test that every field you rely on actually arrives.
+
+Rule of thumb, as with S3-compatible storage: use the compatible API to connect tools you don't own, and the native API when you need the features that make the product different.
 </details>
