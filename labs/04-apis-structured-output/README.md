@@ -479,7 +479,38 @@ What it shows:
 * **`load_duration` means "time this request waited for the runner to be ready", not "this request caused a load".** Summing `load_duration` over requests (4 × 4.32 s) overcounts the one real load (3.27 s in the log) four times.
 * **Same weights, different `num_ctx` = one runner, reloaded.** This wasn't new; I missed it: Lab 01/02 found that a request goes to a loaded runner with the same weights blob, and that changing `num_ctx` reloads the runner. When the `ctx8k` request arrived, the scheduler waited for the `4b` request to finish, unloaded the runner and loaded it again with 8,192 context. The log confirms it: at the second load, the GPU had `free="8.9 GiB"`, i.e. nothing loaded. The cost: 13.2 s of "load" for the second request: ≈7.7 s waiting for the first request to finish, then ≈5.5 s to unload and reload (log: the new `llama-server` started at 22:29:23.4, ≈1.2 s after the first request ended, and took 3.27 s). **So a Modelfile variant (Step 5) isn't free: traffic that alternates between the two names thrashes the runner.** Pick one context size per model and use it for every client.
 * **Cancellation works for generation too** (Step 3 showed it for a load): the server stopped the 3,000-token answer within ≈0.3 s of the disconnect, and the next request started at once. A client timeout really frees the GPU; abandoned requests don't keep the queue busy.
-* **Two VRAM numbers for the same model:** `/api/ps` `size_vram` 3,209 MiB vs the `nvidia-smi` delta 4,116 MiB. The ≈900 MiB difference is not explained here (CUDA context and compute buffers outside Ollama's estimate are likely; Lab 01 found ≈240 MiB of runtime overhead at 4K). Plan with `nvidia-smi`. Also: the idle desktop now uses 2,524 MiB (≈1,650 MiB in Phase 0), so the real headroom is smaller than the baseline says.
+* **Two VRAM numbers for the same model:** `/api/ps` `size_vram` 3,209 MiB vs the `nvidia-smi` delta 4,116 MiB. Explained by the verbose log of the extra run below: `/api/ps` leaves out the **vision projector's weights (644 MiB)** and the CUDA runtime (≈260 MiB). Plan with `nvidia-smi`. Also: the idle desktop now uses 2,524 MiB (≈1,650 MiB in Phase 0), so the real headroom is smaller than the baseline says.
+
+### Step 6 extra — `OLLAMA_NUM_PARALLEL=2`
+
+Raw: `results/raw/concurrency-20261027-224942.md`, plus the `ollama serve` console (22:48–22:49; that console shows the full llama-server output). Server started by hand with `OLLAMA_NUM_PARALLEL:2` (confirmed in its `server config` line), Part A only.
+
+| Part A2 (warm, 4 at once) | 1 slot (Step 6) | `NUM_PARALLEL=2` |
+|---|---|---|
+| First tokens | 0.56 / 2.24 / 3.92 / 5.61 s | 0.61 / 2.31 / 4.02 / 5.71 s |
+| tok/s per request | 122 | 120–122 |
+| Total for 4 | 7.25 s | 7.35 s |
+| VRAM (`nvidia-smi` delta, cold) | — | +3,902 MiB |
+
+**Every prediction failed, for one reason the log states plainly:**
+
+```
+WARN source=sched.go:552 msg="model architecture does not currently support parallel requests" architecture=qwen35
+... llama-server.exe ... -c 4096 -np 1 ...
+srv load_model: initializing, n_slots = 1, n_ctx_slot = 4096
+```
+
+Ollama **ignored the setting for this model** and started llama-server with one slot (`-np 1`), so the run is the 1-slot result again (within ≈0.1 s). No error, and the API gives no hint: only the WARN line. Likely because qwen3.5 is hybrid (Lab 02): its recurrent layers keep one state per sequence, and Ollama doesn't support several sequences for this architecture yet. That's an inference from the warning, not verified. Both chat models in this lab (`qwen3.5:4b`, `:9b`) are this architecture, so **parallel requests aren't available here**; more throughput would need a second instance or a different model family. Lesson, as with Lab 03's ignored options: **check that a setting took effect** (`n_slots` in the log) before measuring its effect.
+
+The verbose console also answered two older open questions:
+
+* **Where the `/api/ps` vs `nvidia-smi` gap comes from (Step 6).** llama-server's own breakdown: `model 2515 + context 178 + compute 78 = 2,771 MiB`, plus the vision projector: weights `644.26 MiB` and a compute buffer `223.30 MiB`. `/api/ps` reported **2,995 MiB ≈ 2,771 + 223**: everything **except the projector's weights**. `nvidia-smi` showed +3,902 MiB = 2,995 + 644 + ≈263 MiB of CUDA runtime. It also confirms Lab 01's "≈640 MiB projector (inferred)".
+* **Why the prompt cache always reuses all but 4 tokens (Lab 03).** Each prompt is processed in two parts: `cached n_tokens = 0 … [0, end)`, then a **context checkpoint** at `n_tokens = 26` of 30 (`created context checkpoint 1 of 32 (pos_min = 25, pos_max = 25, n_tokens = 26, size = 50.251 MiB)`), then the last 4 tokens. A hybrid model's recurrent state can't be rewound to an arbitrary token, only restored from a checkpoint (the 50 MiB is exactly the recurrent state). So an identical prompt resumes from the checkpoint and recomputes the last 4. And a prompt that differs **before** the checkpoint (here at token 19: "request k") can't reuse anything: `forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory …)`. Why the checkpoint sits exactly 4 tokens from the end isn't shown in the log.
+
+Also visible:
+* **A host-RAM prompt cache:** `prompt cache is enabled, size limit: 8192 MiB`. Idle slot states are saved to system RAM, ≈108 MiB per 229-token prompt here (the 50 MiB checkpoint is part of it); 4 prompts held 431 MiB. Up to 8 GiB of RAM per runner that no VRAM tool shows.
+* `--keep 4` on the llama-server command line: the source of the `keep=4` in the truncation rule (Lab 03 Step 5a).
+* At temperature 0 the sampler chain ends in `greedy` instead of `dist`.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -487,6 +518,7 @@ What it shows:
 |---|---|---|
 | `python` reports 3.9, or `pip install pydantic` fails on version | The Microsoft Store Python 3.9 is first on PATH | Use `py -3.12`, or the venv's `.venv\Scripts\python` |
 | Streaming script prints nothing until the end | Body buffered: `Invoke-RestMethod`, or `HttpClient` without `ResponseHeadersRead` | Use `stream.ps1`'s pattern |
+| `OLLAMA_NUM_PARALLEL` > 1 changes nothing | The model's architecture doesn't support parallel requests (qwen3.5: `WARN … does not currently support parallel requests`); the runner starts with `-np 1` | `n_slots` in the llama-server load lines |
 | `localhost` requests ≈2 s slower | Windows resolves `localhost` to `::1` first; Ollama binds IPv4 only (Lab 01) | Use `127.0.0.1` |
 
 ## 7. Cleanup
@@ -677,7 +709,7 @@ tok/s is a **throughput per request** metric: it only measures the time a reques
 
 Queue time = `total_duration − load_duration − prompt_eval_duration − eval_duration` (≈5.1 s for request 4). Watch it at the p95/p99 together with TTFT. With one slot, queue time grows linearly with the number of waiting requests: N clients × ≈1.7 s each here.
 
-Alert on queue time / TTFT, not on tok/s or GPU utilization. A fully busy GPU with a growing queue looks *healthy* on utilization graphs. It's the classic saturation signal (the "S" in USE): a pod at 100% CPU with a growing request backlog, where the fix is more capacity (more slots, `OLLAMA_NUM_PARALLEL`, or a second instance), not a faster pod.
+Alert on queue time / TTFT, not on tok/s or GPU utilization. A fully busy GPU with a growing queue looks *healthy* on utilization graphs. It's the classic saturation signal (the "S" in USE): a pod at 100% CPU with a growing request backlog, where the fix is more capacity (more slots with `OLLAMA_NUM_PARALLEL`, which qwen3.5 doesn't support (Step 6 extra), or a second instance), not a faster pod.
 </details>
 
 **12. Two model names with the same weights ran one after the other, with a reload in between. Why, and why does it matter?**
@@ -710,4 +742,19 @@ The consequences for timeouts:
 * **Generous enough to finish:** a timeout shorter than load + queue + generation never succeeds, and each retry cancels and starts over (Step 3 Q2). With one slot, "queue" can be N × the generation time of whoever is ahead.
 * **Cancelling is cheap and useful:** stop a runaway answer (a thinking loop, Step 1) early; it frees the slot for others. Use `num_predict` as the hard budget, and streaming + cancel as the soft one.
 * **Measure from the client's side:** the server's `total_duration` includes the queue, but not the client's connection setup (≈0.3 s per new `httpx.Client` here). Reuse one client.
+</details>
+
+**14. You set `OLLAMA_NUM_PARALLEL=2`, and the numbers didn't move. What's the lesson beyond "qwen3.5 doesn't support it"?**
+
+The server config said `OLLAMA_NUM_PARALLEL:2`. The scheduler logged `WARN … model architecture does not currently support parallel requests architecture=qwen35` and started llama-server with `-np 1`. The 4 requests were queued exactly as before, with no error from the API.
+
+*How would you make sure a performance setting is actually in effect, here and in general?*
+
+<details><summary>Answer</summary>
+
+A setting has three layers, and each can silently stop it: **configured** (the env var), **accepted** (the server config line shows it), and **applied** (what the component actually runs with). Here the first two were fine and the third wasn't: the scheduler overrode it per model architecture. Lab 03 had the same shape with misspelled options (accepted as a WARN, never applied), and Step 5 with fields that `/v1` dropped.
+
+So before measuring a setting's effect, **verify the applied value at the lowest layer you can see**: here `-np` on the llama-server command line and `n_slots` in its load lines; for `num_ctx`, `/api/ps` `context_length`; for sampling, the `sampler params` line. Then measure. It's the Kubernetes habit of checking the *running* pod (`kubectl get pod -o yaml`, the container's env) rather than the Deployment you applied: an admission webhook or a LimitRange may have changed it.
+
+And for capacity planning: per-model limits like this one mean the answer to "how many concurrent users?" depends on the model family, not only on the GPU. With qwen3.5 on this setup, concurrency = queueing.
 </details>

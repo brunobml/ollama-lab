@@ -47,7 +47,7 @@ flowchart LR
 | Consumer | Size | Where |
 |---|---|---|
 | LLM weights | 2,515 MiB | VRAM |
-| Vision projector weights | ≈640 MiB (inferred) | VRAM |
+| Vision projector weights | 644 MiB (llama-server log, Lab 04 Step 6 extra) | VRAM |
 | Compute buffers | 291 MiB | VRAM |
 | KV cache | 128 MiB | VRAM |
 | Recurrent state (hybrid arch) | 50 MiB | VRAM |
@@ -55,7 +55,10 @@ flowchart LR
 | **Total measured** | **≈3,860 MiB** | `nvidia-smi` delta |
 | Host-side weights (likely embeddings) | 497 MiB | system RAM |
 
-Ollama's own `SIZE` estimate was 3.1 GB — plan with measured values.
+Ollama's own `SIZE` estimate was 3.1 GB — plan with measured values. `/api/ps` `size_vram` (2,995 MiB on 0.40.10) counts weights, KV/recurrent state and compute buffers, including the projector's 223 MiB compute buffer, but **not the projector's weights (644 MiB) or the CUDA runtime** (Lab 04 Step 6 extra).
+
+* **Prompt cache (llama-server):** prompts are processed with a **context checkpoint 4 tokens before the end** (a 50 MiB snapshot of the recurrent state). A hybrid model can only resume from a checkpoint, so an identical prompt reuses all but 4 tokens, and a prompt that differs before the checkpoint is fully re-processed. Idle slot states are saved to a **host-RAM prompt cache** (limit 8,192 MiB; ≈108 MiB per 229-token prompt).
+* **Parallel requests:** `OLLAMA_NUM_PARALLEL` is overridden for qwen3.5 (`WARN … model architecture does not currently support parallel requests architecture=qwen35`; llama-server runs with `-np 1`).
 
 ## Context and truncation
 
