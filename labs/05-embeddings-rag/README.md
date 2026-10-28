@@ -162,9 +162,50 @@ Searched with BM25, both embedding models (no prefixes; Step 2 found no effect),
 | hybrid | still the best in every strategy | Uncorrelated errors (Step 2) |
 | no-answer top score | **lower** than most answerable questions, but **not below all of them** | No clean threshold (Q2): you can't reliably say "nothing found" from the score |
 
-### Later steps (planned)
+### Step 4 — RAG end to end
 
-* Step 4 — RAG end to end, using Step 3's answer: search **section chunks with the hybrid**, put the **parent runbooks** of the top hits into the prompt (Lab 03 Step 6 rules), answer with `qwen3.5:4b`, and check whether the answer is right *and* names the right runbook. Compared with sending only the top chunks, and with no retrieval at all. What the chat model does with the no-answer questions (abstain, or answer from the wrong runbook?).
+Steps 1–3 measured retrieval alone. Now the chat model reads what retrieval found and answers. A RAG answer can go wrong in two places, and they need different fixes: **retrieval** didn't bring the right runbook (fix the index, chunking, search), or the **reader** (the chat model) had it and didn't use it (fix the prompt or the model). Analogy: a 404 from the backend vs a backend that returned the right data and a frontend that rendered the wrong field. The script measures them separately.
+
+**Setup** (`rag_answer.py`): retrieval is Step 3's best: section+title chunks, hybrid BM25 + qwen3-embedding. The embedding model is stopped before generation, so only `qwen3.5:4b` holds VRAM. Four ways to build the prompt, for all 51 answerable and 3 no-answer questions:
+
+| Condition | What goes into the prompt | ≈ Prompt size |
+|---|---|---|
+| `closed-book` | nothing: the question only | ≈60 tokens |
+| `chunks` | the top 3 section chunks | ≈350 tokens |
+| `parents` | the **parent runbooks** of the top chunks, the first 3 distinct ones ("search small, return big", Q8) | ≈750 tokens |
+| `oracle` | only the right runbook: what perfect retrieval would give | ≈350 tokens |
+
+The rules (system prompt, from Lab 03 Step 6): use only the runbooks; **start the reply with the runbook id in brackets** (`[oomkilled]`), so the citation can be checked by code; at most 4 sentences with the applicable commands; and if no runbook answers it, reply exactly `NOT IN RUNBOOKS`. `closed-book` gets a plain "answer in at most 4 sentences, with commands". Think off, temperature 0, seed 42, `num_predict` 300, `truncate: false` (a prompt over 4,096 tokens would fail instead of being cut).
+
+**Scored per answer, deterministically:**
+* **In context:** the right runbook is in the prompt (retrieval's part).
+* **Cited ok:** the reply starts with the right runbook's id (the reader's part).
+* **Abstained:** `NOT IN RUNBOOKS`. Right for the 3 no-answer questions, a miss for the 51 others.
+* **Unsupported items:** backticked commands or identifiers in the reply that **don't appear in the prompt's runbooks**, with placeholders allowed (`kubectl logs my-pod --previous` matches `kubectl logs <pod> --previous`; an invented flag doesn't). A rough hallucination measure. For `closed-book`, they're checked against the right runbook instead ("does the model's own answer match our runbook?").
+* For a `parents` miss: **was the right runbook not retrieved, or retrieved but not cited, or retrieved and abstained?**
+
+Not scored automatically: whether the answer is actually *right*. Every reply is saved to `results/raw/rag-answer-*.jsonl`, and the analysis reads them (Lab 03 habit: the scores, then the raw answers).
+
+```powershell
+.\.venv\Scripts\python scripts\rag_answer.py      # ≈7–10 minutes (213 answers); stops the models at the end
+```
+
+**Predictions:**
+
+| Condition | In context | Cited ok | Wrongly abstained | No-answer abstained | Unsupported items |
+|---|---|---|---|---|---|
+| closed-book | – | – | – | – | **many**: real kubectl commands, but not our runbook's |
+| chunks | ≈49/51 | ≈38–44 | **highest**, ≈5–10: the chunk often lacks the answer (Step 3: wrong section) | 2–3/3 | few |
+| parents | ≈49–50/51 (= doc Hit@3) | **≈43–47** | ≈2–5 | 2–3/3 | few |
+| oracle | 51/51 | ≈48–51 | ≈0–3 | – | fewest |
+
+And:
+* **oracle − parents** is what retrieval costs; **51 − oracle** is what the reader costs. Prediction: retrieval is the bigger loss on the on-call questions, the reader is near-perfect when the right runbook is there.
+* **Lab 03 Step 6 found the strict "not in reference" rule over-abstains.** Expect a few wrong abstentions even with the right runbook in the prompt, more with `chunks`.
+* **No-answer questions:** the model should abstain with `parents`, but may answer from a loosely related runbook ("port-forward drops" → crash loop) for at least one.
+* `parents` costs ≈2× the prompt tokens of `chunks`, ≈0.1–0.2 s more per answer (prompt processing is fast, Lab 02).
+
+### Later steps (planned)
 * Step 5 — A vector store (ChromaDB or sqlite-vec, decided then): what it adds over the numpy array (persistence, metadata filters, approximate search) and what it doesn't change (the vectors).
 
 ## 5. Hypotheses → Observed Metrics
