@@ -423,6 +423,50 @@ What it shows:
 * **Grounding changed what the commands are:** 75% of closed-book commands are not the documented ones; with retrieval, 2% (9/379), and most of those are faithful renderings of prose. The two real errors are subtle (a made-up field path, a missing namespace): exactly the kind a human skimming the answer would not catch.
 * **Measurement limits:** "cited ok" checks the citation, not the whole answer; the replies were read for the misses and spot-checked for hits, not graded one by one. And the questions are still author-written.
 
+#### Run 3: a bigger reader, `qwen3.5:9b`
+
+Same v2 prompt, retrieval and questions; only the reader changes (`rag_answer.py --chat qwen3.5:9b`). The embedding model is stopped before generation, so VRAM is the 9b alone (≈6,450 MiB at 4K, Lab 02; within the 8,500 MiB ceiling).
+
+**Predictions (written before the run):**
+
+| Measure | 4b (run 2) | 9b prediction | Why |
+|---|---|---|---|
+| oracle cited ok | 49/51 | **50–51/51** | The 2 refusals (i04, o04) had the answer verbatim; a bigger model reads more carefully |
+| parents cited ok | 47/51 | ≈48–49/51 | The judgment calls (o05 Argo CD, o08 crash loop) may flip; **o07 stays wrong** (not retrieved: no reader can fix it) |
+| chunks cited ok | 44/51 | ≈45–46/51 | Fewer wrong refusals, but the wrong-section problem is retrieval's |
+| no-answer refused | 3/3 | 3/3 | Already perfect |
+| closed-book unsupported | 130/174 | **about the same share** | More knowledge, but still not *our* runbooks |
+| s/answer | 0.7–0.9 | ≈1.0–1.4 | ≈85 vs ≈120 tok/s (Lab 02), plus slower prompt processing |
+
+**Observed** (raw: `results/raw/rag-answer-qwen3.5-9b-20261027-235343.jsonl`; run by Claude, at the user's request). During generation: `ollama ps` 100% GPU, 4,096 context; `nvidia-smi` 8,794 MiB used vs 2,508 MiB idle, so the 9b took ≈6,290 MiB.
+
+| Condition | Cited ok 4b → 9b | Wrongly refused 4b → 9b | No-answer refused 4b → 9b | Unsupported 4b → 9b | s/answer 4b → 9b |
+|---|---|---|---|---|---|
+| closed-book | – | – | – | 130/174 → 160/209 | 0.9 → 1.4 |
+| chunks | 44 → **42** | 4 → **7** | 3/3 → **2/3** | 2/107 → 9/127 | 0.7 → 1.0 |
+| parents | 47 → **47** | 0 → **3** | 3/3 → 3/3 | 2/134 → 0/130 | 0.8 → 1.1 |
+| oracle | 49 → **48** | 2 → **3** | – | 5/138 → 4/130 | 0.8 → 1.0 |
+
+Question by question, the two readers mostly agree; the flips go both ways:
+* **parents:** the 9b fixed o08 (liveness, not crash loop) and lost p09 (refused, with the PVC runbook in the prompt). And **o07**, the retrieval miss: the 4b answered confidently from the crash-loop runbook, the **9b replied `[none] NOT IN RUNBOOKS`**: still a miss in the table, but the safe kind.
+* **chunks:** the 9b fixed o05 and o15, and lost p07, p08, p09 (refusals) and k06. It also **answered a no-answer question** (n02 "port-forward drops") with an invented explanation from the readiness runbook ("the underlying pod is restarting due to a failing readiness probe, causing the service endpoint to become stale"), where the 4b had refused.
+* **oracle:** the 9b refused i04 (like the 4b) and o05.
+
+| Prediction | Observed |
+|---|---|
+| oracle 50–51 | ❌ 48 |
+| parents ≈48–49, o07 stays wrong | ❌ 47; o07 still a miss, but now a refusal instead of a wrong answer |
+| chunks ≈45–46 | ❌ 42 |
+| no-answer 3/3 | ✅ parents; ❌ chunks 2/3 |
+| closed-book: same share unsupported | ✅ 75% → 77% (longer answers: median 110 vs 98 tokens) |
+| ≈1.0–1.4 s/answer | ✅ 1.0–1.4 s, ≈1.4× the 4b |
+
+What it shows:
+* **A 2× bigger reader didn't score better on this task:** 47 = 47 with parents, ±1–2 elsewhere, which is noise at 51 questions. The 4b already gets everything right that the prompt makes clear; the remaining errors come from ambiguity (two plausible runbooks), retrieval, and the strict refusal rule, not from the reader's capacity. Cost: ≈1.4× the time and ≈6.3 vs ≈3.9 GB of VRAM for no gain. As in Phase 2: **bigger isn't automatically better; measure on your task.**
+* **The 9b behaves differently, not better: more cautious.** It refused more where the answer was there (wrong refusals 0 → 3 with parents), and it refused where retrieval had failed (o07). That's the precision/recall trade-off of Lab 03 Step 6 and Lab 04 Step 4 again, now between models: a more cautious model makes fewer dangerous errors and more useless ones. Which one you want depends on what a wrong answer costs. For an on-call bot, refusing o07 is worth more than answering p09.
+* **Not monotonic:** the same 9b that refused o07 invented an explanation for a no-answer question in `chunks`. One run per question at temperature 0 can't separate "the 9b is safer" from "the 9b is different on these few questions": the flips are 1–4 per condition.
+* **The unsupported-items check has false positives** that show up more with a chattier model: `node-7` comes from the *question*, `READY 0/1` is the runbook's "READY shows `0/1`" re-quoted. A real check would compare against the question and the prompt as a whole, or normalize quoting.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Likely cause | Check |
@@ -662,4 +706,24 @@ How to use the answers:
 * **For an agent that executes commands (Phase 6):** never run a generated command directly. Allow only commands from a whitelist or from the cited runbook, read-only first, with human approval for anything that changes state.
 
 The same as code review for a generated Terraform plan: the plan is usually right, and that's exactly why you still have to read it.
+</details>
+
+**14. qwen3.5:9b scored 47/51 with parents, the same as the 4b, at 1.4× the time and ≈6.3 vs ≈3.9 GB VRAM. But it refused o07 (the retrieval miss) where the 4b answered wrongly. Which reader would you deploy?**
+
+The 9b also refused 3 answerable questions with the right runbook in the prompt (the 4b: 0), and in `chunks` it answered one no-answer question with an invented explanation.
+
+*How do you choose between two models with the same score but different errors?*
+
+<details><summary>Answer</summary>
+
+Not by the total. Look at **which errors** each makes and what each costs:
+
+* A **wrong refusal** ("NOT IN RUNBOOKS" when the answer is there) costs the engineer a minute: they search the runbooks themselves.
+* A **confident wrong answer** (o07 with the 4b) can cost an incident: the engineer follows the crash-loop advice for a readiness problem.
+
+If wrong answers are expensive, the 9b's caution looks attractive. But the evidence is thin: the difference is one question in parents, and the 9b also produced a confident invented answer in chunks. With 51 questions and one run each, "safer" isn't established. What would establish it: more questions with retrieval misses on purpose (remove the right runbook from the prompt for a set of questions and count refusals vs wrong answers per model), and several runs at the default sampling temperature.
+
+Until then, the evidence supports the 4b: same score, 1.4× faster, ≈2.4 GB less VRAM (room for the embedding model and a longer context next to it). And the cheaper fix for confident wrong answers is on the system side: show the cited runbook so the engineer can check it (Q13), and improve recall so the right runbook is there.
+
+It's like comparing two alerting rules with the same accuracy: you look at false positives vs false negatives separately, because they don't cost the same.
 </details>

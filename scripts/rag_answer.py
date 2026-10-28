@@ -1,6 +1,7 @@
 """Lab 05 Step 4. RAG end to end: retrieve, build the prompt, answer, and score retrieval and answer separately.
 
 Run with the venv's interpreter:  .\\.venv\\Scripts\\python scripts\\rag_answer.py      (≈7–10 minutes)
+                 another reader:  .\\.venv\\Scripts\\python scripts\\rag_answer.py --chat qwen3.5:9b
 
 Retrieval (Step 3's best setup): section+title chunks, hybrid BM25 + qwen3-embedding (RRF).
 Four ways to build the prompt for qwen3.5:4b (think off, temperature 0):
@@ -15,6 +16,7 @@ Scored per answer (deterministic; every answer is saved for reading):
   unsupported  backticked commands/identifiers in the reply that don't appear in the prompt's runbooks
                (closed-book: checked against the right runbook instead)
 """
+import argparse
 import json
 import re
 import subprocess
@@ -26,7 +28,9 @@ import numpy as np
 
 from rag_lib import BM25, embed, http, load_corpus, load_questions, ranking, rrf
 
-CHAT = 'qwen3.5:4b'
+ap = argparse.ArgumentParser()
+ap.add_argument('--chat', default='qwen3.5:4b', help='the reader (chat model)')
+CHAT = ap.parse_args().chat
 EMBED = 'qwen3-embedding:0.6b'
 # Run 1 (2026-10-27 23:35) said "for example [oomkilled]": the model then cited [oomkilled] in 9-16 answers per
 # condition, never with that runbook in the prompt. v2 has no concrete id in the instructions.
@@ -105,7 +109,8 @@ def build(cond, q):
 conds = ['closed-book', 'chunks', 'parents', 'oracle']
 jobs = [(c, q) for c in conds for q in allq if not (c == 'oracle' and not q['docs'])]
 stamp = f'{datetime.now():%Y%m%d-%H%M%S}'
-raw_path = Path('results/raw') / f'rag-answer-{stamp}.jsonl'
+tag = CHAT.replace(':', '-')
+raw_path = Path('results/raw') / f'rag-answer-{tag}-{stamp}.jsonl'
 raw_path.parent.mkdir(parents=True, exist_ok=True)
 rows = []
 with raw_path.open('w', encoding='utf-8') as raw:
@@ -190,6 +195,6 @@ say('\nUnsupported items, first 12 (condition, question: item):')
 for r in [r for r in rows if r['unsupported']][:12]:
     say(f'  {r["cond"]:<12} {r["id"]}: {", ".join(r["unsupported"])[:110]}')
 
-out = Path('results/raw') / f'rag-answer-{stamp}.md'
+out = Path('results/raw') / f'rag-answer-{tag}-{stamp}.md'
 out.write_text('\n'.join(report) + '\n', encoding='utf-8')
 say(f'\nSaved to {out} and every answer to {raw_path}')
