@@ -123,6 +123,7 @@ And:
 
 ### Later steps (planned)
 
+* **Questions you write:** 8–10 questions in your own words, from real on-call experience, written **without reading the runbooks** (only the list of topics). They go into `questions.json` as their own type, and they're the fix for the author bias Step 2 found.
 * Step 3 — Chunking: fixed size vs Markdown headers, chunk size and overlap, measured on the same questions.
 * Step 4 — RAG end to end: retrieve top-*k*, build the prompt (Lab 03 Step 6 rules), answer with `qwen3.5:4b`, and check whether the answer is right *and* cites the right section. What happens when retrieval misses.
 * Step 5 — A vector store (ChromaDB or sqlite-vec, decided then): what it adds over the numpy array (persistence, metadata filters, approximate search) and what it doesn't change (the vectors).
@@ -183,6 +184,44 @@ What it shows:
 * **6 queries can't rank the models.** gemma 5/6 vs qwen3 4/6 is one query, and the prefix moved qwen3's miss from one query to another. That's noise at this size; Step 2's labelled set (20–30 questions) is there to measure it properly.
 * **Long chunks lose their end silently.** Default `truncate: true` dropped everything after 2,048 (gemma) or 4,095 (qwen3) tokens, without an error and with HTTP 200. A runbook chunk whose fix is in its last paragraph would be indexed **without the fix**. Keep chunks well below the embedding model's context, and check `prompt_eval_count`, or use `truncate: false` while indexing so oversized chunks fail loudly.
 * **Deterministic and batch-invariant:** the same text always gives the same vector, so an index can be rebuilt reproducibly, and batching while indexing is safe.
+
+### Step 2 — Retrieval quality on a labelled corpus
+
+Raw: `results/raw/retrieval-eval-20261027-231619.md`. 18 runbooks (3,418–3,512 tokens in total, ≈190 per runbook; the largest is far below both context limits, and `truncate: false` raised nothing), 33 questions.
+
+| Method | Hit@1 | Hit@3 | MRR | paraphrase | identifier | distractor | knowledge |
+|---|---|---|---|---|---|---|---|
+| BM25 | 27/33 | 32/33 | 0.885 | **5/10** | **10/10** | 5/6 | 7/7 |
+| embeddinggemma | **31/33** | 32/33 | 0.960 | 9/10 | 9/10 | 6/6 | 7/7 |
+| embeddinggemma +prefix | 30/33 | 33/33 | 0.949 | 9/10 | 8/10 | 6/6 | 7/7 |
+| qwen3-embedding | 29/33 | 32/33 | 0.932 | 9/10 | 9/10 | 6/6 | 5/7 |
+| qwen3-embedding +prefix | 29/33 | 32/33 | 0.923 | 10/10 | 8/10 | 6/6 | 5/7 |
+| hybrid BM25 + gemma +prefix | 32/33 | 33/33 | 0.985 | 9/10 | 10/10 | 6/6 | 7/7 |
+| **hybrid BM25 + qwen3 +prefix** | **33/33** | 33/33 | **1.000** | 10/10 | 10/10 | 6/6 | 7/7 |
+
+Misses (what came first instead):
+* **BM25**, all paraphrases except d01: "pods got kicked off a machine that ran out of RAM" → node-notready (rank 5 for evicted); "a worker machine dropped out of the cluster" → coredns; "the storage request never gets a disk" → hpa-not-scaling; d01 "health check keeps failing while it is still starting up" → stuck-terminating.
+* **gemma +prefix:** p01 "restarts over and over and the wait keeps growing" → liveness-probe; `toomanyrequests` → oomkilled (rank 3); `TARGETS <unknown>/80%` → ingress-5xx.
+* **qwen3 +prefix:** `exit code 137` → crashloopbackoff (rank 3); `toomanyrequests` → pending-insufficient (**rank 8**); k01 "pod is up but gets no traffic" → pending-insufficient; k07 "two people ran apply at the same time" → argocd-outofsync.
+
+| Prediction | Observed |
+|---|---|
+| BM25: paraphrase weak (≈3–5/10), identifier ≈10/10 | ✅ 5/10 and 10/10 |
+| BM25: knowledge weak (≈2–3/7) | ❌ **7/7** (see "author bias" below) |
+| BM25 overall ≈55–65% | ❌ 82% |
+| embeddings: paraphrase ≈8–9/10, identifiers blurred (≈7–9/10) | ✅ 9–10/10 and 8–9/10 |
+| embeddings overall ≈70–80% / Hit@3 ≈90% | ❌ higher: 88–94% / 97–100% |
+| prefixes: small gain or none | ✅ none: −1 to 0 on Hit@1, both models lost one identifier |
+| hybrid ≈ the better of the two per type, best overall | ✅ **better than both** in every column; 33/33 with qwen3 |
+| Hit@3 well above Hit@1 | ✅ for BM25 (27 → 32); dense methods were already close to the ceiling |
+| qwen3 vs gemma: unknown, needs a gap of ≈4 questions | gemma 31 vs qwen3 29: 2 questions, **not a meaningful difference** |
+
+What it shows:
+* **Keyword and semantic search fail on different questions, and that's why hybrid works.** BM25's 6 misses are paraphrases ("ran out of RAM" never says "eviction"); the embeddings' misses are mostly exact strings (`toomanyrequests`, `TARGETS <unknown>/80%`, `137`). No question was missed by both, so fusing the two rankings fixed everything. That's the case for hybrid search in one table, and RRF did it without any tuning or score calibration.
+* **A meaningless token is the embedding's worst case.** `toomanyrequests` is one rare word with no semantic content for the model to place; qwen3 ranked its runbook **8th**. BM25 found it first because the word occurs in exactly one runbook (highest IDF). Error codes, request IDs, hostnames and image tags all look like this to an embedding.
+* **The prefixes didn't help here**, and both cost one identifier question: `task: search result | query: toomanyrequests` turns a one-word query into mostly prefix. The model cards measure on general benchmarks; on this corpus the effect is within noise (1 question). Test before adopting a "recommended" setting, as with the sampling defaults in Lab 03.
+* **The set is too easy to rank the embedding models.** Hit@3 is 32–33/33 everywhere, so every method would put the right runbook into a *k* = 3 prompt: a **ceiling effect**. 18 runbooks on 18 distinct topics are easy to tell apart. The difference between gemma and qwen3 (2 questions) is noise.
+* **Author bias in the questions: BM25 got all 7 "knowledge" questions.** I wrote the questions while looking at the runbooks, and the knowledge ones leaked words from them: "apply" (Terraform), "Let's Encrypt", "metrics are not available", "CI job cancelled", "Unknown", "heap". A real user wouldn't know the runbook's vocabulary. That's the same lesson as Lab 04 Step 4's ground-truth caveat: **an eval set measures the questions as much as the system**. Questions written by someone who hasn't read the documents are the better test (see the next step's plan).
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -271,4 +310,51 @@ Making it fail loudly:
 * **`truncate: false` while indexing:** an oversized chunk becomes an HTTP 400, and the job fails or splits it, like a schema validation step in CI.
 * **Check `prompt_eval_count`** against the limit (2,048 / 4,095 here) and log it.
 * Remember that qwen3's "32K" is only on the card: it loaded with **4,096**, the server default (Lab 04 Step 6).
+</details>
+
+**5. BM25 got 27/33, the best embedding 31/33, and the hybrid 33/33. Why was the hybrid better than both, not just as good as the better one?**
+
+BM25 missed 6 paraphrases ("pods got kicked off a machine that ran out of RAM" → node-notready). qwen3 missed `toomanyrequests` (rank 8), `exit code 137` and two knowledge questions. RRF only adds `1/(60 + rank)` from each ranking.
+
+*What property of the two methods' errors makes fusion work? When would it not help?*
+
+<details><summary>Answer</summary>
+
+Their errors were **uncorrelated**: no question was missed by both. When one method ranks the right runbook 5th or 8th and the other ranks it 1st, the fused score of that runbook (≈1/61 + 1/68) beats a runbook that only one method liked (≈1/61 + something far down). Fusion picks the candidate both methods agree is plausible.
+
+That's the same reason two different monitoring signals (black-box probe + metrics) catch more than either alone: they fail for different reasons. It would **not** help when both methods fail together: a question that shares no words with its runbook *and* needs an inference the embedding can't make (k01 "no traffic" leaned that way), or a corpus where the right answer isn't in any document at all. And fusing two similar methods (two embedding models) helps less, because their errors are correlated.
+
+RRF's other advantage: it ignores raw scores, so there's nothing to calibrate between BM25 values (unbounded) and cosine similarities (model-specific, Step 1 Q2).
+</details>
+
+**6. Every method scored Hit@3 of 32–33/33. What does that tell you about the evaluation set?**
+
+18 runbooks, one per topic, ≈190 tokens each. BM25 also scored 7/7 on the "knowledge" questions, which were meant to be hard for keyword search.
+
+*Why might this set overrate all methods, and how would you make it a better test?*
+
+<details><summary>Answer</summary>
+
+It's near the **ceiling**: when everything scores ≈100%, the test can't tell methods apart, like a load test that never reaches saturation. Reasons:
+
+* **Few, very distinct documents.** 18 topics with different vocabulary are easy to separate. A real knowledge base has hundreds of documents, many about the same component.
+* **Whole runbooks as units.** Each unit contains all the vocabulary of its topic (symptoms, cause and fix), so almost any question about it matches something. Section-level chunks (Step 3) are smaller and more alike.
+* **Author bias.** The questions were written by the runbooks' author, looking at the runbooks, so they reuse their words: "apply", "Let's Encrypt", "metrics are not available". That's why BM25 aced "knowledge".
+
+Better tests: questions from people who **haven't read** the documents (real tickets, chat messages, on-call questions), more documents including near-duplicates, smaller units, and questions whose answer is **not** in the corpus (does retrieval return confident garbage?). Track the score over time like a regression test, not as an absolute grade.
+</details>
+
+**7. The model cards recommend query prefixes, and here they changed nothing or made it slightly worse. Should you use them?**
+
+gemma: 31/33 without, 30/33 with. qwen3: 29/33 both ways (paraphrase +1, identifier −1). Both lost an identifier question, for example `toomanyrequests`.
+
+*How do you decide on a "recommended" setting like this?*
+
+<details><summary>Answer</summary>
+
+Treat it as a **hypothesis to test on your own data**, not a fact. The card's "1% to 5%" comes from broad public benchmarks; this corpus is small and technical, and the measured effect (±1 question of 33) is within noise. Neither "use it" nor "never use it" is supported yet.
+
+What the misses suggest is a plausible mechanism: a long instruction in front of a one-word query (`toomanyrequests`) makes the query's vector mostly "about" the instruction. That may matter for short, identifier-like queries, which is exactly what engineers type.
+
+How to decide: keep the setting that's **consistent between indexing and querying**, measure on a larger and harder set (Step 3), and choose by the numbers. And since the hybrid already covers identifiers with BM25, the prefix's effect on identifiers matters less in a hybrid system. It's the same discipline as Lab 03 with the sampling defaults: the vendor's recommendation is a starting point, the measurement decides.
 </details>

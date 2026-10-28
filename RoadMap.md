@@ -386,5 +386,5 @@ Open decisions (to settle when the phase starts):
 | 2 — Performance | Done — see `labs/02-performance-hardware`, `docs/vram-calculator.md` |
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
 | 4 — APIs | Done — see `labs/04-apis-structured-output` (streaming, Python client and failure modes, structured output, OpenAI-compatible API, concurrency and cancellation); Python venv (D-07). Optional: `OLLAMA_NUM_PARALLEL` > 1 (needs approval) |
-| 5 — Embeddings & RAG | In progress — Step 1 (what an embedding is) done; Step 2 (labelled retrieval eval: BM25 vs embeddings vs hybrid) set up; models pulled (D-09) |
+| 5 — Embeddings & RAG | In progress — Step 1 (what an embedding is) done; Step 2 (labelled retrieval eval: BM25 vs embeddings vs hybrid) done; models pulled (D-09) |
 | 6–9 | Not started |
