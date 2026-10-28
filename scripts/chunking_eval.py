@@ -100,10 +100,13 @@ def rankings_for(s):
 
 
 def first(rank, s, q, section_level):
+    """Rank of the first right chunk; inf if no chunk has that label (a fixed window is labelled with the
+    section most of its words come from, so a short section may own no window at all)."""
     for pos, i in enumerate(rank, 1):
         doc, sec, _ = chunks[s][i]
         if doc in q['docs'] and (not section_level or sec == q['section']):
             return pos
+    return float('inf')
 
 
 say(f'\n{"Strategy":<15} {"Method":<26} {"Doc Hit@1":>9} {"Doc Hit@3":>9} {"Doc MRR":>7} '
@@ -113,6 +116,11 @@ idx = [allq.index(q) for q in questions]
 for s in strategies:
     rk = rankings_for(s)
     all_ranks[s] = rk
+    owned = {(doc, sec) for doc, sec, _ in chunks[s]}
+    lost = [allq[i]['id'] for i in idx if not any((d, allq[i]['section']) in owned for d in allq[i]['docs'])]
+    if s != 'doc' and lost:
+        say(f'{s}: {len(lost)} question(s) whose labelled section owns no chunk (always a section miss): '
+            f'{", ".join(lost)}')
     for method, ranks in rk.items():
         d = [first(ranks[i], s, allq[i], False) for i in idx]
         line = (f'{s:<15} {method:<26} {sum(p == 1 for p in d):>6}/{len(d)} {sum(p <= 3 for p in d):>6}/{len(d)} '
