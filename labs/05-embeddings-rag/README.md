@@ -382,6 +382,47 @@ What run 1 shows:
 
 **v2 (`rag_answer.py`, for run 2):** no concrete id in the rules ("in square brackets, copied exactly from the line above that runbook"); a refusal is `[none] NOT IN RUNBOOKS`; refusals are detected in any phrasing (`not in runbooks`, "do/does not contain/address/cover/match/mention/include"); a new column **"cited not in prompt"** counts citations of a runbook that wasn't there (the anchoring signature). Everything else is unchanged, so run 2 shows what the prompt fix changes.
 
+#### Run 2: v2 prompt
+
+Raw: `results/raw/rag-answer-20261027-234549.jsonl`. Same questions, retrieval and model; closed-book is identical to run 1 (its prompt didn't change, temperature 0).
+
+| Condition | In context | Cited ok | Wrongly refused | No-answer refused | Cited not in prompt | Unsupported items | Prompt tokens | s/answer |
+|---|---|---|---|---|---|---|---|---|
+| closed-book | – | – | – | – | – | 130/174 | 55 | 0.9 |
+| chunks | 49/51 | **44/51** (run 1: 37) | 4 | **3/3** | **0** | 2/107 | 375 | 0.7 |
+| parents | 50/51 | **47/51** (36) | 0 | **3/3** | **0** | 2/134 | 722 | 0.8 |
+| oracle | 51/51 | **49/51** (35) | 2 | – | **0** | 5/138 | 330 | 0.8 |
+
+| Cited ok per type | paraphrase | identifier | distractor | knowledge | on-call |
+|---|---|---|---|---|---|
+| chunks | 10/10 | 9/10 | 6/6 | 7/7 | 12/18 |
+| parents | 10/10 | 9/10 | 6/6 | 7/7 | **15/18** |
+| oracle | 10/10 | 9/10 | 6/6 | 7/7 | 17/18 |
+
+The misses, from the replies:
+* **parents (4):** o07 "new pods never join the load balancer": readiness **not retrieved**, and the model **answered anyway** from the crash-loop runbook ("the new pods failing to start due to configuration errors …"), with no refusal. o05 "4 of 12 replicas sit there unscheduled": the right runbook was there, the model chose Argo CD ("Argo CD is trying to manage replica counts"). o08 "spring boot needs 3 minutes and k8s kills it": chose crash loop over liveness. i04 `toomanyrequests`: cited three ids (`[argocd-outofsync] [coredns] [imagepullbackoff]`) and then answered correctly about the Docker Hub rate limit: a format miss, not a content miss.
+* **oracle (2):** i04 and o04 (both image pull) refused with only the image-pull runbook in the prompt, although it contains `toomanyrequests` and `ErrImagePull` verbatim.
+* **chunks (7):** 4 refusals (o04, o06, o15, and i04 where the runbook wasn't retrieved): the 3 sections in the prompt didn't contain the answer, which is Step 3's wrong-section problem showing up as "NOT IN RUNBOOKS".
+* **Unsupported items with retrieval (9 in 379)** are mostly commands written out from the runbook's prose ("read the logs of the CSI provisioner pods" → `kubectl logs <csi-provisioner-pod>`), which the check can't recognize. Two are real errors: `lifecycle.probes.liveness.initialDelaySeconds` (not a Kubernetes field path) and `nslookup orders-db.svc.cluster.local` (the namespace is missing; the runbook says `<service>.<namespace>.svc.cluster.local`).
+
+| Prediction | Observed |
+|---|---|
+| chunks: cited ≈38–44, most wrong refusals (≈5–10) | ✅ 44, and 4 refusals: the most of the three |
+| parents: cited ≈43–47, ≈2–5 wrong refusals | ✅ 47; ❌ better: **0** refusals |
+| oracle: ≈48–51 | ✅ 49 |
+| No-answer refused 2–3/3, at least one answered from a loosely related runbook | ✅ 3/3; ❌ none answered from a wrong runbook |
+| Retrieval is the bigger loss, the reader near-perfect | ❌ **the reader was the bigger loss for parents**: 1 retrieval miss vs 3 reader misses (the oracle's 49 shows the reader alone loses 2) |
+| closed-book: many unsupported, real commands | ✅ 130/174 |
+| parents ≈2× tokens, ≈same time | ✅ 722 vs 375 tokens, 0.8 vs 0.7 s |
+
+What it shows:
+* **Fixing the prompt was worth more than any retrieval change.** Removing one example id raised the cited-ok rate by 7–14 answers per condition; citations of absent runbooks went from 9–16 to **0**. Steps 2–3's retrieval tuning moved results by 1–4 questions. Prompt and output format are part of the system, and the first place to look.
+* **"Search small, return big" confirmed end to end:** parents 47/51 vs chunks 44/51, and the chunks' extra misses are refusals where the right section wasn't among the three. Doubling the prompt (375 → 722 tokens) cost ≈0.1 s per answer.
+* **When retrieval misses, the reader doesn't notice.** o07 had no readiness runbook in the prompt and got a confident wrong answer from the crash-loop runbook instead of `NOT IN RUNBOOKS`. The refusal rule worked for questions with *nothing* related (3/3), but not for a question with a *plausible but wrong* runbook. This is the Lab 03 Step 6 "poisoned reference" effect again: the context wins, even when it's the wrong context.
+* **The remaining reader errors are judgment calls between plausible runbooks** (o05 Argo CD vs Pending, o08 crash loop vs liveness): on-call questions only (15/18 vs 17/18 with the oracle). And the 4B reader also refuses the right runbook occasionally (i04, o04 with the oracle). A bigger model (`qwen3.5:9b`) would be the experiment for the reader side.
+* **Grounding changed what the commands are:** 75% of closed-book commands are not the documented ones; with retrieval, 2% (9/379), and most of those are faithful renderings of prose. The two real errors are subtle (a made-up field path, a missing namespace): exactly the kind a human skimming the answer would not catch.
+* **Measurement limits:** "cited ok" checks the citation, not the whole answer; the replies were read for the misses and spot-checked for hits, not graded one by one. And the questions are still author-written.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Likely cause | Check |
@@ -566,4 +607,59 @@ A score threshold can catch the obvious cases (0.40 is low for both models), but
 * The **chat model**, with Lab 03 Step 6's rule: "answer only from the reference; if it doesn't contain the answer, say so". Here the crash-loop runbook says nothing about port-forward, so a well-instructed model should abstain (Step 4 tests it).
 * **Logging and feedback:** record questions with low top scores or abstentions. They're your missing documentation, like 404s in an access log.
 * A retrieval threshold as a cheap first filter only, calibrated per model on labelled questions, and set low.
+</details>
+
+**11. Run 1's oracle (only the right runbook in the prompt) scored lowest: 35/51. All 16 misses cited `[oomkilled]`. What happened, and what's the general lesson?**
+
+The rules said "Start your reply with the id of the runbook you used, in square brackets, for example [oomkilled]." The oomkilled runbook wasn't in any of those 16 prompts. Run 2 replaced the example with "copied exactly from the line above that runbook": 49/51, and 0 citations of absent runbooks.
+
+*Why does a small model copy an example, and how would you write format instructions instead?*
+
+<details><summary>Answer</summary>
+
+To the model, the instructions are just more tokens in the context, and a concrete value in them is a strong pattern to continue. When it was unsure (or about to refuse) it fell back on the one id it had seen in exactly the slot it was filling. That's few-shot prompting by accident: the example was meant to show the *format*, and it was taken as a *value*.
+
+Writing format instructions:
+
+* **Describe the slot, don't fill it:** "the id copied from the line above the runbook", or a placeholder like `[runbook-id]` that can't be mistaken for a real one.
+* If you show examples, **show several varied ones**, and make sure none of them could be a valid answer by accident.
+* **Make the format checkable** and check it: here "cited not in prompt" is a one-line test that catches the whole failure class. A schema (Lab 04 Step 4: an enum of the ids in the prompt) would make it impossible.
+
+The general lesson: in an LLM system the prompt is code. A one-line change to it moved the result more than all the retrieval tuning in Steps 2–3. Version it, review it, and test it with the eval set like any other change.
+</details>
+
+**12. In `parents`, 1 miss came from retrieval and 3 from the reader. How do you decide what to improve next?**
+
+o07: the readiness runbook wasn't retrieved, and the model answered confidently from the crash-loop runbook. o05 and o08: the right runbook was in the prompt, and the model picked a plausible other one (Argo CD, crash loop). The oracle (perfect retrieval) scored 49/51.
+
+*What does each number tell you, and which fixes belong to which side?*
+
+<details><summary>Answer</summary>
+
+Decompose the error, like splitting latency into network, queue and processing time before optimizing:
+
+* **oracle vs 51** (2 misses) is the **reader's own limit**: with perfect retrieval it still refused twice. Fixes are on the generation side: a clearer rule ("if the runbook mentions the error string, use it"), a bigger model (qwen3.5:9b), or a structured output that forces a choice among the given ids.
+* **parents vs oracle** (47 vs 49) is what **imperfect retrieval and extra runbooks** cost: one runbook not retrieved, and two cases where a plausible distractor in the prompt won. Fixes are on the retrieval side (better recall for o07), or fewer, better candidates (*k* = 2, a reranker).
+* **chunks vs parents** (44 vs 47) is what the **prompt unit** costs: the right runbook, the wrong section.
+
+Here the reader is the bigger part, and the most dangerous error is o07: retrieval missed, and the reader filled the gap with a confident wrong answer. A retrieval miss doesn't announce itself, so it has to be caught by measurement (recall on the eval set) or by asking the model to judge whether the runbook really matches before answering.
+</details>
+
+**13. With retrieval, 9 of 379 backticked items weren't in the runbooks. Two were real errors: `lifecycle.probes.liveness.initialDelaySeconds` and `nslookup orders-db.svc.cluster.local`. Closed-book had 130 of 174. What does RAG actually guarantee about the answer?**
+
+Most of the other 7 were commands written out from the runbook's prose ("read the logs of the CSI provisioner pods" → `kubectl logs <csi-provisioner-pod>`).
+
+*Is a RAG answer "grounded"? How would you use these answers in a runbook bot or an agent?*
+
+<details><summary>Answer</summary>
+
+RAG changes the **odds**, not the guarantee. With the runbook in the prompt, the model mostly quotes it: 2% unsupported items instead of 75%. But it still paraphrases, fills in, and occasionally invents, and the inventions that remain are the subtle ones: a field path that looks plausible, a DNS name that's missing one part. Those pass a quick human read precisely because everything around them is right.
+
+How to use the answers:
+
+* **Show the source with the answer:** the cited runbook id, linked, so the engineer reads the original for anything they'll run. Citations are cheap to verify (as here) and make the answer auditable.
+* **Check commands mechanically before showing or running them:** "does this command appear in the cited runbook (placeholders allowed)?" is the check this script does; flag anything that doesn't.
+* **For an agent that executes commands (Phase 6):** never run a generated command directly. Allow only commands from a whitelist or from the cited runbook, read-only first, with human approval for anything that changes state.
+
+The same as code review for a generated Terraform plan: the plan is usually right, and that's exactly why you still have to read it.
 </details>
