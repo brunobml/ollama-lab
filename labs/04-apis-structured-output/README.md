@@ -17,7 +17,7 @@ Until now we used Ollama as an experiment target. This lab treats it as what it 
 
 * Labs 01–03. `qwen3.5:4b` (≈4 GB VRAM at 4K context). One model at a time.
 * **Python (from Step 2):** Python 3.12 via the launcher, `py -3.12`. Plain `python` on this machine is a **3.9** from the Microsoft Store, which Pydantic 2.14 doesn't support (needs ≥ 3.10). See Step 2 for the virtual environment.
-* Scripts: `scripts/stream.ps1` (Step 1), `scripts/client_basics.py` (Step 3), `scripts/structured.py` with data in `incidents.json` (Step 4), `scripts/openai_compat.py` and `Modelfile.ctx8k` (Step 5).
+* Scripts: `scripts/stream.ps1` (Step 1), `scripts/client_basics.py` (Step 3), `scripts/structured.py` with data in `incidents.json` (Step 4), `scripts/openai_compat.py` and `Modelfile.ctx8k` (Step 5), `scripts/concurrency.py` (Step 6).
 
 ## 3. Architecture
 
@@ -249,9 +249,38 @@ Created 2026-10-27 (approved). Verified on disk: only two new blobs, the params 
 
 Why this matters for Phase 6: a coding agent like Codex talks `/v1`. If it can't turn thinking off and can't raise `num_ctx`, then **every request may think, and every long file may be silently cut to 2,050 tokens**. Lab 03 showed what a model does with half the input.
 
-### Later steps
+### Step 6 — Concurrency, queueing and cancellation
 
-* Step 6 — Errors, timeouts and concurrency: unknown model, oversized input (`truncate: false`), client timeouts vs cold starts, and what happens to 4 simultaneous requests with one slot (`n_slots = 1`, queued). Testing `OLLAMA_NUM_PARALLEL` > 1 is a server setting change: approval first.
+Errors and timeouts were covered in Step 3 (error types, retry classes, a timeout shorter than the cold start). What's left: **what happens when several requests arrive at once**. That's the normal case as soon as an agent, a pipeline and a human share one Ollama. Analogy: one pod with `maxConcurrency: 1` behind a Service. Extra requests don't fail; they wait in line, and the latency they see is mostly queue time.
+
+**Verified before the experiment (2026-10-27):**
+* `server.log` server config: `OLLAMA_NUM_PARALLEL:1`, `OLLAMA_MAX_QUEUE:512`, `OLLAMA_MAX_LOADED_MODELS:0` (auto), `OLLAMA_KEEP_ALIVE:5m0s`. llama-server: `n_slots = 1, n_ctx_slot = 4096`. **One slot: one request generates at a time, per model.**
+* FAQ: `OLLAMA_NUM_PARALLEL` is "the maximum number of parallel requests each model will process at the same time, default 1". `OLLAMA_MAX_QUEUE`: requests queued "before rejecting additional requests. The default is 512", then **503**. `OLLAMA_MAX_LOADED_MODELS`: "3 * the number of GPUs". And "parallel request processing … increasing the context size by the number of parallel requests" (more KV cache, Lab 02).
+
+`concurrency.py` changes no settings. It uses streaming and threads that are released together by a barrier, and records each request's send time, first token and end (client clock), next to the server's own `total_duration` and `load_duration`:
+
+* **Part A, one model, one slot:** 4 requests (200 tokens each) at the same moment, cold, then warm, then the same 4 one after another as a baseline.
+* **Part B, two models at once:** `qwen3.5:4b` and `qwen3.5:4b-ctx8k` (Step 5) at the same moment. Same weights, but two names; `/api/ps` and `nvidia-smi` show what gets loaded. **VRAM estimate:** ≈3,860 + ≈3,990 MiB ≈ 7,850 MiB, under the 8,500 MiB ceiling. If Ollama decides they don't fit, it will run them one after another instead; either outcome is a result.
+* **Part C, cancellation:** request 1 asks for 3,000 tokens and disconnects 1 s after its first token; request 2 (short) is sent right after. If the server kept generating for a client that's gone, request 2 waits ≈25 s.
+
+```powershell
+.\.venv\Scripts\python scripts\concurrency.py      # ≈2 minutes; unloads at the end
+```
+
+**Predictions:**
+
+| Case | Prediction | Why |
+|---|---|---|
+| A2 warm: first tokens | **staggered**: ≈0.1, ≈1.8, ≈3.5, ≈5.2 s (one request's generation time apart) | One slot: requests are served one at a time, in order |
+| A2: total time | ≈ the sequential baseline A3 (≈7 s) | Queuing doesn't add throughput, it only reorders the wait |
+| A2: `Wait` (Wall − Server) | **unknown**: does `total_duration` include queue time? If not, request 4 shows ≈5 s that the server never reports | Matters for monitoring: server-side latency may look fine while clients wait |
+| A2: tok/s per request | ≈115, as solo | Each request has the GPU to itself while it runs |
+| A1 cold | **one** load (≈4 s, in one request's `load_duration`), then like A2 | The scheduler loads a model once and queues the others |
+| B | **both loaded**: two entries in `/api/ps`, VRAM +≈7.8 GB, i.e. the weights twice | Two names = two runners; sharing on disk is not sharing in VRAM |
+| B: overlap | **> 0**, both generating at once, each **slower** than 115 tok/s | Two processes share one GPU's compute |
+| C | request 2 waits **< 1 s**; generation of request 1 is stopped | Step 3 showed a load being aborted when the client left; generation probably too |
+
+Not tested here: the 503 when the queue is full (it needs 512+ waiting requests, or a lower `OLLAMA_MAX_QUEUE`), and `OLLAMA_NUM_PARALLEL` > 1. Both are server environment changes, so they're optional extras that **need approval**: restart Ollama with the variable set, rerun Part A, and compare (expected: overlapping generation, lower tok/s per request, more VRAM for the KV cache).
 
 ## 5. Hypotheses → Observed Metrics
 
