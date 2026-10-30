@@ -370,6 +370,7 @@ flowchart TD
 | D-09 | 2026-10-27 | Embedding models: `embeddinggemma:300m` and `qwen3-embedding:0.6b` (≈1.26 GB together) | Two small models to compare retrieval quality; the chat model can't embed on this runner (`/api/embed` → 501) |
 | D-10 | 2026-10-27 | Vectors in a numpy array (brute-force cosine) first; a vector DB only in a later step | A few hundred chunks need no index; learn what a DB adds before adding it |
 | D-11 | 2026-10-28 | Phase 5 vector store: sqlite-vec 0.1.9 (one SQLite file, pip in the venv) | Small, embeddable, no server; ChromaDB's larger dependency tree isn't needed for 54 chunks. Pre-v1: expect breaking changes |
+| D-12 | 2026-10-29 | MCP: official Python SDK `mcp==2.3.0` in the venv; stdio transport only | Official SDK, released ≥2 weeks earlier; 2.x is a new major version (FastMCP → MCPServer) and speaks protocol 2026-07-28. stdio keeps everything local: no listening port |
 
 Open decisions (to settle when the phase starts):
 
@@ -387,5 +388,5 @@ Open decisions (to settle when the phase starts):
 | 3 — Prompting | Done — see `labs/03-prompting-behavior` (thinking, reproducibility, chat templates, system prompts, sampling, context overflow, grounding) |
 | 4 — APIs | Done — see `labs/04-apis-structured-output` (streaming, Python client and failure modes, structured output, OpenAI-compatible API, concurrency and cancellation); Python venv (D-07). `OLLAMA_NUM_PARALLEL=2` tested: ignored for qwen3.5 (`-np 1`) |
 | 5 — Embeddings & RAG | Done — see `labs/05-embeddings-rag` (embeddings, labelled retrieval eval, BM25 vs dense vs hybrid, chunking, RAG end to end with retrieval vs reader errors, 4b vs 9b reader, sqlite-vec store); D-08 to D-11 |
-| 6 — Tools & agents | In progress — Step 1 done (tool-calling loop, mock read-only tools: 0 invalid calls, failures are judgment errors; thinking 1.17× tokens, 2.1× time); Step 2 done (gate held; injection followed 1/24 and denied; only hardened prompt + thinking recognized it 3/3; invented pod names approved by a rubber-stamp operator); Step 3 done (coder writes untagged text calls: 3/24, 19/24 with a text parser but placeholder args; 9b most injectable with thinking off 3/12, 0/24 with thinking on across sizes; t8 early stop shared by all) |
+| 6 — Tools & agents | In progress — Step 1 done (tool-calling loop, mock read-only tools: 0 invalid calls, failures are judgment errors; thinking 1.17× tokens, 2.1× time); Step 2 done (gate held; injection followed 1/24 and denied; only hardened prompt + thinking recognized it 3/3; invented pod names approved by a rubber-stamp operator); Step 3 done (coder writes untagged text calls: 3/24, 19/24 with a text parser but placeholder args; 9b most injectable with thinking off 3/12, 0/24 with thinking on across sizes; t8 early stop shared by all); Step 4 (MCP server + host, wire tap, lying-server test) set up |
 | 7–9 | Not started |
