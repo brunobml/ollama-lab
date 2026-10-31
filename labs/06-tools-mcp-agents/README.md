@@ -631,7 +631,7 @@ Spawning a server per task is the right choice for a test (clean mock state), an
 * m3's "disk pressure" ranked `evicted` (a *memory*-pressure runbook) above `node-notready` all 3 times.
 
 **Why, from the separate rankings** (`scratchpad` diagnosis, same index and code as the server):
-* **The model writes keyword strings, not questions.** Lab 05's labelled questions describe symptoms ("my pod keeps restarting…"). The model writes "payments API crash" or "missing environment variable DATABASE_URL configuration invalid", with words the runbooks don't contain (`payments`, `DATABASE_URL`) and words that match the wrong ones (`api` → "Metrics API" in `hpa-not-scaling`).
+* **The model writes keyword strings, not questions.** Lab 05's labelled questions describe symptoms in plain words ("my service restarts over and over and the wait between restarts keeps growing"). The model writes "payments API crash" or "missing environment variable DATABASE_URL configuration invalid", with words the runbooks don't contain (`payments`, `DATABASE_URL`) and words that match the wrong ones (`api` → "Metrics API" in `hpa-not-scaling`).
 * **The two retrievers disagreed, and fusion picked neither one's winner.**
   * For "payments API crash", **dense** ranked `crashloopbackoff` chunks 1, 2 and 3, and **BM25** ranked them first at 14.
   * For the DATABASE_URL query it was the reverse: BM25 had it 1st, dense 16th.
