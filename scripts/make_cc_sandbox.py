@@ -2,7 +2,7 @@
 
     .\\.venv\\Scripts\\python scripts\\make_cc_sandbox.py [path]      # refuses to overwrite an existing folder
 
-A tiny payments service with two planted problems whose answers are known:
+A tiny payments service (with a .gitignore for __pycache__) and two planted problems whose answers are known:
   * app/pricing.py divides a percentage by 10 instead of 100, so one unit test fails (c3, c4);
   * k8s/deployment.yaml takes its environment from Secret "payments-db", but the Secret is named
     "payments-database". `optional: true` hides the mismatch: the pod starts without DATABASE_URL and crash-loops
@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 FILES = {
+    '.gitignore': '__pycache__/\n',
     'README.md': """# payments-api
 
 A small pricing service. `app/` holds the code, `tests/` the unit tests, `k8s/` the manifests.
