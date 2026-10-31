@@ -985,6 +985,55 @@ Each later `ollama launch --model` with a different model wrote `config.json` ag
 3. **Know where your approval gate actually is.** It was the account default, a single prompt choice away, and in auto mode the gate was the same local 4B model. With a local model, auto mode means *the model approves itself*.
 4. **The launcher is light-touch and honest:** environment variables on one process, one launcher record with backups. The rest of the footprint is Claude Code's own (trust, transcripts, memory folder).
 
+### Step 6 — run 1 (2026-10-31, Codex CLI 0.161.0): every command blocked by the sandbox
+
+Raw: `results/raw/cc-tap-cxA-20261031-114732.jsonl` (one tap log for Part A, x0, x1, x2 and an interactive session), `~/.codex/.sandbox/sandbox.2026-10-31.log`, `server.log`. The interactive session got the x1 and x2 prompts instead of c3/c4.
+
+**Part A: what the launcher changed.** Every prediction held.
+
+| Check | Observed |
+|---|---|
+| `ollama launch codex --config --model qwen3.5:4b-ctx64k` | Only `~/.ollama/config.json` changed (`codex` → ctx64k). All three `~/.codex` files had unchanged hashes |
+| After the first real launch | `ollama-launch.config.toml` rewritten, with `model = "qwen3.5:4b-ctx64k"` and **`base_url = "http://127.0.0.1:11436/v1/"`**: the tap's port, stale once the tap stops. Two backups in `~/.ollama/backup/ollama-launch.config.toml.<unix time>` |
+| `model.json` | Rewritten with 5 models; **`context_window: 262144` for ctx64k** (the trained maximum, not `num_ctx` 65,536); 32768 for `qwen2.5-coder:7b` |
+| `~/.codex/config.toml` | Unchanged (last modified 2026-10-29) |
+| After the interactive session | The *profile* file gained `[projects.'c:\tmp\cc-sandbox'] trust_level = "trusted"`. Codex stores the trust decision in the config file that was loaded, so `--restore` removes it with the profile |
+
+**1. The sandbox failed closed, and no command ran in any task.**
+* Every `exec_command` returned `Failed to create unified exec process: helper_unknown_error: setup refresh had errors`: 12 in x0, 8 in x1, 4 in x2, 14 in the interactive session.
+* `sandbox.2026-10-31.log`, 105 times today: `validate runtime read/execute access on …\OpenAI\Codex\runtimes\cua_node\…\node_repl.exe: open ACL target for root-only update: The process cannot access the file because it is being used by another process. (os error 32)`.
+* Before each command, Codex's elevated Windows sandbox refreshes ACLs on its read and write roots, including the computer-use runtime. The **Codex desktop app** had that `node_repl.exe` running (3 processes since 2026-10-29), so the ACL update failed and the sandbox refused to start.
+* Turning the `node_repl` MCP server off for the agent (`-c mcp_servers.node_repl.enabled=false`) didn't remove the path from the sandbox setup.
+* **Failing closed was correct:** no sandbox, no command. My probes had only asked for "OK", so they never exercised the sandbox; a smoke test has to run a command.
+
+**2. What the 4b did with no working tools.** This is Step 1's question in a new form: what does a model do when tools fail?
+* **Retried without a stop rule:** up to 12 near-identical attempts per task (`ls`, `dir /b`, `Get-ChildItem`, `cmd.exe /c dir`, `echo test`, an empty command), each failing in 0 ms. Codex has no limit on identical failures (Step 2's lesson).
+* **Asked for escalation:** in x1 the model requested to run outside the sandbox. Codex rejected it: `approval policy is Never; reject command — you cannot ask for escalated permissions`.
+* **x0 gave up honestly:** "I cannot list the repository files at this time."
+* **x1 invented a repository from the folder name:** "Based on the `cc-sandbox` naming convention and common C/C++ development patterns…" It produced a table of `Makefile`, `main.c`, `include/*.h`, none of which exist. It did add "Unable to execute commands".
+* **The interactive x1 invented hidden directories:** "Based on the repository context showing hidden directories (.git, .agents, .codex, .aws)…".
+  * `.agents` and `.codex` came from the skill roots in its own developer prompt (`C:/Users/bruno/.agents/skills`, `~/.codex/skills`).
+  * `.aws` came from nowhere: the model had put it in its own `findstr` filter one command earlier.
+  * So its own guess became "context".
+* **The interactive x2 gave generic advice** with invented paths (`k8s_manifests/*/deployment.yaml`, Helm values, Kustomize patches), although it said it couldn't access the files.
+
+**3. `web_search`: a cloud-backed tool in a "local" setup.**
+* With commands failing, `exec` x2 called the hosted **`web_search`** tool 6 times.
+* Ollama executes that tool itself, through its **`/api/experimental/web_search`** endpoint (`server.log`: 6 × `401`), which needs an **ollama.com account**. The responses failed with `authentication_error: This model requires an Ollama account. Please sign in to Ollama to use this model.`
+* Codex reconnected 5 times, then the run ended with `Error: exit status 1`.
+* **If this machine were signed in to ollama.com, a local model's search queries (here, text from the task) would have gone to a cloud service.** No approval is asked (Codex's `--search` help: "no per-call approval"), and the read-only sandbox's "Network access is restricted" doesn't cover it, because the call happens in the Ollama server, not in a sandboxed command.
+
+**4. Background requests: a 4-word title took up to 94 s.**
+* The interactive session asked the model to "Generate a concise, single-line task title" with `reasoning.effort: high`. The answers took **11,061 and 5,238 output tokens** (94 s and 46 s) to produce "List files describing purpose" and "Check DATABASE_URL in manifests".
+* Ollama runs one request at a time for this model (Lab 04: `-np 1`). The agent's next turn **waited behind it** (92.5 s and 43.9 s).
+* Claude Code's title request took 16.8 s (Step 5).
+
+**5. Size and cache.**
+* Prompts stayed small: 1,678 tokens at the start, at most 3,932. The cache kept "new" tokens at 36–46 per turn.
+* So **x0 at 4K never overflowed**. The prediction about truncation is untested, because failed commands return tiny outputs.
+
+**Status:** the quality tasks need a rerun with the Codex desktop app closed.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Likely cause | Check |
@@ -1006,6 +1055,9 @@ Each later `ollama launch --model` with a different model wrote `config.json` ag
 | Claude Code on a local model answers nonsense or ignores its tools | The model runs at Ollama's default 4,096 context and the prompt was silently trimmed | `ollama ps` CONTEXT column; the tap's input tokens vs request size; use a 64K Modelfile variant |
 | `ollama` CLI: `timed out waiting for server to start` | `OLLAMA_HOST` points at a port with nothing listening (here: the tap wasn't running); the CLI then tries to start the Ollama app | Start the tap first; `$env:OLLAMA_HOST`; `app.log` shows the start attempt |
 | Claude Code never asks before running commands | Auto permission mode (an account default, or picked on a prompt); with `ollama launch` its classifier runs on the local model | `/status` or the transcript's `permission-mode`; start with `--permission-mode default` and choose "Yes", not the auto option |
+| Codex: every command fails with `helper_unknown_error: setup refresh had errors` | The elevated Windows sandbox can't update ACLs on a file another process holds (here the Codex desktop app's `node_repl.exe`, `os error 32`) | `~/.codex/.sandbox/sandbox.<date>.log`; close the Codex desktop app and retry |
+| Codex `web_search` fails with "This model requires an Ollama account" | Ollama executes the hosted `web_search` tool through ollama.com (`/api/experimental/web_search`), which needs sign-in | `server.log` 401s; it's a cloud call, so leave it off for local-only work |
+| A 4-word session title takes a minute and blocks the agent | Background title request at `reasoning.effort: high` on a one-request-at-a-time model | Tap: a no-tool request with thousands of output tokens before the agent's turn |
 | `ollama launch claude --restore` fails | Not implemented for `claude`: it only sets environment variables on the child process | Nothing to restore in Claude Code; Ollama's own record is `~/.ollama/config.json` (backups in `~/.ollama/backup`) |
 | Long Claude Code session on a local model "forgets" early instructions | Claude Code assumes a bigger window than `num_ctx` (no `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for local models), so Ollama drops old messages | The tap's max input tokens vs `num_ctx` |
 | Agent calls the search tool several times for one question | Retrieval misses on the model's keyword queries (names like `payments`, `DATABASE_URL`) | The returned names per search (saved tool results); evaluate retrieval on the model's real queries |
