@@ -777,6 +777,96 @@ The model compensated by searching again with other words (3 searches; this run 
 2. **Trust is the host's decision.** A server's `readOnlyHint` is a claim made by the code you're trying to constrain. Annotations may make a host *stricter* (ask for approval even for an allowlisted tool marked destructive), never more permissive.
 3. **The model asks for the mutation regardless.** "Restart" led to `delete_pod` in 9/9 runs, including 4 that had read the real cause. Whether anything changes is decided by code outside the model.
 
+### Step 5 — run 1 (2026-10-31, Claude Code 2.1.302 on `qwen3.5:4b` / `qwen3.5:4b-ctx64k`, Ollama 0.40.13)
+
+Raw: `results/raw/cc-tap-{partA,c0,c1,c2,c34,c34-default}-20261031-*.jsonl` (full request and response bodies), Claude Code's own transcripts in `~/.claude/projects/C--tmp-cc-sandbox/`, and the `truncating input prompt` line in `server.log`. One run per task. Every answer, tool call and tool result was read.
+
+| Task | Model / context | Requests (agent + other) | Tool calls | Tool errors | Prompt tokens (first → max) | Model time | Result |
+|---|---|---|---|---|---|---|---|
+| c0 | `qwen3.5:4b` / **4,096** | 1 | 0 | 0 | 16,137 sent, **2,050 kept** | 6.4 s | **Failed**: "I'm ready to help… What would you like to work on?" |
+| c1 | ctx64k | 3 | 9 (Glob, 8 × Read in one turn) | 0 | 16,464 → 18,518 | 15.5 s | **ok**: all 8 files, accurate roles |
+| c2 | ctx64k | 6 | 6 (3 Grep, 3 Read) | 0 | 16,480 → 17,467 | 12.7 s | **Wrong cause, harmful fix** (below) |
+| c3+c4, account default (`auto`) | ctx64k | 9 + 1 title + 2 classifier | 7 | 1 (the failing test) | 19,081 → 20,697 (classifier 31K) | 69 s | c3 wrong reason; c4 fixed it with an **unrequested extra function** |
+| c3+c4, `--permission-mode default` → auto | ctx64k | 29 + 1 title + 5 classifier | 27 | 6 (3 real) | 19,081 → 26,390 (classifier 32K) | 109 s | **Correct, clean one-line fix** after 1 min 33 s of blind debugging |
+
+**Part A: what the launcher changed.**
+
+| Command | What happened | Prediction |
+|---|---|---|
+| `ollama launch claude --config --model qwen3.5:4b-ctx64k` | `~/.ollama/config.json`: `integrations.claude.models` `qwen3.5:4b` → `qwen3.5:4b-ctx64k` (`codex` untouched); a backup `config.json.1793466563` (the name is the Unix time, 2026-10-31 11:09:23). Run again with the same model: no write, no backup | ✓ |
+| `ollama launch claude --restore` | `Error: claude does not support --restore` | ✓ |
+| `~/.claude/settings.json` | Unchanged (last modified 2026-10-10) | ✓ |
+| What the proxy saw during `--config` | `HEAD /`, `GET /api/experimental/model-recommendations`, `GET /api/status`, `POST /api/show`, `GET /api/tags`: the launcher checking the server and the model, all local | — |
+| `ollama` CLI with `OLLAMA_HOST` pointing at a port with nothing on it | `Error: timed out waiting for server to start`. The CLI tried to **start the Ollama app**; the app found the running instance and exited (`app.log`) | Not predicted |
+
+Each later `ollama launch --model` with a different model wrote `config.json` again, with a new backup each time: 4 backups after the session. Claude Code's own sessions wrote to `~/.claude.json` (folder trust for `C:/tmp/cc-sandbox`) and created `~/.claude/projects/C--tmp-cc-sandbox/` (transcripts, a `memory` folder).
+
+**1. What a production agent sends: ≈16K tokens before your question.**
+* **22 tools** in `-p` mode, **25** interactive (+ AskUserQuestion, EnterPlanMode, ExitPlanMode). The tool definitions are **53K of the 70K characters**. The largest were SendMessage, Workflow, ScheduleWakeup, CronCreate and Agent (4–6K characters each); the system prompt itself is 5.6K.
+* **Claude Code's prompt order:** two system blocks, then your question wrapped in `<system-reminder>` context (git status with your git user name, an attribution note), then **a second system block of 8,423 characters** *after* the question: environment, agent types, the skills list.
+* **Other fields in the request:** `thinking: {type: adaptive}`, `output_config.effort: high`, `max_tokens: 32000`, a `context_management` block, and `metadata.user_id` with a device id and session id. All of it stays local here; all of it goes to whatever `ANTHROPIC_BASE_URL` points at.
+* Claude Code printed: *"doesn't recognize the model 'qwen3.5:4b-ctx64k', so it assumes a context window of 200k tokens"*. It believes it has 200K; Ollama has 64K.
+
+**2. c0: at 4K the question was cut away, silently.**
+* `server.log`: `truncating input prompt limit=2050 prompt=16137 keep=4 new=2050`. That is the rule Lab 03 measured for `/api/generate`: keep 4 tokens plus the last half of the context. It is **not** the "drop whole old messages, keep the system message" behaviour of `/api/chat`. Over the Anthropic endpoint, the conversation is flattened and cut from the front.
+* Because Claude Code puts the 8.4K-character environment block *after* the question, the surviving 2,046 tokens were mostly that block. The answer was built from it: "I can see you're working in a Git repository at `C:\tmp\cc-sandbox` on Windows 11 Home with a Bash shell."
+* Nothing told the client: HTTP 200, `end_turn`, `input_tokens: 2050`. Only the token count, or the server log, gives it away.
+
+**3. The prefix cache makes a 16K-token agent usable on this GPU.**
+* Ollama reports usage the Anthropic way: `input_tokens` = tokens processed now, `cache_read_input_tokens` = prefix reused from the KV cache. (The tap first showed only the first number; fixed.)
+* **c1:** the first request processed 16,464 tokens (8.2 s to the first token, including the model load). The next two reused 16,538 and 17,741 cached tokens and processed only 857 and 777: **0.3–0.4 s** to the first token.
+* **Over the default-mode session:** 761K prompt tokens reused, 60K processed.
+* The classifier's 31–32K-token prompt was cached separately (31,820 → 32,278 with 500–800 new). Both prefixes stayed usable in the same session.
+* qwen3.5 is hybrid, so llama.cpp saves **context checkpoints** of the recurrent state (50.25 MiB each, up to 32) to resume from a cached prefix (`server.log`). A plain KV cache can be cut back to any position; a recurrent state can't.
+
+**4. Quality: right file, wrong reasoning.**
+* **c1 (lookup):** perfect. Absolute Windows paths and parallel reads, 0 errors.
+* **c2 (the Secret):**
+  * It read both manifests and cited `deployment.yaml:23` and `config.py:8` exactly.
+  * It **missed that `payments-db` ≠ `payments-database`**, and didn't mention `optional: true`. Its diagnosis was "only an example secret exists".
+  * Its fix: create a *second* Secret named `payments-db` with the placeholder password `CHANGE-ME`, in two identical files, committed to the repo. That contradicts the example's own "never committed". Applied, the pod would start and fail to log in to the database.
+  * It also read "Don't change any files" as "don't touch existing files".
+  * Predictions: naming the mismatch was a coin flip, and it missed; `optional: true` was unlikely, and it missed.
+* **c3 (both runs):** it found the failing test, then got the arithmetic wrong: "100 − (100 × 10 / 10) = 100 − 10 = 90". Run 1 blamed floating-point precision. Run 2 said the parameter "isn't being passed correctly somehow".
+* **c4, run 1:** the first `Edit` *left the bug* and added a new function `total_with_discount`; a second `Edit` fixed `/ 10`. Tests pass, but the diff carries an unrequested duplicate function.
+* **c4, run 2:** a stale-`__pycache__` theory, `git show HEAD:`, a debug `print`, `cat -A` for hidden characters, a scratch copy with its own bug (`items` vs `ITEMS`)… until `python -c "print(100.0 * 10 / 10)"` printed `100.0`. **Running code corrected the model's mental arithmetic.** Final diff: a clean one-line fix; it removed its scratch file and debug print.
+* **Tool errors** (`is_error` results): 0 in c1–c2, then 3 real ones in run 2: `cd /dev/null`, the NameError in its own scratch file, and an `Edit` whose `old_string` matched twice. It recovered from each. Predicted ≥1 ✓.
+
+**5. The approval gate moved from the human to the 4B model.**
+* **Run 1 started in `auto` permission mode.** That's this account's default; `~/.claude.json` has `hasSeenAutoDefaultNotice: true`, and `settings.json` sets no mode. No prompt ever appeared.
+* **Run 2 started in `default`** (`--permission-mode default`). The human approved the first `pytest`, `rmdir /s app\__pycache__`, `git show` and the first `Edit`, then **picked the "auto mode" option on a prompt**. The transcript records `permission-mode: default` → `auto`.
+* **In auto mode, a classifier decides.** Requests with the system prompt *"You are a security monitor for autonomous AI coding agents"*, 31–32K tokens each, went to… `qwen3.5:4b-ctx64k`:
+  * `ollama launch` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` (use Claude Code's own classifier, not Anthropic's server), and maps every model tier to the local model.
+  * 7 classifier calls across both runs, all answered `<block>no` (allow).
+  * Among them: `rm test_direct.py` and `rm -rf app\__pycache__`.
+  * 6–12 s each: ≈37 s of the default-mode session's 109 s.
+* So **the model that miscalculated 100 × 10 / 10 and missed a Secret's name was also judging whether its own agent's shell commands were safe.** Here the commands were harmless, and the classifier's answers were plausible. But on a 4B model the gate is a probabilistic check by the same weak judge, not a human or a policy (Steps 2 and 4).
+
+**6. Background requests also run on the local model.**
+* Every interactive session first asked the model to **name the session** ("Unit test failures"). With thinking on, that took up to 1,943 output tokens and **16.8 s**, before the first real request.
+* Together with the classifier, **9 of 47** `/v1/messages` requests in the two interactive runs weren't the agent's own turns.
+
+**Predictions vs observed:**
+
+| Measure | Prediction | Observed |
+|---|---|---|
+| `config.json` / `--restore` / `~/.claude` | changed / error / untouched | ✓ / ✓ / ✓ (the sessions themselves write trust and transcripts) |
+| First request | ≈15–30K tokens, 15–25 tools | 16,137–19,081 tokens, 22–25 tools ✓ |
+| c0 at 4K | fails, trimmed silently | ✓. The cut kept the *trailing* environment block, not the question |
+| Background requests | ≥1 small one | ✓ title request per session, plus the auto-mode classifier (31K tokens; not predicted) |
+| c1 | ok | ✓ |
+| c2 mismatch / `optional: true` | coin flip / unlikely | missed / missed, with a harmful fix |
+| c3 / c4 | asks before each Bash and Edit; fixes `/ 10` | asked only while in default mode; fixed, once with an extra function, once after 27 tool calls |
+| Tool errors | ≥1 | 0, 0, 1, 6 (3 real) ✓ |
+| Speed | first request slow, later fast via cache | 3.2–8.2 s first, ≈1 s later ✓ |
+| VRAM | ≈5.9 GB, `100% GPU` | `ollama ps`: 5.2 GB (decimal), `100% GPU`, context 65536 ✓ |
+
+**What this step teaches:**
+1. **Context is the first thing to check with a real agent.** Its fixed overhead (≈16–19K tokens, mostly tool definitions) is 4× Ollama's default context, and truncation is silent. The client also assumed 200K. The 64K Modelfile fixed the first problem; nothing here fixed the second.
+2. **A 4B model can drive real tools** (paths, parallel reads, edits, recovery from errors) **but not reason reliably.** Every miss was judgment: two files compared, simple arithmetic, a minimal fix. Running code rescued it once.
+3. **Know where your approval gate actually is.** It was the account default, a single prompt choice away, and in auto mode the gate was the same local 4B model. With a local model, auto mode means *the model approves itself*.
+4. **The launcher is light-touch and honest:** environment variables on one process, one launcher record with backups. The rest of the footprint is Claude Code's own (trust, transcripts, memory folder).
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Likely cause | Check |
@@ -796,6 +886,8 @@ The model compensated by searching again with other words (3 searches; this run 
 | Agent auto-runs a tool that changes things | The host trusted the server's `readOnlyHint` | Host-side allowlist (Step 4, part C) |
 | First MCP call of a tool is slow (≈1 s), later ones take ms | The server builds state on first use (here, the runbook index), and each run starts a new server | Per-call latency in the results (`mcp_ms`); keep one server per session; build indexes ahead of time |
 | Claude Code on a local model answers nonsense or ignores its tools | The model runs at Ollama's default 4,096 context and the prompt was silently trimmed | `ollama ps` CONTEXT column; the tap's input tokens vs request size; use a 64K Modelfile variant |
+| `ollama` CLI: `timed out waiting for server to start` | `OLLAMA_HOST` points at a port with nothing listening (here: the tap wasn't running); the CLI then tries to start the Ollama app | Start the tap first; `$env:OLLAMA_HOST`; `app.log` shows the start attempt |
+| Claude Code never asks before running commands | Auto permission mode (an account default, or picked on a prompt); with `ollama launch` its classifier runs on the local model | `/status` or the transcript's `permission-mode`; start with `--permission-mode default` and choose "Yes", not the auto option |
 | `ollama launch claude --restore` fails | Not implemented for `claude`: it only sets environment variables on the child process | Nothing to restore in Claude Code; Ollama's own record is `~/.ollama/config.json` (backups in `~/.ollama/backup`) |
 | Long Claude Code session on a local model "forgets" early instructions | Claude Code assumes a bigger window than `num_ctx` (no `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for local models), so Ollama drops old messages | The tap's max input tokens vs `num_ctx` |
 | Agent calls the search tool several times for one question | Retrieval misses on the model's keyword queries (names like `payments`, `DATABASE_URL`) | The returned names per search (saved tool results); evaluate retrieval on the model's real queries |
@@ -982,4 +1074,44 @@ The evaluation was valid, just for a different query distribution, like load-tes
 * **Log the real queries** the model sends (the tap, or the saved tool calls) and build the retrieval test set from those, labelled.
 * **Measure retrieval inside the agent**, separately from answer quality. m2 scored 3/3 even though the runbook was ranked 2nd or 3rd, because `k = 3` hid the miss.
 * **Shape the tool's interface:** a description that asks for symptoms rather than names, or a server that rewrites the query. The tool's input is now model-generated, so design it for that user.
+</details>
+
+**Q17. In c0 the model answered "I'm ready to help… what would you like to work on?" although the question was in the request. Explain exactly what happened, and why nothing in the response warned the client.**
+
+<details><summary>Answer</summary>
+
+Claude Code sent ≈16,137 tokens; `qwen3.5:4b` was loaded with `num_ctx` 4,096. Ollama flattened the conversation into one prompt and cut it the way Lab 03 measured for `/api/generate`: keep the first 4 tokens and the last 2,046 (half the context, leaving room for the answer). Claude Code puts an 8.4K-character system block (environment, agents, skills) *after* the user's question, so the surviving tail was mostly that block. The model answered what it could see: an environment description with no question.
+
+The response was HTTP 200 with `stop_reason: end_turn` and `input_tokens: 2050`. Truncation isn't an error in Ollama's API, only a `WARN` line in `server.log`. The only client-side clue is the token count: 2,050 tokens for a 70K-character request. Claude Code didn't check it, and it assumed a 200K window anyway. It's like a load balancer silently truncating request bodies: the backend returns 200 to a request it never fully received.
+</details>
+
+**Q18. In both interactive runs the auto-mode "security monitor" ran on `qwen3.5:4b-ctx64k` and allowed every command. Why did that happen, and why is it a weaker gate than either a human or the host allowlist from Step 4?**
+
+<details><summary>Answer</summary>
+
+`ollama launch claude` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0`, so Claude Code uses its own classifier requests instead of Anthropic's server-side review. It also maps every model tier (Opus, Sonnet, Haiku, subagents) to the local model, so those classifier requests (31–32K tokens each) went to the 4B model. Auto mode was this account's default in run 1, and one prompt choice away in run 2.
+
+It's weaker than either alternative:
+* **Than a human:** a human brings outside judgment. The classifier is the same small model family that, in the same session, miscalculated `100 × 10 / 10` and missed a Secret's name.
+* **Than an allowlist:** an allowlist is deterministic code the agent's text can't argue with. A classifier reads text, including text an attacker can influence (Step 2's injection), and answers probabilistically.
+
+Here the commands were harmless and its answers were reasonable. But "the model approves itself" is the opposite of separation of duties. With a local model, use default mode with explicit allow rules for safe commands (e.g. `Bash(python -m pytest *)`), not auto.
+</details>
+
+**Q19. c2 cited `deployment.yaml:23` and `config.py:8` correctly, but its diagnosis was wrong and its fix would have broken things further. What does that tell you about reviewing an agent's work, and how would you set up this task so the mistake can't land?**
+
+<details><summary>Answer</summary>
+
+**Correct citations don't mean correct reasoning.** Each fact it quoted was true; the inference connecting them was wrong. It read `name: payments-database` and never compared it with `payments-db`. Its fix then followed from the wrong cause:
+* a second Secret with a placeholder password, committed to git;
+* the pod would start and fail on the database login: a different, later failure, harder to trace back.
+
+A reviewer who checks only "are the referenced lines real?" would approve it.
+
+Setting it up so the mistake can't land:
+* **Read-only first, change second:** ask for the diagnosis, review it, then ask for the change. Here `-p` mode refused writes anyway.
+* **Validate the claim against the system, not the repo:** `kubectl get secret -n payments` would show `payments-database` exists, which immediately disproves "no Secret exists". Give the agent a read-only `kubectl` (Steps 1–4), or check it yourself.
+* **Policy in CI:** a check that rejects Secret manifests with real-looking values, and `optional: true` on required config. Like Step 4's lesson, the guardrail lives outside the model.
+
+Review the *argument*, not the citations: what would have to be true for this diagnosis to hold, and did the agent check it?
 </details>
