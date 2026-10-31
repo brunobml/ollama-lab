@@ -1,0 +1,5 @@
+# qwen3.5:4b with a 64K context, for Claude Code via ollama launch (Lab 06 Step 5): the client can't set num_ctx.
+# Create:  ollama create qwen3.5:4b-ctx64k -f labs\06-tools-mcp-agents\Modelfile.ctx64k
+# Remove:  ollama rm qwen3.5:4b-ctx64k    (removes only this manifest; the weights stay shared with qwen3.5:4b)
+FROM qwen3.5:4b
+PARAMETER num_ctx 65536

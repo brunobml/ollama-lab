@@ -327,9 +327,138 @@ sequenceDiagram
 
   An MCP server is third-party code you run with your privileges: **treat it like a container image from a registry** (pin it, review it, least privilege), not like a library you trust by default.
 
-### Later steps (planned)
+### Step 5 — A real coding agent on a local model: `ollama launch claude`
 
-* Step 5 — A local coding agent: `ollama launch claude` (Claude Code against Ollama's Anthropic-compatible API; record what `--config` changes and how `--restore` undoes it; **approval before any config change**), at 64K context on a throwaway sandbox repo. Lab 04 Step 5's checks apply: does it think on every turn, and is the context big enough?
+**What we're learning.** Steps 1–4 used an agent we wrote, with 3–5 tools and a 5-line system prompt. Claude Code is a production agent: a long system prompt, a dozen or more tools with detailed schemas, permission prompts, and background requests. `ollama launch claude` points it at the local `qwen3.5:4b`. Four questions:
+* What does the launcher change on this machine?
+* How big is the prompt a real agent sends, and what happens at the default 4K context?
+* Can a 4B model drive real tools: read files, run a command, edit code?
+* What does Claude Code send that our own agent never did?
+
+```mermaid
+flowchart LR
+    CC["Claude Code 2.1.302<br/>(child of ollama launch)"] -- "POST /v1/messages<br/>ANTHROPIC_BASE_URL = OLLAMA_HOST" --> TAP["anthropic_tap.py<br/>127.0.0.1:11436"]
+    TAP --> OL["Ollama 0.40.13<br/>127.0.0.1:11434"]
+    OL --> M["qwen3.5:4b-ctx64k<br/>(num_ctx 65536)"]
+    CC -- "Read / Grep / Bash / Edit<br/>(asks before Bash and Edit)" --> SB["C:\tmp\cc-sandbox<br/>(throwaway git repo)"]
+```
+
+**Verified before the run (2026-10-31; Ollama 0.40.13, Claude Code 2.1.302).** `ollama launch --help` doesn't say what it changes, so I read the source of the installed tag (`cmd/launch/claude.go`, `launch.go`, `cmd/config/config.go` at `v0.40.13`):
+* **It sets environment variables on the child process only.** `ollama launch claude` runs `claude --model <m>` with:
+  * `ANTHROPIC_BASE_URL=<OLLAMA_HOST>`, `ANTHROPIC_API_KEY=` (empty), `ANTHROPIC_AUTH_TOKEN=ollama`;
+  * `ANTHROPIC_DEFAULT_OPUS_MODEL`, `…_SONNET_MODEL`, `…_HAIKU_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` all set to the same model, so **background requests and subagents also go to the local model**;
+  * `ENABLE_CLAUDEAI_MCP_SERVERS=false`: the claude.ai connectors (Gmail, Drive, …) aren't loaded, so their tool definitions don't reach the model;
+  * `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `DISABLE_ERROR_REPORTING=1`, `DISABLE_FEEDBACK_COMMAND=1`, `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`, `CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off`, and `CLAUDE_CODE_AUTO_MODE_SERVER=0` unless already set.
+
+  **No Claude Code settings file is written.** The variables die with the process, like `docker run -e`.
+* **It writes Ollama's own launcher state.** When the model differs from the saved one, it writes `~/.ollama/config.json` (`integrations.claude.models`) and keeps the previous version in `~/.ollama/backup/config.json.<n>` (`fileutil.WriteWithBackup`). The file already exists here: `claude` and `codex` → `qwen3.5:4b`, with a backup dated 2026-10-23.
+* **`--config`** runs the same flow: choose a model, save it, then ask "Launch Claude Code now?". For `claude` it configures Ollama's record, not Claude Code.
+* **`--restore` is not implemented for `claude`.** The Claude runner doesn't implement `RestorableIntegration`, so the code returns `claude does not support --restore`. There's nothing in Claude Code to restore. Integrations that edit an app's config files (`codex`, `chatgpt`, `claude-desktop`) do implement it.
+* **If `claude` isn't found**, it offers to install it with `irm https://claude.ai/install.ps1 | iex`. That doesn't happen here: `claude` 2.1.302 is installed (WinGet link).
+* **The context window isn't passed for local models.** `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set only for cloud models, so Claude Code doesn't know a local model has a 64K window and won't compact in time. Lab 03 showed what Ollama's chat path does when a conversation overflows: it **silently drops the oldest messages**. Short tasks stay well below the limit; watch the tap's maximum input tokens.
+* **Telemetry isn't turned off.** Inference goes to `ANTHROPIC_BASE_URL` (local), but auto-updates and telemetry are separate traffic. Claude Code documents `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` to turn them off; set it in the launch terminal for this session.
+* **The endpoint:**
+  * `POST /v1/messages` answers with Anthropic-format `thinking` and `text` blocks and `usage`; streaming `tool_use` works (tested through the tap).
+  * `POST /v1/messages/count_tokens` returns **404**.
+  * In a stream, Ollama's `message_start` carries an early input-token estimate (32 in a test); the real count (272) arrives in `message_delta`. The tap uses the final one.
+* **Context and VRAM:**
+  * `/api/ps` shows `qwen3.5:4b` loads with **`context_length: 4096`** by default, and Claude Code can't set `num_ctx`. So, as in Lab 04 Step 5: a Modelfile, `labs/06-tools-mcp-agents/Modelfile.ctx64k` → **`qwen3.5:4b-ctx64k`** (created 2026-10-31, shares the weights blob).
+  * It loads at `context_length: 65536`, **5,879 MiB** on the GPU (8,406 MiB total minus a 2,527 MiB desktop baseline today), as in Lab 02.
+  * **`qwen3.5:9b` at 64K is out:** ≈8,410 MiB (Lab 02) plus today's 2,527 MiB desktop exceeds the 10,240 MiB card, so it would spill to the CPU. The RoadMap condition ("only if it stays within the 8.5 GB ceiling") fails.
+
+**The pieces:**
+* `scripts/anthropic_tap.py`: an HTTP reverse proxy on `127.0.0.1:11436` in front of Ollama, the HTTP version of Step 4's `mcp_tap.py`. `ollama launch` builds `ANTHROPIC_BASE_URL` from `OLLAMA_HOST`, so setting `$env:OLLAMA_HOST` in that terminal routes Claude Code (and the `ollama` CLI) through it. For each `/v1/messages` call it prints and logs:
+  * the request: messages, tools, system-prompt size, `thinking`, `max_tokens`, tool results with `is_error`;
+  * the response: input/output tokens, stop reason, tool calls.
+
+  Ctrl+C prints a summary; `--summary <file>` re-reads a log. The log holds full bodies, including Claude Code's system prompt (gitignored).
+* `scripts/make_cc_sandbox.py` → `C:\tmp\cc-sandbox`: a tiny payments service with two planted problems and known answers:
+  * `pricing.py` divides a percentage by 10, so one unit test fails;
+  * the Deployment reads Secret `payments-db`, but the Secret is called `payments-database`. `optional: true` hides the mismatch, so the pod starts without `DATABASE_URL` and crash-loops (Steps 1–4's symptom, now with a cause in the manifests).
+
+**Tasks** (one run each: this is about what happens, not a rate):
+
+| Task | Mode | Prompt | Correct when |
+|---|---|---|---|
+| c0 | `-p`, **`qwen3.5:4b` (4K)** | (same as c1) | — it shows what 4K does to the prompt |
+| c1 | `-p` | List the files in this repository and say in one sentence what each one is for. | All 8 files, correct roles |
+| c2 | `-p` | The payments-api pod crash-loops with "required environment variable DATABASE_URL is not set". Find the cause in this repository's manifests. Don't change any files. | Names `payments-db` vs `payments-database`; bonus: `optional: true` hid it |
+| c3 | interactive | Run the unit tests and tell me which test fails and why. Don't change any files. | `test_ten_percent_discount`, `/ 10` instead of `/ 100`; asks before running Bash |
+| c4 | interactive (same session) | Fix the bug, then run the tests again. | Asks before Edit; one-line fix; 3 tests pass |
+
+In `-p` (print) mode, read-only tools (Read, Glob, Grep) run without asking, and tools that need permission are refused. That's why c3–c4 are interactive: **you are the approval gate** (Step 2), with Claude Code's own prompts.
+
+**Run it.** Use three PowerShell terminals in the lab repo. Nothing below changes Windows, WSL2 or Ollama server settings. The `$env:` lines last only for that terminal.
+
+```powershell
+# Terminal 3: VRAM while it runs
+.\scripts\check-vram.ps1
+
+# Terminal 2: launch terminal. Snapshot Ollama's launcher state first.
+Copy-Item $HOME\.ollama\config.json results\raw\ollama-config-before.json
+Get-ChildItem $HOME\.ollama\backup
+$env:OLLAMA_HOST = '127.0.0.1:11436'                      # through the tap (this terminal only)
+$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'       # no telemetry or auto-update traffic (this terminal only)
+
+# Part A: what --config and --restore do. Answer "n" to "Launch Claude Code now?". Needs the tap running (terminal 1).
+ollama launch claude --config --model qwen3.5:4b-ctx64k
+Compare-Object (Get-Content results\raw\ollama-config-before.json) (Get-Content $HOME\.ollama\config.json)
+Get-ChildItem $HOME\.ollama\backup
+ollama launch claude --restore                            # prediction: "claude does not support --restore"
+```
+
+Then one task per tap log. In terminal 1, start the tap with the task's label; in terminal 2, run the task; then Ctrl+C in terminal 1 for the summary:
+
+```powershell
+# Terminal 1, before each task (c0, c1, c2, then c34 for the interactive session):
+.\.venv\Scripts\python scripts\anthropic_tap.py --label c0
+
+# Terminal 2:
+cd C:\tmp\cc-sandbox
+# c0: the default 4K context
+ollama launch claude --model qwen3.5:4b -- -p "List the files in this repository and say in one sentence what each one is for."
+# c1, c2: 64K
+ollama launch claude --model qwen3.5:4b-ctx64k -- -p "List the files in this repository and say in one sentence what each one is for."
+ollama launch claude --model qwen3.5:4b-ctx64k -- -p "The payments-api pod crash-loops with 'required environment variable DATABASE_URL is not set'. Find the cause in this repository's manifests. Don't change any files."
+# c3 + c4: interactive. Type the two prompts from the table; quit with /exit.
+ollama launch claude --model qwen3.5:4b-ctx64k
+```
+
+**During c3–c4:**
+* On the folder-trust question, trust `C:\tmp\cc-sandbox`. Claude Code records that in `~/.claude.json`.
+* On permission prompts, choose **"Yes"**, not "Yes, and don't ask again". The second writes `.claude/settings.local.json`, and the first time Claude Code writes that file it also adds a line to your **global git excludes**: a change outside the sandbox.
+* Run `ollama ps` once while it works.
+
+**Afterwards:**
+
+```powershell
+git -C C:\tmp\cc-sandbox diff                        # what c4 changed
+cd C:\tmp\cc-sandbox; python -m unittest; cd C:\repos\ollama-lab
+ollama ps
+# Undo Part A (there is no --restore): put Ollama's launcher record back exactly as it was
+Copy-Item results\raw\ollama-config-before.json $HOME\.ollama\config.json
+Remove-Item Env:OLLAMA_HOST, Env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+```
+
+Paste the tap summaries (c0, c1, c2, c34), the Part A output, the `git diff`, the test result and the `ollama ps` line. I'll read the full request/response logs.
+
+Optional, after the main run: c1 again with `-- --bare -p "…"` (Claude Code's minimal mode: no hooks, plugins, auto-memory or CLAUDE.md discovery). It shows how much of the prompt is optional. Its help says auth then comes only from `ANTHROPIC_API_KEY` or `apiKeyHelper`, so it may fail against Ollama. If it does, record that.
+
+**Predictions:**
+
+| Measure | Prediction | Why |
+|---|---|---|
+| Part A: `config.json` | `integrations.claude.models` → `["qwen3.5:4b-ctx64k"]`, one new backup file; nothing under `~/.claude` | Read in the source |
+| Part A: `--restore` | Error: `claude does not support --restore` | No `Restore()` for the Claude runner |
+| First request | **≈15–30K input tokens**, 15–25 tools, a system prompt of tens of thousands of characters | An educated guess: Claude Code's prompt isn't published. That's what the tap is for |
+| c0 at 4K | **Fails**: no useful answer or a broken tool call. The tap shows input tokens ≤ 4,096 while the request carried several times more | Lab 03: Ollama trims silently. Which part survives (system prompt or user message) is the open question |
+| Background requests | ≥1 small request with no tools besides the task's own | Every tier, including "haiku", maps to the local model |
+| c1 | ok | Glob + Read on 8 small files |
+| c2 | **names the Secret mismatch: a coin flip**; mentions `optional: true` hiding it: unlikely | Needs two files compared, plus Kubernetes knowledge the 4b may lack |
+| c3 / c4 | Asks before each Bash and Edit; c4 fixes `/ 10` → `/ 100`, tests pass, possibly after a retry | The bug is one line, and the test says what it expected |
+| Tool-call errors (`is_error` results) | **≥1** over c1–c4 (Edit's exact `old_string`, or a path problem) | Real tools have stricter contracts than our mock ones (the RoadMap hypothesis) |
+| Speed | First request of each run slow (prompt processing); later ones faster when Ollama reuses the cached prefix | Same prefix every request |
+| VRAM | ≈5.9 GB, `100% GPU` | Measured above |
 
 ## 5. Hypotheses → Observed Metrics
 
@@ -666,6 +795,9 @@ The model compensated by searching again with other words (3 searches; this run 
 | MCP client hangs or gets garbage | The server printed to **stdout** (the protocol channel) | Log to stderr only; check with `mcp_tap.py` |
 | Agent auto-runs a tool that changes things | The host trusted the server's `readOnlyHint` | Host-side allowlist (Step 4, part C) |
 | First MCP call of a tool is slow (≈1 s), later ones take ms | The server builds state on first use (here, the runbook index), and each run starts a new server | Per-call latency in the results (`mcp_ms`); keep one server per session; build indexes ahead of time |
+| Claude Code on a local model answers nonsense or ignores its tools | The model runs at Ollama's default 4,096 context and the prompt was silently trimmed | `ollama ps` CONTEXT column; the tap's input tokens vs request size; use a 64K Modelfile variant |
+| `ollama launch claude --restore` fails | Not implemented for `claude`: it only sets environment variables on the child process | Nothing to restore in Claude Code; Ollama's own record is `~/.ollama/config.json` (backups in `~/.ollama/backup`) |
+| Long Claude Code session on a local model "forgets" early instructions | Claude Code assumes a bigger window than `num_ctx` (no `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for local models), so Ollama drops old messages | The tap's max input tokens vs `num_ctx` |
 | Agent calls the search tool several times for one question | Retrieval misses on the model's keyword queries (names like `payments`, `DATABASE_URL`) | The returned names per search (saved tool results); evaluate retrieval on the model's real queries |
 | One MCP call is ≈300 ms in the host but ms on the wire | Client-side work: the SDK imports `jsonschema` on the first output-schema validation | Compare tap timestamps with host timings |
 | Answer asks "would you like me to proceed?" after the operator denied | The model rewrites the denial as a pending question | Gate asks vs mutations run in the runtime's log; print the outcome yourself (Step 2, Q8) |
