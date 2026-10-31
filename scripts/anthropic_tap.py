@@ -47,7 +47,8 @@ def request_shape(body):
 
 def response_shape(raw, content_type):
     """Usage, stop reason, tool calls and text from an SSE stream or a plain JSON response."""
-    out = {'input_tokens': None, 'output_tokens': None, 'stop_reason': None, 'tool_calls': [], 'text': ''}
+    out = {'input_tokens': None, 'cached_tokens': 0, 'output_tokens': None, 'stop_reason': None, 'tool_calls': [],
+           'text': ''}
     text = raw.decode('utf-8', 'replace')
     events = []
     if 'event-stream' in content_type:
@@ -71,8 +72,11 @@ def response_shape(raw, content_type):
         elif e.get('type') == 'message_delta':
             out['stop_reason'] = e.get('delta', {}).get('stop_reason') or out['stop_reason']
             out['output_tokens'] = e.get('usage', {}).get('output_tokens', out['output_tokens'])
-            # Ollama's message_start carries an early estimate; the final count arrives here (272 vs 32 in a test)
+            # Ollama's message_start carries an early estimate; the final count arrives here (272 vs 32 in a test).
+            # Anthropic-style usage: input_tokens = prompt tokens processed now, cache_read_input_tokens = prefix reused
+            # from the KV cache. The whole prompt is the sum.
             out['input_tokens'] = e.get('usage', {}).get('input_tokens', out['input_tokens'])
+            out['cached_tokens'] = e.get('usage', {}).get('cache_read_input_tokens', out['cached_tokens']) or 0
         elif e.get('type') == 'error':
             out['error'] = e.get('error')
     return out
@@ -140,7 +144,8 @@ def record(method, path, status, body, raw, content_type, headers, start, first,
             f.write(json.dumps(rec) + '\n')
     if is_messages:
         calls = ','.join(rec['tool_calls']) or '-'
-        print(f"#{rec['n']:<3} {rec['seconds']:6.1f}s  in {rec['input_tokens'] or 0:>6,}  out {rec['output_tokens'] or 0:>5,}  "
+        print(f"#{rec['n']:<3} {rec['seconds']:6.1f}s  prompt {prompt_tokens(rec):>6,} (new {rec['input_tokens'] or 0:>6,})  "
+              f"out {rec['output_tokens'] or 0:>5,}  "
               f"msgs {rec['messages']:>3}  tools {rec['tools']:>3}  results {rec['tool_results']}"
               f"{'(' + str(rec['tool_result_errors']) + ' err)' if rec['tool_result_errors'] else ''}  "
               f"stop {rec['stop_reason']}  -> {calls}{'  [client hung up]' if gone else ''}"
@@ -149,18 +154,26 @@ def record(method, path, status, body, raw, content_type, headers, start, first,
         print(f"     {method} {path} {status} ({rec['seconds']} s)", flush=True)
 
 
+def prompt_tokens(rec):
+    return (rec.get('input_tokens') or 0) + (rec.get('cached_tokens') or 0)
+
+
 def summary(recs):
     m = [r for r in recs if r['path'].split('?')[0] == '/v1/messages' and r['method'] == 'POST']
     if not m:
         return 'no /v1/messages requests'
+    for r in m:                      # re-parse saved responses, so older logs get the current counting
+        if 'response_raw' in r:
+            r.update(response_shape(r['response_raw'].encode('utf-8'), 'event-stream' if r.get('stream') else 'json'))
     calls = Counter(c for r in m for c in r.get('tool_calls', []))
     models = Counter(r.get('model') for r in m)
-    ins = [r['input_tokens'] or 0 for r in m]
+    ins = [prompt_tokens(r) for r in m]
     first = m[0]
     lines = [f"/v1/messages requests: {len(m)} (models: {dict(models)}), other requests: {len(recs) - len(m)}",
              f"first request: system prompt {first.get('system_chars', 0):,} chars, {first.get('tools', 0)} tools, "
-             f"{first.get('input_tokens') or 0:,} input tokens",
-             f"input tokens: max {max(ins):,}, total {sum(ins):,}; output tokens total "
+             f"{prompt_tokens(first):,} prompt tokens ({first.get('first_byte_s')} s to first byte)",
+             f"prompt tokens: max {max(ins):,}; processed new {sum(r.get('input_tokens') or 0 for r in m):,}, "
+             f"reused from cache {sum(r.get('cached_tokens') or 0 for r in m):,}; output tokens total "
              f"{sum(r.get('output_tokens') or 0 for r in m):,}",
              f"tool calls: {sum(calls.values())} {dict(calls)}; tool results marked is_error: "
              f"{sum(r.get('tool_result_errors', 0) for r in m)}",
