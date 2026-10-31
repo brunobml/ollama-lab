@@ -23,7 +23,7 @@ A hands-on learning lab for local LLM inference with Ollama on an RTX 3080 (10 G
 * [Lab 04 — APIs, Streaming & Structured Output](labs/04-apis-structured-output/README.md) ✅
 * [Lab 05 — Embeddings, Vector Search & Local RAG](labs/05-embeddings-rag/README.md) ✅
 * [Lab 06 — Tool Calling, MCP & AI Agents](labs/06-tools-mcp-agents/README.md) ✅
-* **Next lab:** Phase 7 — Multimodal Models (`labs/07-multimodal/`)
+* [Lab 07 — Multimodal Models: Images as Tokens](labs/07-multimodal/README.md) — in progress
 
 Each lab README follows the same template; measured results are in its section 5 ("Hypotheses → Observed Metrics").
 
