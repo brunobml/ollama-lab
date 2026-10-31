@@ -1044,7 +1044,7 @@ Raw: `results/raw/cc-tap-cxA-20261031-114732.jsonl` (one tap log for Part A, x0,
   * The **standalone CLI** (0.161.0, installed 2026-10-06) ships without `codex-command-runner.exe`, so it can't run sandboxed commands on Windows at all.
   * The desktop app's bundle (`%LOCALAPPDATA%\OpenAI\Codex\bin\…`, 0.163.0-alpha.11.2) and the VS Code extension's bundle (0.164.0-alpha.11.1) include it.
   * Fix, for that terminal only: `$env:PATH = "$env:LOCALAPPDATA\OpenAI\Codex\bin\37f54d68e5533a51;$env:PATH"`. `ollama launch` finds `codex` on `PATH`. Then `exec "Run: echo sandbox-ok"` succeeded in 473 ms.
-* **Seen in the sandbox log:** before running commands, the setup grants the sandbox users **read** access across the user profile, including `.claude.json`, `kafka-pki`, `givenchy-kafka` and `Ubuntu-20.04-backup.tar`. Codex's Windows "read-only" sandbox means *can read most of your home, can't write outside the workspace*.
+* **Seen in the sandbox log:** before running commands, the setup grants the sandbox users **read** access across the user profile, including other tools' config files (`.claude.json`), certificate and project folders, and backup archives. Codex's Windows "read-only" sandbox means *can read most of your home, can't write outside the workspace*.
 
 Raw: `results/raw/cc-tap-x0b-20261031-120856.jsonl` (all four sessions in one log), Codex transcripts in `~/.codex/sessions/2026/10/31/`. One run each.
 

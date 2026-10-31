@@ -1,6 +1,6 @@
 # Ollama Architecture (as observed on this machine)
 
-Everything here was verified in Labs 00–01 on Ollama 0.40.2, Windows 11, RTX 3080. Items not yet verified are marked.
+Everything here was verified in Labs 00–01 on Ollama 0.40.2, Windows 11, RTX 3080 (current version 0.40.13; not re-verified as a whole since). Items not yet verified are marked.
 
 ## Components
 

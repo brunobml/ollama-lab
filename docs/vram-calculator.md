@@ -1,6 +1,6 @@
-# VRAM & Speed Calculator (RTX 3080 10 GB, Ollama 0.40.2)
+# VRAM & Speed Calculator (RTX 3080 10 GB, measured on Ollama 0.40.2)
 
-How to predict whether a model fits on this GPU and how fast it will run, **before** loading it. Every constant here was measured in Lab 01 and Lab 02 (2026-10-10 → 2026-10-12); sources are linked per section. Values marked *unverified* are theory, not measurements.
+How to predict whether a model fits on this GPU and how fast it will run, **before** loading it. Every constant here was measured in Lab 01 and Lab 02 (2026-10-10 → 2026-10-12); sources are linked per section. Spot-checks on 0.40.13 (Lab 06 Step 5: `qwen3.5:4b` at 64K context, 5,879 MiB) still match. Values marked *unverified* are theory, not measurements.
 
 Like sizing a pod: add up the requests, compare with what the node has free *right now*, and keep headroom.
 

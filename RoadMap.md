@@ -119,7 +119,7 @@ ollama-lab/
 │   ├── 08-operations-containers/       # WSL2 networking, Docker, Kubernetes GPU scheduling
 │   └── 09-runtime-comparison/          # Ollama vs llama.cpp vs LM Studio
 ├── scripts/                            # check-vram.ps1, benchmark scripts (built in-lab)
-└── results/                            # Summaries committed; results/raw/ gitignored
+└── results/                            # results/raw/ gitignored; curated results live in each lab's section 5
 ```
 
 ### Standard Lab README Template
@@ -208,7 +208,7 @@ flowchart TD
   * Deliberately exceed VRAM (large context on 9b) and observe the `ollama ps` CPU/GPU split and tok/s drop.
   * Force CPU-only inference using a **documented** method — to be identified and verified against 0.40.2 in-lab (candidate: hiding the GPU via `CUDA_VISIBLE_DEVICES`).
 * **Verification Criteria:**
-  * Measured tok/s and VRAM for each configuration recorded in `results/`.
+  * Measured tok/s and VRAM for each configuration recorded in the lab README (raw runs in `results/raw/`).
   * An empirical VRAM-vs-context curve for this RTX 3080, compared against the KV formula.
 
 ---
@@ -351,7 +351,7 @@ flowchart TD
 5. **No API exposure:** Ollama stays bound to localhost; container ports bind to `127.0.0.1`.
 6. **System changes need approval:** No changes to Windows, WSL2 (`.wslconfig`), Docker, or environment variables without explanation and approval.
 7. **Repository hygiene:** Weights (`*.gguf`), vector DB directories, `.venv/`, secrets, private documents, and raw benchmark output stay out of Git.
-8. **No fabricated results:** Every metric in `results/` comes from an actual run, with the command and conditions recorded.
+8. **No fabricated results:** Every metric in the lab READMEs comes from an actual run, with the command and conditions recorded; raw outputs are kept in `results/raw/`.
 
 ---
 
