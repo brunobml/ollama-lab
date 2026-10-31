@@ -601,7 +601,47 @@ This is Step 2's Q8 again, through a different host: the model's account of a de
 
 Spawning a server per task is the right choice for a test (clean mock state), and the wrong one for a real host. Real hosts start the server once and keep the session; the ≈3 s per run would then be paid once.
 
-**5. The wire tap was not part of this run.** The protocol facts in the Step 4 setup section come from the tapped smoke tests. Those included `server/discover` and `_meta` per request in the default mode, and the `initialize` handshake with `--legacy`.
+**5. The wire, seen through the tap** (`--trace m1 --tap --legacy`, 2026-10-30, one run; 17 lines in `results/raw/mcp-wire.jsonl`):
+
+| t (s) | Direction | Message | Note |
+|---|---|---|---|
+| 0.009 | client → server | `initialize` `protocolVersion 2025-11-25`, `capabilities {}`, `clientInfo {mcp 0.1.0}` | The SDK's default client name; we never set one |
+| 2.728 | server → client | result: `protocolVersion 2025-11-25`, capabilities `tools`, `prompts`, `resources` (all `listChanged: false`), the `instructions` string | **2.7 s = the server starting** (Python + imports); the reply itself is instant |
+| 2.729 | client → server | `notifications/initialized`, then `tools/list` | A notification has no `id`: no reply expected |
+| 2.731 | server → client | 5 tools with `inputSchema`, `outputSchema`, `annotations` | 2 ms |
+| 13.121 | client → server | `tools/call list_pods {}` | 10 s of model time before the first call |
+| 13.124 | server → client | result: text `content` + `structuredContent`, `isError: false` | **3 ms on the wire**, but the host measured **272.7 ms** (see below) |
+| 13.393 → 16.152 | ↔ | `search_runbooks "payments API crash"` | 2.76 s: the index is built and the embedding model loaded |
+| 19.922 → 19.965, 21.389 → 21.416 | ↔ | two more searches | 43 ms and 27 ms: index cached, only the query embedded |
+
+* **The tap explains a number that looked like a protocol cost.** The first `list_pods` took 3 ms between the two pipe messages but 272.7 ms in the host. The extra time was spent in the *client*:
+  * The SDK validates every `structuredContent` against the tool's `outputSchema`, and imports `jsonschema` lazily on the first validation (`mcp/client/session.py`; its comment says so).
+  * Importing it takes **≈310 ms** in this venv (measured 3×).
+
+  In the 18-run batch only the first call of the first run paid it, which is part of that run's 2.93 s. Without timestamps on both sides of the pipe, I'd have blamed the transport.
+* **What a tap can and can't show.** It shows the timing, the order of messages, and exact payloads, including the duplicated text and structured content. It can't show what each end does in between: the 270 ms happened inside a process. That's the same limit as `tcpdump`.
+
+**6. The search tool returned the wrong runbooks for the model's own queries.** The trace needed three searches to find `crashloopbackoff`. The first two returned `hpa-not-scaling, argocd-outofsync, node-notready` and `cert-expired, argocd-outofsync, coredns`. I checked all 14 searches in the 18-run batch (read from the saved tool results):
+
+| Searches | Right runbook ranked 1st | In the 3 returned | Missed |
+|---|---|---|---|
+| 14 | **6** | 12 | 2 |
+
+* m2's 3 searches had `crashloopbackoff` at rank 2, 2 and 3. m2 still scored 3/3 only because the model asked for `k` ≥ 3 and the server returns whole runbooks. With `k: 1` all three answers would have lacked the runbook.
+* m3's "disk pressure" ranked `evicted` (a *memory*-pressure runbook) above `node-notready` all 3 times.
+
+**Why, from the separate rankings** (`scratchpad` diagnosis, same index and code as the server):
+* **The model writes keyword strings, not questions.** Lab 05's labelled questions describe symptoms ("my pod keeps restarting…"). The model writes "payments API crash" or "missing environment variable DATABASE_URL configuration invalid", with words the runbooks don't contain (`payments`, `DATABASE_URL`) and words that match the wrong ones (`api` → "Metrics API" in `hpa-not-scaling`).
+* **The two retrievers disagreed, and fusion picked neither one's winner.**
+  * For "payments API crash", **dense** ranked `crashloopbackoff` chunks 1, 2 and 3, and **BM25** ranked them first at 14.
+  * For the DATABASE_URL query it was the reverse: BM25 had it 1st, dense 16th.
+  * RRF with `k = 60` over 54 chunks rewards documents that sit in the middle of both lists. So `hpa-not-scaling` (BM25 2nd, dense middle) beat a chunk that was 1st in one list and far down the other.
+* Lab 05 measured hybrid as the best retriever **on its own question set**. The agent is a different user with a different query style, which is the evaluation-distribution lesson from Lab 05, now inside an agent.
+
+The model compensated by searching again with other words (3 searches; this run used **12,042 tokens**, vs a median of 6,618 for m1). That works here, but it costs tokens and time, and it depends on the model noticing that the results were wrong. Fixes to test, not yet measured:
+* a tool description that asks for a symptom description;
+* evaluating retrieval on queries the model actually writes;
+* dense-only retrieval, or weighted fusion.
 
 **What this step teaches:**
 1. **MCP standardizes the plumbing:** discovery, schemas, transport, versioning. Moving the tools behind it changed nothing about how the model performed (9/9 lookups) and added milliseconds.
@@ -626,6 +666,8 @@ Spawning a server per task is the right choice for a test (clean mock state), an
 | MCP client hangs or gets garbage | The server printed to **stdout** (the protocol channel) | Log to stderr only; check with `mcp_tap.py` |
 | Agent auto-runs a tool that changes things | The host trusted the server's `readOnlyHint` | Host-side allowlist (Step 4, part C) |
 | First MCP call of a tool is slow (≈1 s), later ones take ms | The server builds state on first use (here, the runbook index), and each run starts a new server | Per-call latency in the results (`mcp_ms`); keep one server per session; build indexes ahead of time |
+| Agent calls the search tool several times for one question | Retrieval misses on the model's keyword queries (names like `payments`, `DATABASE_URL`) | The returned names per search (saved tool results); evaluate retrieval on the model's real queries |
+| One MCP call is ≈300 ms in the host but ms on the wire | Client-side work: the SDK imports `jsonschema` on the first output-schema validation | Compare tap timestamps with host timings |
 | Answer asks "would you like me to proceed?" after the operator denied | The model rewrites the denial as a pending question | Gate asks vs mutations run in the runtime's log; print the outcome yourself (Step 2, Q8) |
 | Agent "restarts" something that wasn't asked for | Mutating tool available + a model that likes to fix things | Unrequested-mutation count (Step 2, s3); approval gate; expose mutating tools only when needed |
 | Confident summary that misses an obvious problem | The model stopped after one tool (t8) | Compare the calls made with what the question needs; list the evidence in the answer |
@@ -794,4 +836,18 @@ The model followed the literal instruction. Places to stop it, from strongest to
 * **The prompt:** "find the cause before changing anything; say if the requested action won't fix it". This helps but relies on the model, and 4 runs that knew the cause still asked to delete.
 
 An agent that does what it's told is not the same as one that helps. The second needs the runbook's judgment somewhere the model can't skip it.
+</details>
+
+**Q16. Lab 05 measured hybrid retrieval as the best option, yet inside the agent the right runbook came first in only 6 of 14 searches, and the trace needed three searches to find it. What changed between Lab 05 and Step 4, and how would you evaluate a tool that a model calls?**
+
+<details><summary>Answer</summary>
+
+**The user changed.** Lab 05's labelled questions were written by people, describing symptoms. Here the queries are written by the model: short keyword strings such as "payments API crash" or "missing environment variable DATABASE_URL configuration invalid".
+* Those strings contain names that aren't in the runbooks (`payments`, `DATABASE_URL`), and words that match the wrong runbook (`api` hits "Metrics API").
+* BM25 and dense retrieval then disagree, and RRF with `k = 60` over 54 chunks prefers a document that's mediocre in both lists to one that's first in one list. So the fused result was worse than either retriever alone on these queries.
+
+The evaluation was valid, just for a different query distribution, like load-testing an API with the wrong traffic mix. To evaluate a tool the model calls:
+* **Log the real queries** the model sends (the tap, or the saved tool calls) and build the retrieval test set from those, labelled.
+* **Measure retrieval inside the agent**, separately from answer quality. m2 scored 3/3 even though the runbook was ranked 2nd or 3rd, because `k = 3` hid the miss.
+* **Shape the tool's interface:** a description that asks for symptoms rather than names, or a server that rewrites the query. The tool's input is now model-generated, so design it for that user.
 </details>
