@@ -460,6 +460,124 @@ Optional, after the main run: c1 again with `-- --bare -p "…"` (Claude Code's 
 | Speed | First request of each run slow (prompt processing); later ones faster when Ollama reuses the cached prefix | Same prefix every request |
 | VRAM | ≈5.9 GB, `100% GPU` | Measured above |
 
+### Step 6 — The same tasks with Codex: `ollama launch codex`
+
+**What we're learning.** Same sandbox, same tasks, same local model, a different agent and a different API. Codex speaks the OpenAI **Responses** API (`/v1/responses`), and `ollama launch codex` works by **writing config files** instead of only setting environment variables. Three questions:
+* What does this launcher change, and does `--restore` undo it?
+* What does Codex send that Claude Code didn't?
+* Does the agent harness change what the 4b gets right?
+
+**Verified before the run (2026-10-31; Ollama 0.40.13, Codex CLI 0.161.0).** Source: `cmd/launch/codex.go` at `v0.40.13`, plus five probes of `codex exec` against local Ollama, through the tap (the extended `anthropic_tap.py`):
+* **What `ollama launch codex` runs:**
+
+  ```
+  codex --profile ollama-launch -c model_provider="ollama-launch" \
+        -c model_providers.ollama-launch.{name,base_url="<OLLAMA_HOST>/v1/",wire_api="responses"} \
+        -c model_catalog_json="~/.codex/model.json" -c service_tier="default" -m <model> [extra args]
+  ```
+
+  It sets `OPENAI_API_KEY=ollama` on the child process.
+* **What it writes, at launch time (not with `--config`):**
+  * `~/.codex/ollama-launch.config.toml`, a profile with the model, the provider and `base_url`. The previous copy is backed up to `~/.ollama/backup`.
+  * `~/.codex/model.json`, a model catalog, overwritten without a backup. Each entry has `context_window`, reasoning levels, `truncation_policy` (tool output cut at **10,000 bytes**) and `supports_parallel_tool_calls: false`.
+  * `~/.codex/config.toml`, your main config, only to remove old-style `profile = "ollama-launch"` entries. There are none here.
+
+  `--restore` deletes the profile and the catalog ("Codex launch configuration removed."). Both files already exist here, from a launch on 2026-10-23.
+* **The catalog gets the context window wrong.** It lists `context_window: 262144` (the model's trained maximum) for `qwen3.5:4b`, which Ollama runs at 4,096. Codex derived `model_context_window: 249036` from it, so it believes it has ≈250K tokens. That's the same blind spot as Claude Code's 200K assumption.
+* **The Responses endpoint works.**
+  * `POST /v1/responses` streams `response.output_item.added`, `response.function_call_arguments.*`, reasoning summaries, and a final `response.completed` carrying the whole response.
+  * **Usage is counted the OpenAI way:** `input_tokens` is the *whole* prompt, and `input_tokens_details.cached_tokens` is the part of it reused. Anthropic's `input_tokens` excludes the cached part. The tap normalizes both to "prompt (new)".
+* **With your normal `~/.codex`, Codex's first request was 53,349 tokens.** It had 26 tools totalling 231K characters, mostly **ChatGPT-connected apps**:
+  * `mcp__codex_apps__google_drive` (69K characters), `…sites`, `…gmail`, `…google_calendar`, `…google_contacts`;
+  * computer-use and browser REPLs, `multi_agent_v1`, and a hosted `web_search`.
+
+  That's 82% of a 64K window before the task starts.
+  * Unlike `ollama launch claude` (`ENABLE_CLAUDEAI_MCP_SERVERS=false`), `ollama launch codex` **doesn't disable them**.
+  * So the local 4B model is offered tools that read your real Gmail and Drive through OpenAI's connector service, and Codex contacts that service with your ChatGPT login to list them.
+* **An empty `CODEX_HOME`: 4,476 tokens, 9 tools, but `sandbox: none`.** Your real home has `windows.sandbox = "elevated"`, Codex's restricted-token Windows sandbox, set up on 2026-10-12. A new home doesn't, so "read-only" would be an instruction to the model, not something enforced.
+* **Chosen setup: your real `~/.codex` with features turned off by flags for the session:**
+
+  `--disable apps --disable plugins --disable computer_use --disable browser_use --disable multi_agent --disable goals -c mcp_servers.MCP_DOCKER.enabled=false -c mcp_servers.node_repl.enabled=false`
+
+  Result: **1,670 tokens, 5 tools** (`exec_command`, `write_stdin`, `request_user_input`, `view_image`, `web_search`), and `sandbox: windows_elevated`. Nothing is written to disk by the flags.
+* **Codex has no file-reading or editing tool here.** It reads with shell commands through `exec_command` and edits with shell commands too. The sandbox, not the tool list, is what keeps it read-only.
+* **A missing profile is ignored silently.**
+  * One exploratory probe ran `codex --profile <a name that doesn't exist> exec "hi"` *without* the provider overrides. Codex didn't fail: it started a turn on the default **OpenAI provider** under the ChatGPT login (`model_provider: openai`).
+  * The turn was aborted within ≈1 s with no answer, so whether a request left the machine is unknown. That was my mistake; every later probe forced the local provider with `-c`.
+  * The lesson for any wrapper: a misspelled profile doesn't fail closed, it falls back to the cloud. `ollama launch` passes the provider with `-c` as well, which is what keeps it local.
+* **Other request fields:** `reasoning: {effort: high, summary: auto}`, `parallel_tool_calls: true`, `store: false`, `prompt_cache_key`, and `client_metadata` with an installation id, session and turn ids, sandbox mode and `analytics_enabled: true`. All local here; all sent to any provider you configure.
+
+**Tasks.** The same as Step 5, renamed x0–x34, in the same sandbox repo (reset first). `codex exec` is Codex's `-p`: non-interactive, read-only sandbox, never asks.
+
+| Task | Mode | Model | Prompt |
+|---|---|---|---|
+| x0 | `exec` | `qwen3.5:4b` (**4K**) | List the files in this repository and say in one sentence what each one is for. |
+| x1 | `exec` | `qwen3.5:4b-ctx64k` | (same as x0) |
+| x2 | `exec` | ctx64k | The payments-api pod crash-loops with 'required environment variable DATABASE_URL is not set'. Find the cause in this repository's manifests. Don't change any files. |
+| x34 | interactive | ctx64k | Run the unit tests and tell me which test fails and why. Don't change any files. → Fix the bug, then run the tests again. |
+
+**Run it.** Terminal 1 is the tap, as in Step 5. Terminal 2 is the launch terminal:
+
+```powershell
+cd C:\repos\ollama-lab
+# Finish Step 5 first: put Ollama's launcher record back, and reset the sandbox
+Copy-Item results\raw\ollama-config-before.json $HOME\.ollama\config.json
+git -C C:\tmp\cc-sandbox checkout -- app/pricing.py
+
+# Snapshot what Codex's launcher may touch
+New-Item -ItemType Directory -Force results\raw\codex-before | Out-Null
+Copy-Item $HOME\.ollama\config.json, $HOME\.codex\config.toml, $HOME\.codex\ollama-launch.config.toml, $HOME\.codex\model.json results\raw\codex-before\
+$env:OLLAMA_HOST = '127.0.0.1:11436'
+$lean = @('--disable','apps','--disable','plugins','--disable','computer_use','--disable','browser_use','--disable','multi_agent','--disable','goals','-c','mcp_servers.MCP_DOCKER.enabled=false','-c','mcp_servers.node_repl.enabled=false')
+
+# Part A (tap label cxA): answer "n" to "Launch Codex CLI now?"
+ollama launch codex --config --model qwen3.5:4b-ctx64k
+foreach ($f in 'config.toml','ollama-launch.config.toml','model.json') { '{0,-28} {1}' -f $f, ((Get-FileHash $HOME\.codex\$f).Hash -eq (Get-FileHash results\raw\codex-before\$f).Hash) }
+Compare-Object (Get-Content results\raw\codex-before\config.json) (Get-Content $HOME\.ollama\config.json)
+
+# Tasks: restart the tap with label x0, x1, x2, x34 before each one
+cd C:\tmp\cc-sandbox
+ollama launch codex --model qwen3.5:4b -- @lean exec "List the files in this repository and say in one sentence what each one is for."
+ollama launch codex --model qwen3.5:4b-ctx64k -- @lean exec "List the files in this repository and say in one sentence what each one is for."
+ollama launch codex --model qwen3.5:4b-ctx64k -- @lean exec "The payments-api pod crash-loops with 'required environment variable DATABASE_URL is not set'. Find the cause in this repository's manifests. Don't change any files."
+ollama launch codex --model qwen3.5:4b-ctx64k -- @lean
+```
+
+**In the interactive session (x34):**
+* If Codex asks whether to trust the folder, **don't trust it**. Trusting writes `C:\tmp\cc-sandbox` into your main `~/.codex/config.toml`.
+* If it offers automatic review or "approve for me", decline. That reviewer would be the local 4b, as Claude Code's auto mode was in Step 5.
+* Approve each command once. **Copy the screen this time.**
+* Run `ollama ps` once while it works.
+
+**Afterwards:**
+
+```powershell
+cd C:\repos\ollama-lab
+foreach ($f in 'config.toml','ollama-launch.config.toml','model.json') { '{0,-28} {1}' -f $f, ((Get-FileHash $HOME\.codex\$f).Hash -eq (Get-FileHash results\raw\codex-before\$f).Hash) }
+Get-Content $HOME\.codex\ollama-launch.config.toml
+git -C C:\tmp\cc-sandbox diff
+ollama launch codex --restore
+Test-Path $HOME\.codex\ollama-launch.config.toml, $HOME\.codex\model.json
+Copy-Item results\raw\codex-before\config.json $HOME\.ollama\config.json
+Remove-Item Env:OLLAMA_HOST
+```
+
+`--restore` leaves the launcher files *absent*, not as they were on 2026-10-23. The next `ollama launch codex` recreates them, and the copies are in `results\raw\codex-before\` if you want them back.
+
+**Predictions:**
+
+| Measure | Prediction | Why |
+|---|---|---|
+| Part A: `--config` | Changes only `~/.ollama/config.json` (`codex` → ctx64k); all three `~/.codex` files unchanged | Codex isn't an "editor" integration: its files are written in `Run()`, at launch |
+| After the first launch | `ollama-launch.config.toml` rewritten, with **`base_url` = the tap's port** (stale once the tap stops); `model.json` rewritten, with `context_window: 262144` for ctx64k (the trained maximum, not `num_ctx`); `config.toml` unchanged | Source; the existing catalog shows 262144 for a model run at 4K |
+| `--restore` | Deletes both launcher files; `config.toml` untouched | `Restore()` |
+| First request | ≈1.7K tokens, 5 tools, <2 s to the first token on a warm model | Probe |
+| x0 at 4K | The first requests fit. Once file contents push the prompt past 4,096, Ollama cuts it silently (keep 4 + last 2,046), removing the instructions and tool definitions at the *start*. Expect a degraded or confused end of the task; a `truncating input prompt` line in `server.log` | Step 5's rule. This time the question survives, because it's near the end, and the tools don't |
+| x1 | ok, with more calls than Claude Code (one shell command per file or a loop), and ≥1 shell-quoting error (PowerShell vs bash) | No Read tool |
+| x2 | Same model, so probably the same miss (`payments-db` vs `payments-database`) | The harness changes the tools, not the reasoning |
+| x34 | Finds the failing test. The fix is attempted through shell commands that need your approval to write; same arithmetic risk as Step 5 | Read-only sandbox until approved |
+| Prompt growth | Much slower than Claude Code's (1.7K vs 16–19K start); tool output capped at 10,000 bytes | Catalog `truncation_policy` |
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 — run 1 (2026-10-28, `qwen3.5:4b`, 8 tasks × think off/on × 3 runs)

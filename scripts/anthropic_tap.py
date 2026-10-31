@@ -1,4 +1,5 @@
-"""Lab 06 Step 5. A logging reverse proxy between Claude Code and Ollama's Anthropic-compatible API.
+"""Lab 06 Steps 5-6. A logging reverse proxy between a coding agent and Ollama: Claude Code on the
+Anthropic-compatible API (/v1/messages), Codex on the OpenAI Responses API (/v1/responses).
 
 `ollama launch claude` points Claude Code at ANTHROPIC_BASE_URL = OLLAMA_HOST. Set OLLAMA_HOST to this proxy in the
 same PowerShell session, and every request (from Claude Code and from the ollama CLI) passes through here:
@@ -10,7 +11,7 @@ same PowerShell session, and every request (from Claude Code and from the ollama
 Like scripts/mcp_tap.py, but for HTTP: nothing is changed, only copied and logged. Streaming (SSE) responses are
 passed through as they arrive. For each /v1/messages request it prints and logs the request's shape (messages,
 tools, system prompt size, thinking, max_tokens) and the response's usage (input/output tokens), stop reason and
-tool calls. Ctrl+C prints a summary.
+tool calls. /v1/responses (Codex, `ollama launch codex`) is parsed into the same fields. Ctrl+C prints a summary.
 
 Log: results/raw/cc-tap-<label>-<stamp>.jsonl (gitignored). It includes the full request and response bodies, which
 contain Claude Code's system prompt and whatever files it read: keep the sandbox free of secrets.
@@ -82,6 +83,68 @@ def response_shape(raw, content_type):
     return out
 
 
+def responses_request_shape(body):
+    """What Codex sent on /v1/responses (OpenAI Responses API): instructions + a list of input items."""
+    items = body.get('input', [])
+    if isinstance(items, str):
+        items = [{'type': 'message', 'role': 'user', 'content': items}]
+    tail = []                               # tool outputs sent back since the model's last turn
+    for it in reversed(items):
+        if not it.get('type', '').endswith('_call_output'):
+            break
+        tail.append(it)
+    tools = body.get('tools', [])
+    return {'model': body.get('model'), 'stream': body.get('stream', False), 'max_tokens': body.get('max_output_tokens'),
+            'thinking': body.get('reasoning'), 'messages': len(items), 'system_chars': len(body.get('instructions') or ''),
+            'tools': len(tools), 'tool_names': [t.get('name') or t.get('type') for t in tools],
+            'tool_results': len(tail), 'tool_result_errors': 0}
+
+
+def responses_response_shape(raw):
+    """Usage, status, tool calls and text from a Responses stream: everything is in the final response object."""
+    out = {'input_tokens': None, 'cached_tokens': 0, 'output_tokens': None, 'stop_reason': None, 'tool_calls': [],
+           'text': ''}
+    text = raw.decode('utf-8', 'replace')
+    resp = None
+    for line in text.splitlines():
+        if line.startswith('data:') and line[5:].strip()[:1] == '{':
+            e = json.loads(line[5:])
+            if e.get('type') in ('response.completed', 'response.failed', 'response.incomplete'):
+                resp = e['response']
+            elif e.get('type') == 'error':
+                out['error'] = e.get('error') or e.get('message')
+    if resp is None:
+        try:
+            resp = json.loads(text)
+        except ValueError:
+            return out
+    usage = resp.get('usage') or {}
+    cached = (usage.get('input_tokens_details') or {}).get('cached_tokens') or 0
+    # OpenAI-style usage: input_tokens is the whole prompt, cached part included (Anthropic's input_tokens excludes it)
+    out['input_tokens'] = (usage.get('input_tokens') or 0) - cached
+    out['cached_tokens'] = cached
+    out['output_tokens'] = usage.get('output_tokens')
+    output = resp.get('output') or []
+    out['tool_calls'] = [o.get('name') or o.get('type') for o in output if o.get('type', '').endswith('_call')]
+    out['text'] = ''.join(c.get('text', '') for o in output if o.get('type') == 'message'
+                          for c in o.get('content', []) if c.get('type') == 'output_text')
+    status = resp.get('status')
+    out['stop_reason'] = 'tool_use' if out['tool_calls'] else ('end_turn' if status == 'completed' else status)
+    if resp.get('error'):
+        out['error'] = resp['error']
+    return out
+
+
+def parse(api, body, raw, content_type):
+    """Request and response shape for one model call, by API."""
+    if api == 'responses':
+        return {**responses_request_shape(body), **responses_response_shape(raw)}
+    return {**request_shape(body), **response_shape(raw, content_type)}
+
+
+API_PATHS = {'/v1/messages': 'messages', '/v1/responses': 'responses'}   # Claude Code, Codex
+
+
 class Tap(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -128,15 +191,15 @@ def record(method, path, status, body, raw, content_type, headers, start, first,
            'client_gone': gone, 'user_agent': headers.get('User-Agent'),
            'auth': 'bearer' if headers.get('Authorization') else ('x-api-key' if headers.get('x-api-key') else None),
            'anthropic_beta': headers.get('anthropic-beta')}
-    is_messages = path.split('?')[0] == '/v1/messages' and method == 'POST'
+    api = API_PATHS.get(path.split('?')[0]) if method == 'POST' else None
+    is_messages = api is not None
     if is_messages:
         try:
             req = json.loads(body)
-            rec.update(request_shape(req))
         except ValueError:
-            req = None
-        rec.update(response_shape(raw, content_type))
-        rec['request_body'], rec['response_raw'] = req, raw.decode('utf-8', 'replace')
+            req = {}
+        rec.update(parse(api, req, raw, content_type))
+        rec['api'], rec['request_body'], rec['response_raw'] = api, req, raw.decode('utf-8', 'replace')
     with lock:
         rec['n'] = len(records) + 1
         records.append(rec)
@@ -159,17 +222,19 @@ def prompt_tokens(rec):
 
 
 def summary(recs):
-    m = [r for r in recs if r['path'].split('?')[0] == '/v1/messages' and r['method'] == 'POST']
+    m = [r for r in recs if r['path'].split('?')[0] in API_PATHS and r['method'] == 'POST']
     if not m:
-        return 'no /v1/messages requests'
+        return 'no model requests (/v1/messages or /v1/responses)'
     for r in m:                      # re-parse saved responses, so older logs get the current counting
         if 'response_raw' in r:
-            r.update(response_shape(r['response_raw'].encode('utf-8'), 'event-stream' if r.get('stream') else 'json'))
+            r.update(parse(API_PATHS[r['path'].split('?')[0]], r.get('request_body') or {},
+                           r['response_raw'].encode('utf-8'), 'event-stream' if r.get('stream') else 'json'))
     calls = Counter(c for r in m for c in r.get('tool_calls', []))
     models = Counter(r.get('model') for r in m)
     ins = [prompt_tokens(r) for r in m]
     first = m[0]
-    lines = [f"/v1/messages requests: {len(m)} (models: {dict(models)}), other requests: {len(recs) - len(m)}",
+    lines = [f"model requests ({', '.join(sorted({r['path'] for r in m}))}): {len(m)} (models: {dict(models)}), "
+             f"other requests: {len(recs) - len(m)}",
              f"first request: system prompt {first.get('system_chars', 0):,} chars, {first.get('tools', 0)} tools, "
              f"{prompt_tokens(first):,} prompt tokens ({first.get('first_byte_s')} s to first byte)",
              f"prompt tokens: max {max(ins):,}; processed new {sum(r.get('input_tokens') or 0 for r in m):,}, "
