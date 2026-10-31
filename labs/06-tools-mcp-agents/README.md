@@ -919,6 +919,8 @@ Raw: `results/raw/cc-tap-{partA,c0,c1,c2,c34,c34-default}-20261031-*.jsonl` (ful
 
 Each later `ollama launch --model` with a different model wrote `config.json` again, with a new backup each time: 4 backups after the session. Claude Code's own sessions wrote to `~/.claude.json` (folder trust for `C:/tmp/cc-sandbox`) and created `~/.claude/projects/C--tmp-cc-sandbox/` (transcripts, a `memory` folder).
 
+**Correction (found during Step 6):** in run 2 of c3/c4, at 11:31, the prompt choice that switched to auto mode **also saved a permission rule**. Claude Code wrote `C:\tmp\cc-sandbox\.claude\settings.local.json` (`allow`: `Bash(python -m pytest tests/ -v)`, `Bash(python -m unittest discover tests/ -v)`) and **created `~/.config/git/ignore`** with `**/.claude/settings.local.json`. That's the change outside the sandbox the instructions warned about. My first check of these files happened before that run, so it missed it.
+
 **1. What a production agent sends: ≈16K tokens before your question.**
 * **22 tools** in `-p` mode, **25** interactive (+ AskUserQuestion, EnterPlanMode, ExitPlanMode). The tool definitions are **53K of the 70K characters**. The largest were SendMessage, Workflow, ScheduleWakeup, CronCreate and Agent (4–6K characters each); the system prompt itself is 5.6K.
 * **Claude Code's prompt order:** two system blocks, then your question wrapped in `<system-reminder>` context (git status with your git user name, an attribution note), then **a second system block of 8,423 characters** *after* the question: environment, agent types, the skills list.
@@ -1032,7 +1034,67 @@ Raw: `results/raw/cc-tap-cxA-20261031-114732.jsonl` (one tap log for Part A, x0,
 * Prompts stayed small: 1,678 tokens at the start, at most 3,932. The cache kept "new" tokens at 36–46 per turn.
 * So **x0 at 4K never overflowed**. The prediction about truncation is untested, because failed commands return tiny outputs.
 
-**Status:** the quality tasks need a rerun with the Codex desktop app closed.
+**Status:** see run 2.
+
+### Step 6 — run 2 (2026-10-31, Codex 0.163.0-alpha.11.2 from the desktop app, desktop app closed)
+
+**Two fixes before the rerun:**
+* **Quit the ChatGPT desktop app** (`ChatGPT.exe`, the Store package `OpenAI.Codex`), which had started the app-server and the `node_repl.exe` processes. Closing its window only hides it in the tray.
+* **Use a Codex build that includes the sandbox helper.** The next error was `CreateProcessWithLogonW failed: 2` (file not found). The sandbox log said `helper copy failed for command-runner: helper not found next to current executable or under codex-resources: C:\Users\bruno\.local\bin\codex.exe`.
+  * The **standalone CLI** (0.161.0, installed 2026-10-06) ships without `codex-command-runner.exe`, so it can't run sandboxed commands on Windows at all.
+  * The desktop app's bundle (`%LOCALAPPDATA%\OpenAI\Codex\bin\…`, 0.163.0-alpha.11.2) and the VS Code extension's bundle (0.164.0-alpha.11.1) include it.
+  * Fix, for that terminal only: `$env:PATH = "$env:LOCALAPPDATA\OpenAI\Codex\bin\37f54d68e5533a51;$env:PATH"`. `ollama launch` finds `codex` on `PATH`. Then `exec "Run: echo sandbox-ok"` succeeded in 473 ms.
+* **Seen in the sandbox log:** before running commands, the setup grants the sandbox users **read** access across the user profile, including `.claude.json`, `kafka-pki`, `givenchy-kafka` and `Ubuntu-20.04-backup.tar`. Codex's Windows "read-only" sandbox means *can read most of your home, can't write outside the workspace*.
+
+Raw: `results/raw/cc-tap-x0b-20261031-120856.jsonl` (all four sessions in one log), Codex transcripts in `~/.codex/sessions/2026/10/31/`. One run each.
+
+| Task | Model | Requests | Commands (non-zero exit) | Max prompt | Model time | Result |
+|---|---|---|---|---|---|---|
+| x0b | `qwen3.5:4b` (4K) | 2 | 1 (0) | 1,923 | 8 s | **Incomplete**: `Get-ChildItem -File` lists only the top level, so "two files: `.gitignore`, `README.md`" |
+| x1b | ctx64k | 2 | 1 (0) | 2,079 | 9 s | **Incomplete**: the top-level folders with one-line guesses (`app/` "the main application codebase"), no file inside them |
+| x2b | ctx64k | 9 | 8 (1) | 3,610 | 15 s | **Correct**: "Secret Name Mismatch: `payments-db` ❌ vs `payments-database` ✅", and "since `optional: true` is set… Kubernetes silently skips loading the secret". Fix stated as editing the Deployment. One path typo (`.k8s/`) |
+| x34b (c3 + c4) | ctx64k | 171 + 2 title | **169 (81)** | **49,399** | 567 s (12 min) | **Correct one-line fix, invented verification, 8 scratch files left in the repo** |
+
+**1. x2b got right what Claude Code's c2 got wrong, with the same model.** It `cat`-ed both manifests and compared the names, and it explained `optional: true`, which no Step 5 run did. With one run per tool this isn't a verdict on the harness: Step 5 c2 also read both files and missed. It shows how much a single run of a 4B model can vary.
+
+**2. x34b: the agent loop without limits.**
+* **169 shell commands, 81 with a non-zero exit**:
+  * bash idioms in PowerShell (`ls -la`, `&&`, `2>/dev/null`, `xargs`);
+  * `pytest` and `python` not found: the sandbox user can't run the Microsoft Store Python's app alias (`ResourceUnavailable`);
+  * an attempted `pip install pytest`, blocked because the sandbox has no network.
+* It eventually found `pytest.exe` under the user's `AppData\Local\Packages\PythonSoftwareFoundation…\Scripts\` (readable thanks to the profile-wide read grants) and ran it through `Invoke-Expression`. **No test run produced any output** in the whole session: `Ran 3 tests` never appears in a tool result.
+* **The fix:** `/ 10` → `/ 100`, correct (`python -m unittest` afterwards: 3 tests OK). The file was rewritten with CRLF line endings.
+* **The final answer claimed** "I have successfully identified, fixed, and verified the bug" and listed all three tests as `PASS`, although the last command printed nothing and nothing had ever shown a test result. **It reported verification that never happened.**
+* **No human was asked anything.** Run 1's interactive session had recorded the folder as trusted (in the launcher profile). So run 2 ran in **`workspace-write` with `on-request` approvals**: writes inside the workspace need no approval, and the model never requested escalation.
+  * It wrote 13 times, leaving `fixed_pricing.py`, `pricing_test.py`, `pricing_test_runner.py`, `run_inline_test.py`, `run_tests.py`, `standalone_pricing.py`, `standalone_test_runner.py` and `verify_fix.py` untracked in the repo.
+  * The trust decision from one session silently set the permissions of the next.
+* **The prompt reached 49,399 tokens, 75% of the 64K window,** through many small turns, not big outputs. A few more minutes and Ollama would have cut the start of the conversation (instructions, tool definitions) without telling anyone, while Codex believes it has 249K.
+* **Title generation again:** 9,311 thinking tokens (79 s, and the agent's next turn waited 75.5 s), and 3,039 (30 s) for the second prompt.
+
+**3. x0 at 4K never overflowed.** The 4b listed only the top level (1,923 tokens), so the truncation prediction is untested in both runs. The 4K run's real failure was laziness: one non-recursive command, and an answer as if that were the whole repository.
+
+**Predictions vs observed (Step 6):**
+
+| Measure | Prediction | Observed |
+|---|---|---|
+| `--config` / first launch / `--restore` | Ollama record only / profile + catalog rewritten, `base_url` = tap port, 262144 / both deleted | ✓ / ✓ / see Cleanup |
+| First request | ≈1.7K tokens, 5 tools | 1,666–1,694 tokens, 5 tools (`exec`); 2,637 tokens and **9 tools interactive** (+ `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`, `mcp__codex_worktrees`) |
+| x0 at 4K | truncation late in the task | never reached 4K; incomplete answer instead |
+| x1 | ok, more calls than Claude Code | 1 command, top level only: **incomplete** |
+| x2 | probably the same miss | **correct**, including `optional: true` |
+| x34 | finds the test; fix after approvals | fix correct after 169 commands; **no approvals asked** (trusted folder); **invented test results**; scratch files |
+| Prompt growth | slower than Claude Code | start 6–10× smaller, but **49K by the end** of a long loop |
+
+**What Step 6 teaches:**
+1. **Configuration is part of the attack surface and of the failure surface.** One setup carried ChatGPT-connected Gmail and Drive tools. Another had a CLI without its sandbox helper. A third had a desktop app holding a file the sandbox needed. A trust decision from an earlier session decided whether anyone was asked. None of these is about the model.
+2. **Fail closed is the right default.** When the sandbox couldn't set up, Codex refused every command rather than running them unprotected. The model then hallucinated around the gap, which is the next thing to guard against.
+3. **"Local" setups have cloud edges:**
+   * `web_search` via ollama.com;
+   * the ChatGPT apps;
+   * the OpenAI default provider behind a misspelled profile.
+
+   Each was found by watching the traffic or reading the source, not from the docs.
+4. **Agents claim verification they didn't do.** Step 5's Claude Code ran the tests and showed the output. Codex's 4b said "verified" with no output at all. Check the tool results, not the summary (Q8, Q19).
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -1056,6 +1118,8 @@ Raw: `results/raw/cc-tap-cxA-20261031-114732.jsonl` (one tap log for Part A, x0,
 | `ollama` CLI: `timed out waiting for server to start` | `OLLAMA_HOST` points at a port with nothing listening (here: the tap wasn't running); the CLI then tries to start the Ollama app | Start the tap first; `$env:OLLAMA_HOST`; `app.log` shows the start attempt |
 | Claude Code never asks before running commands | Auto permission mode (an account default, or picked on a prompt); with `ollama launch` its classifier runs on the local model | `/status` or the transcript's `permission-mode`; start with `--permission-mode default` and choose "Yes", not the auto option |
 | Codex: every command fails with `helper_unknown_error: setup refresh had errors` | The elevated Windows sandbox can't update ACLs on a file another process holds (here the Codex desktop app's `node_repl.exe`, `os error 32`) | `~/.codex/.sandbox/sandbox.<date>.log`; close the Codex desktop app and retry |
+| Codex: `CreateProcessWithLogonW failed: 2` on every command | The standalone CLI has no `codex-command-runner.exe` for the Windows sandbox (`helper not found next to current executable`) | Sandbox log; use a Codex build that ships the helper (desktop app or VS Code extension bundle) |
+| An agent session asks for no approvals although you expected prompts | A stored trust decision from an earlier session (Codex: `trust_level` in the loaded config; Claude Code: `settings.local.json` allow rules) | Codex transcript `turn_context` (`approval_policy`, `sandbox_policy`); pass the modes explicitly each session |
 | Codex `web_search` fails with "This model requires an Ollama account" | Ollama executes the hosted `web_search` tool through ollama.com (`/api/experimental/web_search`), which needs sign-in | `server.log` 401s; it's a cloud call, so leave it off for local-only work |
 | A 4-word session title takes a minute and blocks the agent | Background title request at `reasoning.effort: high` on a one-request-at-a-time model | Tap: a no-tool request with thousands of output tokens before the agent's turn |
 | `ollama launch claude --restore` fails | Not implemented for `claude`: it only sets environment variables on the child process | Nothing to restore in Claude Code; Ollama's own record is `~/.ollama/config.json` (backups in `~/.ollama/backup`) |
@@ -1284,4 +1348,36 @@ Setting it up so the mistake can't land:
 * **Policy in CI:** a check that rejects Secret manifests with real-looking values, and `optional: true` on required config. Like Step 4's lesson, the guardrail lives outside the model.
 
 Review the *argument*, not the citations: what would have to be true for this diagnosis to hold, and did the agent check it?
+</details>
+
+**Q20. In Step 6 run 2 the agent edited code and created 8 files without asking anyone, although you'd been told to approve each command. Trace why, and say what you would change so a trust decision can't silently widen later sessions.**
+
+<details><summary>Answer</summary>
+
+In run 1's interactive session the folder was recorded as trusted. Codex writes that decision into the config file it loaded, here `~/.codex/ollama-launch.config.toml` (`[projects.'c:\tmp\cc-sandbox'] trust_level = "trusted"`). In run 2, that trust selected `sandbox: workspace-write` with `approval: on-request`:
+* writes inside the workspace are allowed without asking;
+* approval happens only when the *model* requests escalation, which it never did.
+
+So the gate was the model's own judgment again (Step 5's Q18), and a decision made in one session set the permissions of the next.
+
+What to change:
+* **Be explicit per session:** pass the sandbox and approval mode on the command line every time (`-s read-only`, or `-c approval_policy=…`). That way the session doesn't inherit stored trust.
+* **Review stored trust like any other credential:** know where it lives (`~/.codex/*.toml`, `~/.claude.json`, `.claude/settings.local.json`), and clear it after lab work. `ollama launch codex --restore` happened to remove this one with the profile.
+* **Run agents in a disposable workspace** (a fresh clone or container) so "workspace-write" can't reach anything that matters.
+
+It's the same pattern as a `kubectl` context or an AWS profile: the dangerous part is the default you forgot you set.
+</details>
+
+**Q21. Codex's final answer said all three tests PASS. No command in the session had shown a test result. How would you catch this automatically, and why is it a different failure from the c2/c3 reasoning errors?**
+
+<details><summary>Answer</summary>
+
+c2 and c3 were **reasoning errors**: the model drew a wrong conclusion from evidence it had. This is a **reporting error**: it claimed evidence it never had. It's worse, because a reviewer who trusts the summary has no reason to look. Steps 2 and 5 showed the same thing with denials.
+
+To catch it, don't let the model be the source of truth for what happened:
+* **The runtime records outcomes:** exit codes and outputs of every command. Here 81 of 169 non-zero exits and 0 lines of test output were in the transcript.
+* **A claim check:** if the answer says "tests pass", require a tool result in this session containing the test runner's success line (`OK`, `passed`). Otherwise flag the claim.
+* **Run the check yourself in CI:** a fix isn't done until the pipeline runs the tests. The agent's summary is a PR description, not a test report.
+
+Like Q8: facts about what happened come from logs, not from the model's account of them.
 </details>
