@@ -186,9 +186,58 @@ Output: `results\raw\vision-dashboard-<stamp>\`, containing the report, the thre
 | Prompt time per image question | ≈0.4 s | ≈0.9 s | Probe ratio |
 | VRAM, 9b peak | – | ≈9.0 GB GPU total (≈6.5 GB over idle) | Probe 9,230 MiB with a 3× larger image |
 
-### Later steps (planned)
+### Step 3 — Thinking and counting
 
-* **Step 3 — Thinking and counting:** does thinking help reading and counting (pods, nodes, spikes), or only add tokens?
+**What we're learning.** Steps 1–2 ran with thinking off. Two kinds of question are left where a model might *reason* its way to a better answer:
+* **counting** (squares, circles, spikes, Running pods), a known weak point of vision models;
+* **dense reading** (Step 1's 8/12 names).
+
+Lab 06 Step 1 measured thinking on tool calls: 1.17× the tokens and 2.1× the time, with no fewer judgment errors. Here the question is whether thinking helps the model *see*, or only lets it talk longer about what it saw.
+
+**Three modes, same image, same `num_ctx` (12,288, so no reload between modes):**
+* **off:** think off; the answer goes straight into `{"count": int}`.
+* **steps:** think off, but the schema puts **the working first** and the total last: `{"red_per_row": [int], "count": int}`, a list of circle positions, spike times, or Running pod names. The model must write an enumeration *you can check* before it writes the number. This is chain-of-thought in the visible, schema-constrained output instead of in a hidden thinking block.
+* **think:** think on, then the plain schema, with up to 8,000 output tokens. A run that hits the limit returns **no answer**.
+
+**Verified before the run (2026-11-02, probe; a different 8×6 grid with 7 red squares, 4b):**
+* **think off → 6** (wrong), in 11 output tokens, 9.4 s including the load.
+* **think on → no answer, twice.** Both runs used all 6,000 tokens (≈50 s), once at temperature 0 and once with the model's own sampling defaults (temperature 1, top_k 20, top_p 0.95, presence_penalty 1.5).
+  * The thinking isn't an exact loop (287 distinct lines of 347).
+  * It's **endless re-verification**: it scans row by row, writes bounding-box coordinates for each square (`Square 6: **Red** [453, 28, 506, 145]`), loses track of the grid size ("Col 9", "Cols 1-10" in an 8-column grid), and starts again ("Wait, let me count rows from bottom up").
+  * So the sampling settings aren't the cause.
+* **Thinking with `format` works**: thinking goes to `message.thinking`, and the answer to `content` once thinking ends (Ollama applies the grammar after the thinking close tag, `llm/llama_server.go`). On `done_reason: length`, `content` is empty.
+
+**Tasks.** Synthetic images (`--images` draws them); the ground truth comes from the drawing code and is saved in `truth.json`.
+
+| Task | Image | Image tokens | Truth |
+|---|---|---:|---|
+| grid-7, grid-12 | 8×6 grid of 50 px squares, red among green | 300 | 7, 12 (per-row counts saved) |
+| grid-19 | 10×8 grid | 480 | 19 |
+| circles-11 | 11 unlabelled circles scattered on 800×600 | 475 | 11 |
+| spikes-5 | CPU line 14:00–15:00 with 5 two-minute spikes over a dashed 70% line | 336 | 5 (14:05, :17, :26, :41, :52) |
+| running-12 | A 20-pod `kubectl get pods` (16 px, Step 1's style) | 336 | 12 Running |
+| read-x1, read-x0.75 | Step 1's 12-pod table; JSON extraction (off and think only) | 275, 144 | 12 names |
+
+```powershell
+.\.venv\Scripts\python scripts\vision_thinking.py            # 4b only: ≈10–15 minutes (thinking runs up to ≈65 s each)
+.\.venv\Scripts\python scripts\vision_thinking.py --9b       # optional: adds the 9b, ≈25 minutes in total
+```
+
+Output: `results\raw\vision-thinking-<stamp>\` holds the report, every image, `truth.json`, and `answers.json` **with the full thinking text**. Read one thinking trace that hit the limit, and one that finished.
+
+**Predictions:**
+
+| Measure | Prediction | Why |
+|---|---|---|
+| off, grids | Off by 1–3, more often on grid-19 | Probe 6 for 7; counting many identical objects in one glance is a known weakness |
+| off, spikes-5 | ✅ | 5 large, separate events |
+| off, circles-11 / running-12 | Off by 1–2 | — |
+| **steps**, grids | Per-row counts mostly right (≤ 4 per row), so the totals are right or off by 1. **At least once, `count` ≠ the sum of the model's own per-row list** | Small sub-counts are easier; adding them is arithmetic the model doesn't check |
+| steps, running-12 | Count right; names with typos (Step 1) | Statuses read well, names don't |
+| **think** | Hits the 8,000-token limit on at least half the counting tasks: **no answer**. When it finishes, more often right than off | Probe: 2/2 at 6,000 |
+| think, read-x1 / x0.75 | No better than off on names (8/12, 7/12 ± 1) | The image tokens are the same; thinking can't add pixels |
+| Cost | off ≈ 1 s, steps 2–5 s, think 30–70 s per task | 120 tok/s × up to 8,000 tokens |
+| 9b (optional) | Finishes thinking more often; same reading limit | — |
 * **Step 4 — Prompt injection through pixels:** instructions written *inside* an image (a log line in a screenshot, a sticky note on a diagram) given to Lab 06's agent. Does the image channel bypass the hardened system prompt?
 
 ## 5. Hypotheses → Observed Metrics
