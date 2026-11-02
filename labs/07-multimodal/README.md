@@ -256,7 +256,7 @@ Raw: `results/raw/vision-basics-20261102-093556/` (report, every image, every JS
 | Back at 4K after Parts 2–3 | 6,450 | +64 |
 
 * **The model costs ≈3.9 GB at 4K with the projector loaded,** close to Lab 02's 3,860 MiB. The projector is loaded at start (`--mmproj`), image or not, but this run can't separate its share: there's no text-only build of the same model to compare.
-* **`ollama ps` says 3.1 GB; nvidia-smi says 3.9 GB.** Under the llama.cpp runner, `ollama ps` doesn't count ≈0.7–0.8 GB. That's about the projector's 675 MB of weights, but this is **not verified**.
+* **`ollama ps` says 3.1 GB; nvidia-smi says 3,901 MiB over idle.** `ollama ps` uses decimal GB: 3.1 GB ≈ 2,956 MiB. So under the llama.cpp runner it doesn't count **≈945 MiB**. That's more than the projector's 644 MiB of weights; Step 2 adds the 9b's numbers. *(Corrected: an earlier version said "≈0.7–0.8 GB", mixing GB and GiB.)*
 * Large images add ≈350 MiB of compute buffers, and they aren't freed until the model reloads. Peak use was 4,487 MiB over idle: inside the 8,500 MiB ceiling, with room for the 9b test.
 
 **Predictions vs observed:**
@@ -282,6 +282,91 @@ Raw: `results/raw/vision-basics-20261102-093556/` (report, every image, every JS
 4. **Vision errors are plausible inventions, not blanks.** Validate extracted identifiers against a source of truth (`kubectl get pod <name>`) before acting. Never act on a name read from a screenshot.
 5. **Check that the image actually arrived.** The model won't tell you it didn't.
 
+### Step 2 — run 1 (2026-11-02, `qwen3.5:4b` and `qwen3.5:9b`, think off, temperature 0, seed 42, one run)
+
+Raw: `results/raw/vision-dashboard-20261102-110758/` (report, images, text versions, `answers.json`).
+
+**Score, corrected by hand.** The 9b's d10 text answer was `{"endpoint": "/v1/refund", "count": 311}`: right, but the scorer took the "1" in `/v1` as the number. "Strict" counts d6 from *text* as wrong unless it's exactly 14:35; the data is per minute, so ±3 minutes is too lenient there.
+
+| | Dashboard image /12 | CPU crop /4 | Diagram image /7 | **All images /19** | Text /19 (strict) |
+|---|---:|---:|---:|---:|---:|
+| `qwen3.5:4b` | 12 | 4 | 6 | **18** | 18 (17) |
+| `qwen3.5:9b` | 11 | 4 | 7 | **18** | 19 (18) |
+
+**The misses:**
+
+| Q | Truth | Answer | What it was |
+|---|---|---|---|
+| t7 PostgreSQL version, 4b image | not shown | "PostgreSQL" | Answered with the label next to the question's subject. Not an invented version, but not "not shown" either. The 4b on *text* said "not shown" |
+| d7 peak, 9b image | 96 | "90" | Read the plateau, not the peak. The ×2 crop gave 95 |
+| d7 peak, 4b **text** | 96 | "not shown" | The 61 per-minute values were in the prompt; the model didn't find a maximum in them |
+| d6 crossing, text | 14:35 | 4b "14:36", 9b "14:38" | Counting positions in a 61-element array. **Both models gave exactly 14:35 from the image and from the crop** |
+
+**1. My predictions were too pessimistic.** I predicted 13–15/19 for the 4b on images; it got 18. Everything I flagged as hard (colour → legend, the crossing time, containment, arrow direction, listing every Pod target) was right with both models. My mistake was **extrapolating Step 1's failure, random 5-character suffixes at 16 px, to every kind of visual reading.**
+* Here the text was large or common words (`payments-db`, `Error rate`, `14:41`).
+* The chart had one salient event.
+* The images were clean, synthetic and high-contrast.
+
+Step 1 and Step 2 together say: **difficulty is glyph density and randomness, not "charts" or "diagrams".** Caveats:
+* one image of each kind, one run at temperature 0, 19 questions;
+* a 1-question difference between the models means nothing at this sample size;
+* real Grafana pages are denser (more series, smaller legends, overlapping lines) than this one.
+
+**2. The text version wasn't the ceiling.** For questions about a *time series*, the image beat the raw numbers:
+* The crossing time came out exact from both images and wrong from both texts.
+* The 4b couldn't find the maximum of 61 numbers.
+
+A chart is a computation already done for the eye; a raw array asks the model to scan and count, which LLMs do badly (Lab 06 Step 5: the 4b miscalculated in c3/c4). The lesson for agents: **give the model aggregates computed in code** (`max`, first crossing, slope: a PromQL query or a tool), not raw series, whether as pixels or as numbers.
+
+**3. Cost depends on what the image encodes.**
+
+| Input | Prompt tokens | 4b prompt ms | 9b prompt ms |
+|---|---:|---:|---:|
+| Dashboard image | 937 | 367 | 605 |
+| CPU crop ×2 | 1,054 | 397 | 702 |
+| Dashboard as JSON (183 values) | 1,088 | 237 | 339 |
+| Diagram image | 931 | 363 | 605 |
+| Diagram as an edge list | **295** | 109 | 143 |
+
+* The **diagram as text is 3× cheaper** than its picture.
+* The **dashboard as raw data is dearer** than its picture: raw series are verbose, and a chart compresses them.
+* The 9b's bigger projector makes image prompts ≈1.65× slower; text prompts are ≈1.4× slower.
+
+**4. The schema guaranteed a string, not a clean answer.** The 9b put JSON *inside* the string 3 times (`{"count": 3}`, `{"payments-api Pods": 3}`, d10). It's valid against `{"answer": string}`, and it broke a naive number parser. Make the schema specific (`"type": "integer"` for counts), or parse defensively.
+
+**5. VRAM: the 9b fits, with little room.**
+
+| | Idle | Peak | Over idle | `ollama ps` | Not counted by `ollama ps` | Projector blob |
+|---|---:|---:|---:|---:|---:|---:|
+| 4b | 2,009 | 6,030 | 4,021 | 3.1 GB (≈2,956 MiB) | ≈1,065 MiB | 644 MiB |
+| 9b | 2,065 | **8,618** | 6,553 | 5.6 GB (≈5,341 MiB) | ≈1,212 MiB | 879 MiB |
+
+* The 9b's 6,553 MiB is inside the 8,500 MiB ceiling. With today's desktop (≈2 GB) the GPU was at 8.6 of 10.2 GB, 100% GPU.
+* The `ollama ps` gap is larger than the projector in both cases, and it grows less than the projector does from the 4b to the 9b (+147 vs +235 MiB). So **"`ollama ps` leaves out the projector" doesn't explain it alone.** CUDA context and compute buffers are candidates. **Not verified**; nvidia-smi remains the number to trust.
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| Large text, colour 5/5 both | ✅ |
+| Small text d10, d11 right | ✅ both |
+| d5 coin flip for the 4b on the full image | ❌ (better) ✅ both inputs, both models |
+| d6 4b wrong on the image ("14:30") | ❌ (better) exactly 14:35 everywhere from images |
+| d7 peak ±4 on half | 5/6 within ±4 (95, 95, 95, 96 text; 9b image 90) |
+| Diagram: 4b misses t4/t5/t6 | ❌ (better) all right |
+| t7: 4b may invent a version | Half-right: no version invented, but "PostgreSQL" instead of "not shown" |
+| Text 18–19/19, d6 ±1 minute | 4b 18 (missed the peak), 9b 19; d6 off by 1 and 3 minutes: **text was worse than the image for time-series questions** |
+| Images 4b 13–15, 9b 16–18 | 4b 18, 9b 18 |
+| 9b prompt ≈0.9 s per image question | ≈0.6 s |
+| 9b peak ≈9.0 GB total | 8,618 MiB (idle was 420 MiB lower than in the probe) |
+
+**What Step 2 teaches:**
+1. On clean, sparse visuals, **a 4B vision model reads values, colours, charts and diagram structure reliably**. The failures are in dense, random text (Step 1) and in questions about missing information.
+2. **For time series, neither pixels nor raw numbers are the right input:** compute the aggregate in code and give the model the result.
+3. **For structure, text is cheaper** (an edge list is 3× fewer tokens than the diagram). For raw data, a chart can be cheaper than the data.
+4. **The 9b didn't buy accuracy here**, but it cost ≈1.65× prompt time and ≈2.5 GB more VRAM. Pick the model by the failure you need to fix, measured on your own images.
+5. **My predictions failed in the safe direction, but they still failed.** Measure before believing a rule of thumb, including mine.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Cause | Check / fix |
@@ -292,6 +377,9 @@ Raw: `results/raw/vision-basics-20261102-093556/` (report, every image, every JS
 | The first image request ever took ≈12 s | One-time cost after install or upgrade (not seen again after reloads in run 1; cause not verified) | Ignore after the first run, or warm up with a small image |
 | The answer describes a screenshot you never sent | No image reached the model (empty `images`, a failed capture), and the model invents one | Check `prompt_eval_count`: an image adds ≥ 11 tokens |
 | Two similar pod names merged into one, or a healthy pod reported as failing | Characters smaller than a token patch; filter questions blend near-identical names | Upscale/crop; extract all rows into a schema first, then filter in code; verify names with `kubectl` |
+| A model's string answer contains JSON (`{"count": 3}`) | The schema only says `string`; the 9b nests objects in it | Type the field (`integer`), or parse defensively; don't take the first number in the string |
+| Wrong times or maxima from a time series passed as raw numbers | The model must count positions or scan a long array | Compute aggregates in code or with a query; give the model the result |
+| `ollama ps` SIZE is ≈1 GB below nvidia-smi for vision models | Not explained (more than the projector alone); also, `ollama ps` uses decimal GB | Budget VRAM from nvidia-smi |
 | JSON output from a tiny image never ends | Runaway invented rows (`payment-db-0 … -30`) until `num_predict` | Cap `num_predict`; reject images below a readable size |
 | Image requests slow or out of memory with a big context | Projector moved to the CPU (`--no-mmproj-offload`) when the text model doesn't fully fit or free VRAM < projector + 1 GiB | `server.log`: `disabling multimodal projector offload` |
 
@@ -311,3 +399,6 @@ Remove-Item -Recurse results\raw\vision-basics-*      # optional: generated imag
 5. In run 1, the ×1 screenshot cost fewer tokens than the same table as text, yet text was the better input. Why? At what scale did the image become error-free, and what did it cost then?
 6. At ×0.5 the JSON was valid and every pod looked healthy. Which two safeguards from Labs 04 and 06 would have caught this, and which wouldn't?
 7. The real screenshot read into a schema got both `payments-api` rows right, but "which pods are in CrashLoopBackOff?" on the same image named both. How would you design the extraction so this can't reach an action?
+8. In Step 2 both models found the 80% crossing time exactly from the chart but not from the same data as JSON. Why, and what would you give an agent instead of either?
+9. Step 1's kubectl screenshot and Step 2's dashboard both used 14–16 px text. Why was one read badly and the other almost perfectly?
+10. The 9b used ≈2.5 GB more VRAM and ≈1.65× more prompt time for the same 18/19. What result would justify switching to it?
