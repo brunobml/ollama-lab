@@ -115,7 +115,94 @@ Output: the report on screen and in `results\raw\vision-basics-<stamp>\report.md
 
 ## 5. Hypotheses → Observed Metrics
 
-No runs yet. The probe numbers in §3 are from 2026-10-31 setup checks.
+### Step 1 — run 1 (2026-11-02, `qwen3.5:4b`, think off, temperature 0, seed 42)
+
+Raw: `results/raw/vision-basics-20261102-093556/` (report, every image, every JSON answer).
+
+**Part 1: cost. The formula held for all 15 sizes.**
+
+| Size | Measured image tokens | Prompt ms | Answer |
+|---|---:|---:|---|
+| 32², 64² | 11 (scaled up to 9 + 2) | 92–113 | "NODE", "NODE-7" |
+| 128² / 256² | 18 / 66 | 112 / 54 | "NODE-7" / "NODE7" |
+| 500² / 512² | 258 / 258 | 164 / 154 | "NODE-7" / **"mod"** |
+| 1000² / 1024² | 963 / 1,026 | 371 / 388 | "NODE-7" |
+| 2048×512 / 512×2048 | 1,026 / 1,026 | 386 / 387 | "NODE -7" / **"mode .fi"** |
+| 1500×1000 | 1,459 | 543 | "NODE-7" |
+| 1800² | 3,138 | 1,308 | "NODE-7" |
+| 8000×1000 | 3,984 (scaled down to 181×22) | 1,781 | "NODE-7" |
+| 2048², 4096² at 4K | **HTTP 400** `request (4123 tokens) exceeds the available context size (4096 tokens)` | – | – |
+| 2048², 4096² at 8K | **4,098 both** | 1,985 / 1,773 | – |
+
+* **Measured = predicted + 2 everywhere**, so the fitted resize rule describes this build.
+* **Above 2048² extra pixels are free and useless:** a 16.8-megapixel image costs exactly what a 4.2-megapixel one does, because it's scaled down first.
+* **Prompt time is linear in image tokens:** ≈2,300–2,400 tokens/s for large images, ≈0.4 ms per token. The bigger cost is context: one maximum-size image is a whole 4K context.
+* **The same encoded size doesn't give the same reading.** 500² and 512² both become 16×16 tokens, but the 512² card was read as "mod". 512×2048 (the same 1,024 tokens as 2048×512) gave "mode .fi". One large, clean word, temperature 0: a small model's reading is **fragile to layout**, not only to resolution.
+
+**Part 2: readability.** The table was scored by hand from the raw JSON, row by row, because the script scores fields only on exactly matched names.
+
+| Variant | Image tokens | Rows | Names exact /12 | READY / STATUS / RESTARTS (by row) | What went wrong |
+|---|---:|---:|---:|---|---|
+| ×2 (1574×696) | 1,078 | 12 | **12** | 12 / 12 / 12 | – |
+| ×1.5 (1180×522) | 592 | 12 | **12** | 12 / 12 / 12 | – |
+| ×1 (787×348, 16 px) | 275 | 12 | 8 | 12 / 12 / 12 | 4 names off by 1–2 characters: `2847f1935` (an extra `f`), `z2zkd` for `zz9kd`, `6f7d8b9c5-d3we1r` for `6f7d8b9c5d-w3e1r` |
+| ×0.75 | 144 | 12 | 7 | 11 / 12 / 12 | **`x2k4p` read as `x2k4q`**: the crash-looping pod's name now appears twice, once as Running. `c2vn1`, `7xkap`, `mg7zt` |
+| ×0.5 (8 px) | 60 | 8 | 1 | – | 4 pods missing; 6 of 8 "Running". **No CrashLoopBackOff, ImagePullBackOff, Pending or Error at all.** READY `/1` everywhere. Still mostly legible to a human eye |
+| ×0.35 | 36 | 34+ | 0 | – | Invented `sub1-get-pods-n-payments-…` (the prompt line read as a pod), then `payment-db-0` … `payment-db-30` until `num_predict` cut the JSON: **not JSON** |
+| text | (≈414 table tokens) | 12 | **12** | 12 / 12 / 12 | – |
+
+* **A screenshot can be the cheaper input, but it costs accuracy.** The table as text took ≈414 tokens (461 prompt tokens − 47 for the instruction), more than the ×1 image (275 + 2). The ×1 image already loses a third of the names. The first error-free image (×1.5, 592 tokens) costs **≈1.4× the text**.
+* **Errors are silent and plausible.** Every wrong name looks like a real Kubernetes name: right prefix, right length, a hash-like suffix. Nothing in the output says "uncertain".
+* **The failure shape changes with resolution:**
+  * ×1: character-level typos;
+  * ×0.75: **two pods merged into one name**;
+  * ×0.5: rows dropped, and **the problem pods vanish into "Running"** (the default status);
+  * ×0.35: generation of a fictional table that never ends.
+* **For operations, ×0.5 is the dangerous case:** a healthy-looking summary of an unhealthy namespace.
+* The JSON schema guaranteed shape at ×0.5 and above, not content. At ×0.35 the model kept producing schema-valid rows forever (Lab 04: schema ≠ correctness; `num_predict` is the only stop).
+* **Status words survive downscaling longer than names.** At ×1 and ×0.75 every status was right while names failed: long, common words are recognizable from a blur; random suffixes aren't.
+
+**Part 3: controls.**
+* **No image:** "Based on the screenshot provided, here are the pods that are in a **CrashLoopBackOff** state: `my-app-7d8b9c4f5-x2k3m` … restarted 3 times …". **It invented an entire screenshot**, with pod names, restart counts and reasons. There's no "no image attached" check anywhere in the path. If an agent's screenshot step fails silently, the model reports on a cluster that doesn't exist.
+* **Blank image:** correct: "the screenshot is completely black … No pods visible". An empty image is handled; a *missing* one isn't.
+* **The real screenshot at native size, as a free-text question:** `x2k4q` **and `x2k4p`**. Only `x2k4q` crash-loops; `x2k4p` is Running. The same image read into the JSON schema had both rows right (×1 above). The filter question ("which pods are in X") merged the two near-identical names. That's the kind of answer that gets the healthy pod deleted.
+
+**Part 4: VRAM** (nvidia-smi, whole GPU; desktop 2,485 MiB before load).
+
+| Point | MiB | Δ vs load |
+|---|---:|---:|
+| After text-only load (4K) | 6,386 | +3,901 over idle |
+| After the first image (256²) | 6,414 | +28 |
+| After 3,984-token images (4K) | 6,740 | +354 |
+| 8K context, after a 4,098-token image | 6,972 | +586 |
+| Back at 4K after Parts 2–3 | 6,450 | +64 |
+
+* **The model costs ≈3.9 GB at 4K with the projector loaded,** close to Lab 02's 3,860 MiB. The projector is loaded at start (`--mmproj`), image or not, but this run can't separate its share: there's no text-only build of the same model to compare.
+* **`ollama ps` says 3.1 GB; nvidia-smi says 3.9 GB.** Under the llama.cpp runner, `ollama ps` doesn't count ≈0.7–0.8 GB. That's about the projector's 675 MB of weights, but this is **not verified**.
+* Large images add ≈350 MiB of compute buffers, and they aren't freed until the model reloads. Peak use was 4,487 MiB over idle: inside the 8,500 MiB ceiling, with room for the 9b test.
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| Tokens = formula + 2; ≤ 4,096 image tokens | ✅ all 15 sizes; 4,098 at 8K for both large images |
+| 2048²/4096² at 4K → HTTP 400 | ✅ |
+| Prompt time ∝ image tokens | ✅ ≈0.4 ms per token |
+| First image after a load takes seconds | ❌ 273 ms. The setup probe's 11.9 s didn't recur after a reload, so it was a **one-time** cost (first image since the Ollama upgrade). The cause is not verified |
+| Text 350–550 tokens, more than the ×1 image | ✅ ≈414 vs 277 |
+| ×2, ×1.5 near-perfect | ✅ 12/12 on all fields |
+| ×1 statuses right, a few names off by one | ✅ 8/12 names, 12/12 statuses |
+| ×0.5/×0.35 invented names; statuses partly right | Worse than predicted: at ×0.5 every problem status was lost; at ×0.35 a runaway invented table |
+| No image: refuse *or* invent | Invented a full screenshot's worth of pods |
+| Blank: "nothing visible" | ✅ |
+| VRAM: +a few hundred MiB for large images; +≈130 MiB at 8K | ✅ +354 MiB; 8K plus the max image +586 |
+
+**What Step 1 teaches:**
+1. **An image is a resolution-priced prompt.** Tokens = pixels / 1,024, clamped to 9–4,096. Content doesn't matter; cropping does.
+2. **Readability needs glyphs that span most of a 32 px token.** Here 24 px text (×1.5) was clean; 16 px lost a third of the names; 8 px lost the problems themselves.
+3. **When the text exists, use it.** It was cheaper than any image that read it correctly, and it was exact.
+4. **Vision errors are plausible inventions, not blanks.** Validate extracted identifiers against a source of truth (`kubectl get pod <name>`) before acting. Never act on a name read from a screenshot.
+5. **Check that the image actually arrived.** The model won't tell you it didn't.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -124,7 +211,10 @@ No runs yet. The probe numbers in §3 are from 2026-10-31 setup checks.
 | HTTP 400 `request (N tokens) exceeds the available context size` with an image | The image's tokens (up to 4,096) + text don't fit `num_ctx`; images aren't truncated | Downscale the image (tokens ≈ w×h / 1,024), or raise `num_ctx` |
 | A large image costs no more than a medium one | Resized down to `image_max_pixels` (2048² equivalent) | Formula in `vision_basics.py`; crop to the region you care about instead |
 | Confident but wrong text from a screenshot | Glyphs smaller than a token patch; the model fills in plausible text | Upscale or crop; prefer the source text |
-| First image request after a load takes ≈10 s | One-time cost on the first image (not yet explained) | Warm up with a small image |
+| The first image request ever took ≈12 s | One-time cost after install or upgrade (not seen again after reloads in run 1; cause not verified) | Ignore after the first run, or warm up with a small image |
+| The answer describes a screenshot you never sent | No image reached the model (empty `images`, a failed capture), and the model invents one | Check `prompt_eval_count`: an image adds ≥ 11 tokens |
+| Two similar pod names merged into one, or a healthy pod reported as failing | Characters smaller than a token patch; filter questions blend near-identical names | Upscale/crop; extract all rows into a schema first, then filter in code; verify names with `kubectl` |
+| JSON output from a tiny image never ends | Runaway invented rows (`payment-db-0 … -30`) until `num_predict` | Cap `num_predict`; reject images below a readable size |
 | Image requests slow or out of memory with a big context | Projector moved to the CPU (`--no-mmproj-offload`) when the text model doesn't fully fit or free VRAM < projector + 1 GiB | `server.log`: `disabling multimodal projector offload` |
 
 ## 7. Cleanup
@@ -140,3 +230,6 @@ Remove-Item -Recurse results\raw\vision-basics-*      # optional: generated imag
 2. Why does an image over the context limit fail with HTTP 400, when an over-long text prompt was cut silently in Lab 03?
 3. Where does the vision encoder's memory show up, and what happens to image requests when the text model only partly fits on the GPU?
 4. Your agent can either take a screenshot of a dashboard or call the metrics API behind it. Give two reasons, beyond cost, to prefer the API.
+5. In run 1, the ×1 screenshot cost fewer tokens than the same table as text, yet text was the better input. Why? At what scale did the image become error-free, and what did it cost then?
+6. At ×0.5 the JSON was valid and every pod looked healthy. Which two safeguards from Labs 04 and 06 would have caught this, and which wouldn't?
+7. The real screenshot read into a schema got both `payments-api` rows right, but "which pods are in CrashLoopBackOff?" on the same image named both. How would you design the extraction so this can't reach an action?
