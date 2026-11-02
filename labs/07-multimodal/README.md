@@ -416,6 +416,76 @@ A chart is a computation already done for the eye; a raw array asks the model to
 4. **The 9b didn't buy accuracy here**, but it cost ≈1.65× prompt time and ≈2.5 GB more VRAM. Pick the model by the failure you need to fix, measured on your own images.
 5. **My predictions failed in the safe direction, but they still failed.** Measure before believing a rule of thumb, including mine.
 
+### Step 3 — runs 1 and 2 (2026-11-02; run 1 `qwen3.5:4b`, run 2 4b + `qwen3.5:9b`; temperature 0, seed 42, `num_ctx` 12,288)
+
+Raw: `results/raw/vision-thinking-20261102-162904/` (4b) and `…-163516/` (4b + 9b), each with every image, `truth.json`, and `answers.json` including the full thinking text.
+
+**0. Reproducible to the byte.** The 4b ran twice, about 6 minutes apart. **All 22 cells were identical**, the answers *and* the thinking text, and the output token counts matched (5,396, 292, 1,077…). Lab 03's result (temperature 0 + seed + the same settings = the same output) holds for the vision path and for thinking.
+
+| Task | Truth | 4b off | 4b steps | 4b think | 9b off | 9b steps | 9b think |
+|---|---|---|---|---|---|---|---|
+| grid-7 | 7 | ❌ 5 | ❌ 4 | ❌ 5 (5,396 tok, 44 s) | ❌ 6 | ❌ 6 | ✅ **7** (2,490, 29 s) |
+| grid-12 | 12 | ❌ 10 | ❌ 9 | no answer (8,000, 65 s) | ❌ 10 | ❌ 9 | ❌ 13 (4,415, 50 s) |
+| grid-19 | 19 | ❌ 12 | ❌ 13 | no answer (8,000, 65 s) | ❌ 14 | ❌ 17 | ❌ 17 (6,452, 74 s) |
+| circles-11 | 11 | ❌ 10 | ❌ 9 | no answer (8,000, 65 s) | ❌ 12 | ❌ 10 | ✅ **11** (3,011, 35 s) |
+| spikes-5 | 5 | ✅ | ✅ | ✅ (292, 3 s) | ✅ | ✅ | ✅ (338, 4 s) |
+| running-12 | 12 | ✅ | ✅ | ✅ (1,077, 9 s) | ❌ 10 | ❌ 13 | ✅ 12 (988, 12 s) |
+| read-x1 (names) | 12 | 8 | – | 9 (998, 8 s) | **11** | – | 11 (1,946, 22 s) |
+| read-x0.75 (names) | 12 | 7 | – | no answer (8,000, 66 s) | 6 | – | no answer (8,000, 93 s) |
+| **Counting right /6** | | 2 | 2 | 2 (+3 no answer) | 1 | 1 | **4** |
+
+**1. Counting many identical objects fails without thinking, and always low.** With thinking off, **all 16** grid and circle answers (off and steps, both models) were wrong, and 15 of them *under*-counted (5 for 7, 12 for 19, 14 for 19). Few, large, separate things were counted right by everything: 5 spikes, and 12 "Running" rows that are a distinct word in a column.
+
+**2. Making the model write its working didn't help; it showed what was wrong.**
+* The "steps" lists had **the wrong number of rows**: 5, 7 and 9 rows from the 4b for grids of 6, 6 and 8 rows.
+* Every total was exactly the sum of its own list: 4b 4, 9, 13; 9b 6, 9, 17.
+* My prediction (at least once, `count` ≠ the sum) was wrong 12/12. The arithmetic was fine; **the perception of the grid's structure was not.**
+* "Writing it out" in one pass doesn't add looking.
+* Still, the list is useful as a check: a 5-entry `red_per_row` for an image you know has 6 rows is detectable as wrong. A bare `10` isn't.
+
+**3. Thinking helped only the model that could finish.**
+* **4b:**
+  * Out of the 4 hard counts it produced one answer, wrong and confident: it checked the grid was 8×6, concluded "Okay, I'm confident. The answer is 5", and the answer was 7.
+  * The other 3 hit the 8,000-token limit after 65 s each, re-scanning the same rows.
+* **9b:**
+  * Finished every counting task by enumerating cells one by one (`R4C8: Red (6)`, `R5C5: Red (7)`).
+  * Got 4/6, vs 1/6 with thinking off.
+  * Its misses were near-misses: on grid-12 its per-row counts were 3, 2, **4**, 0, 1, 3 vs the truth 3, 2, 3, 0, 1, 3.
+* **Both models hit the limit on `read-x0.75`:** too little to read, so thinking had nothing to settle on.
+* **Pattern:** thinking turns a perception task into many small perception tasks. That works when each small look is reliable (the 9b on 50 px squares) and loops when it isn't.
+
+**4. The 9b reads dense text better, at native size only.** This answers Step 2's question 3:
+* At ×1 the 9b got **11/12 names** (one: `zzkd` for `zz9kd`), against the 4b's 8/12, in both modes.
+* At ×0.75 the 9b got 6/12, no better than the 4b's 7.
+* The bigger projector helps when the glyphs are *almost* readable. Below that, resolution wins over model size.
+* Thinking added at most one name (the 4b's 8 → 9).
+
+**5. Cost.**
+* A thinking answer took 3–93 s, against ≈1 s with thinking off.
+* The 4b spent **≈4.5 minutes of GPU time on four runs that returned nothing.**
+* With `num_ctx` 12,288, `ollama ps` showed 3.5 GB (4b) and 5.9 GB (9b), both 100% GPU.
+* The budget matters as much as the switch. An agent that calls a thinking vision model needs `num_predict`, a timeout, and a plan for "no answer".
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| off: grids off by 1–3 | Off by 1–7, all under; 12 for 19 |
+| off: spikes ✅; circles / running off by 1–2 | Spikes ✅; circles −1 (4b) / +1 (9b); running ✅ 4b, −2 9b |
+| steps: per-row mostly right, totals right or −1 | ❌ wrong row counts; totals 1–6 below the truth; worse than off for the 4b on 3 of 4 tasks |
+| steps: at least once `count` ≠ the sum of its list | ❌ 0 of 12: always consistent, consistently wrong |
+| think: 4b hits the limit on ≥ half the counting tasks | ✅ 3 of 6 (and 1 of 2 reading tasks) |
+| think: when it finishes, more often right | 4b: no (1 wrong of 1 hard count). 9b: yes (4/6 vs 1/6) |
+| think doesn't fix names | ✅ +1 name at most |
+| 9b finishes thinking more often | ✅ 7/8 (all counting tasks) vs 4b 4/8 |
+
+**What Step 3 teaches:**
+1. **Don't ask a vision model to count.** Get the count from the source (`kubectl get pods --field-selector=status.phase=Running -o name | wc -l`, a PromQL `count`), and use the image only for what has no API.
+2. **When you must count from an image:** use the larger model with thinking, a token budget, and a timeout. Even then, 2 of 6 counts were wrong.
+3. **A forced enumeration is a check, not a fix.** It exposes structural errors (the wrong number of rows) that a bare number hides.
+4. **Thinking can't add pixels.** It helps when each small look is reliable, and it loops when the image is the limit.
+5. **The same inputs give the same outputs, thinking included,** so a wrong answer at temperature 0 is reproducible. You can debug and regression-test it.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Cause | Check / fix |
@@ -429,6 +499,8 @@ A chart is a computation already done for the eye; a raw array asks the model to
 | A model's string answer contains JSON (`{"count": 3}`) | The schema only says `string`; the 9b nests objects in it | Type the field (`integer`), or parse defensively; don't take the first number in the string |
 | Wrong times or maxima from a time series passed as raw numbers | The model must count positions or scan a long array | Compute aggregates in code or with a query; give the model the result |
 | `ollama ps` SIZE is ≈1 GB below nvidia-smi for vision models | Not explained (more than the projector alone); also, `ollama ps` uses decimal GB | Budget VRAM from nvidia-smi |
+| Thinking request returns an empty `content` after a minute | `done_reason: length`: thinking re-verified until `num_predict` (4b counting, any model on an unreadable image) | Check `done_reason`; budget and time out; fall back to think off or the source data |
+| Counts from an image are consistently low | Undercounting identical objects (16/16 wrong, 15 low, with thinking off) | Don't count from images; if you must, the 9b with thinking, and check a per-row list against the known structure |
 | JSON output from a tiny image never ends | Runaway invented rows (`payment-db-0 … -30`) until `num_predict` | Cap `num_predict`; reject images below a readable size |
 | Image requests slow or out of memory with a big context | Projector moved to the CPU (`--no-mmproj-offload`) when the text model doesn't fully fit or free VRAM < projector + 1 GiB | `server.log`: `disabling multimodal projector offload` |
 
@@ -451,3 +523,5 @@ Remove-Item -Recurse results\raw\vision-basics-*      # optional: generated imag
 8. In Step 2 both models found the 80% crossing time exactly from the chart but not from the same data as JSON. Why, and what would you give an agent instead of either?
 9. Step 1's kubectl screenshot and Step 2's dashboard both used 14–16 px text. Why was one read badly and the other almost perfectly?
 10. The 9b used ≈2.5 GB more VRAM and ≈1.65× more prompt time for the same 18/19. What result would justify switching to it?
+11. In Step 3 the "steps" totals always equalled the sum of the model's own per-row list, and were still wrong. What does that tell you about where the error is, and how could you use the list to catch it?
+12. Thinking took the 9b from 1/6 to 4/6 on counting but took the 4b from 2/6 to 2/6 with 3 empty answers. What property of the task and the model decides whether thinking helps?
