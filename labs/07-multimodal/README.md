@@ -107,9 +107,87 @@ Output: the report on screen and in `results\raw\vision-basics-<stamp>\report.md
 
 **Questions to keep in mind:** which is the better input for an agent, a screenshot of `kubectl get pods` or `kubectl get pods -o json`? What does Part 2 say about using a small vision model to read a Grafana panel's numbers?
 
+### Step 2 — A dashboard and a diagram, scored; 4b vs 9b
+
+**What we're learning.** Step 1 was text in a picture. Real screenshots are **charts, colours, layout and arrows**, where the model must map a yellow line to a legend entry, read a value off an axis, or follow an arrow to its target. Three questions:
+* Which kinds of visual question does a small model get right?
+* Does the bigger model (and its bigger projector) help?
+* When it's wrong, is it the **seeing** or the **reasoning**?
+
+The third question is answered by asking the same questions about the same facts as text, as Lab 05 split retrieval errors from reader errors.
+
+**Verified before the run (2026-11-02):**
+* **`qwen3.5:9b` uses the same image token rule.** `server.log` shows the same `patch_size 16`, `n_merge 2` and pixel limits; 1280×720 → 882 extra tokens with both models.
+* **Its projector is bigger** (456M vs 333.5M parameters), so encoding is slower: the probe took 3,272 ms vs 1,308 ms for 3,138 image tokens.
+* **9b VRAM:** 9,230 MiB on the GPU after a 3,138-token image (6,745 over idle): within the ceiling, ≈1 GB from full. `ollama ps` showed 5.6 GB.
+* **The script stops the 4b before loading the 9b:** both together (≈10.6 GB) would overflow the GPU.
+* **Smoke test** (4b, before the run; disclosed because it's part of the results):
+  * d1 → "4.7%" ✅;
+  * d12 → "not shown" ✅;
+  * d6 from the *text* → "14:36" (truth 14:35; passes the ±3-minute tolerance).
+* **Cost:**
+  * a dashboard question with the image = 932 prompt tokens;
+  * with the JSON = 1,098 prompt tokens;
+  * so **the image is again the cheaper input**, as in Step 1.
+
+**Images** (synthetic, 1280×720, drawn by the script; ground truth from the drawing code):
+* **dashboard:**
+  * 4 stat panels: Error rate 4.7% (red), p95 812 ms and Pods ready 9/12 (yellow), Requests/s 1,240 (green);
+  * a CPU time series, 14:00–15:00, 3 pods, with a dashed 80% threshold. `payments-api-b` first goes above it at 14:35 and peaks at 96% at 14:42; `payments-worker` rises from 20 to 55;
+  * a memory gauge at 87%;
+  * a 5xx table (`/v1/refund` 311);
+  * an alert "firing since 14:41".
+* **diagram:**
+  * 4 namespaces (edge, payments, data, messaging);
+  * ingress → Service → **3** Pods;
+  * a red dashed arrow labelled "5432 connection refused" to `payments-db`;
+  * Pods → `redis-cache` (6379) and → `kafka` (produce); kafka → `payments-worker` (consume);
+  * **no PostgreSQL version anywhere.**
+
+**Questions.** 19 in all, one per request, answered in a `{"answer": string}` schema. The instruction allows "not shown".
+
+| Kind | Questions |
+|---|---|
+| Large text | d1 error rate, d2 p95, d3 pods ready, d9 gauge |
+| Colour | d4 which stat panel is red |
+| Small text, table lookup | d10 `/v1/refund` 5xx count, d11 alert time |
+| Chart reading | d5 which pod crosses 80% (colour → legend), d6 when (axis, ±3 min), d7 its peak (±4), d8 worker trend |
+| Diagram structure | t1 ingress target, t2 count the Pods, t3 the failing link's target, t4 redis-cache's namespace, t5 what the worker consumes from, t6 all Pod targets (a set) |
+| Not in the image | d12 disk usage, t7 PostgreSQL version: the answer must be "not shown" |
+
+**Three inputs per question:**
+* **image**: the full image.
+* **crop**: the CPU panel only, cropped and upscaled ×2 (1680×620, ≈988 tokens). Chart questions only. Step 1 showed that resolution is the limit, and this checks whether that holds for charts.
+* **text**: the same facts as JSON (dashboard: every series value per minute) or as an edge list (diagram). This is vision-free: it shows the reasoning ceiling.
+
+```powershell
+.\.venv\Scripts\python scripts\vision_dashboard.py --images     # optional: draw the images only, and look at them
+.\.venv\Scripts\python scripts\vision_dashboard.py              # ≈4 minutes: 4b, then 9b
+```
+
+Output: `results\raw\vision-dashboard-<stamp>\`, containing the report, the three images, the text versions (`dashboard.json`, `diagram.txt`) and every answer (`answers.json`). The script runs ≈60 requests per model. While the 9b runs, check `ollama ps` once: it should say `100% GPU`.
+
+**Predictions:**
+
+| Measure | 4b | 9b | Why |
+|---|---|---|---|
+| Large text (d1–d3, d9), colour (d4) | 5/5 | 5/5 | 44 px digits; Step 1: large glyphs are reliable |
+| Small text (d10, d11) | right | right | 14–16 px digits in a row; Step 1's errors were in random letter strings, not short numbers |
+| d5 which pod crosses | coin flip on the full image, ✅ on the crop | ✅ | Needs colour → legend matching on 14 px labels |
+| d6 crossing time | ❌ image (expect "14:30", where the rise starts), maybe ✅ on the crop | maybe ✅ on the crop | Interpolating between axis ticks is the hardest visual task here |
+| d7 peak | ±4 on half of the inputs | similar | Between gridlines 75 and 100; "100" or "95" both likely |
+| d8 trend | ✅ | ✅ | A slope is visible at any resolution |
+| Diagram t1–t3 | ✅ | ✅ | Large labels; red dashed is salient |
+| t4 namespace, t5 direction | one wrong | ✅ | Containment and arrowheads are spatial, not text |
+| t6 set of targets | ❌ (misses one or adds the worker) | ✅ | Multi-edge enumeration |
+| "Not shown" (d12, t7) | d12 ✅ (seen); t7: may invent a version ("PostgreSQL 15") | ✅ | "PostgreSQL" is written, and a version is one guess away |
+| **Text input** | 18–19/19 | 19/19 | No vision; d6 ±1 minute (the smoke test said 14:36) |
+| **Image total** | ≈13–15/19 | ≈16–18/19 | |
+| Prompt time per image question | ≈0.4 s | ≈0.9 s | Probe ratio |
+| VRAM, 9b peak | – | ≈9.0 GB GPU total (≈6.5 GB over idle) | Probe 9,230 MiB with a 3× larger image |
+
 ### Later steps (planned)
 
-* **Step 2 — A dashboard and a diagram, with ground truth:** a synthetic Grafana-style panel (series values, thresholds, trend, legend) and a Kubernetes topology diagram, scored question by question; then `qwen3.5:9b` (bigger projector) on the same images, within the 8.5 GB ceiling.
 * **Step 3 — Thinking and counting:** does thinking help reading and counting (pods, nodes, spikes), or only add tokens?
 * **Step 4 — Prompt injection through pixels:** instructions written *inside* an image (a log line in a screenshot, a sticky note on a diagram) given to Lab 06's agent. Does the image channel bypass the hardened system prompt?
 
