@@ -119,7 +119,78 @@ Output: `results\raw\container-ollama-<stamp>\` with `report.md` and `data.json`
 
 ## 5. Hypotheses → Observed Metrics
 
-*(Filled in after each run.)*
+### Step 1 — runs 1 and 2 (2026-11-04, `qwen3.5:4b`, temperature 0, seed 42, think off; run 2 with `--contend`)
+
+Runs: `container-ollama-20261104-124536` and `…-133051`. Afterwards I ran three follow-up probes by hand: the CUDA kernel cache, reachability from the LAN address, and Windows tok/s in each Part D state (5 samples each).
+
+**1. The port is the access control, and it held.**
+* `PortBindings` was `{'11434/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '11435'}]}`, while inside the container `OLLAMA_HOST=0.0.0.0:11434`.
+* The Windows-side listener is `127.0.0.1:11436`, owned by `com.docker.backend`, not by a container process.
+* Connecting to the machine's Wi-Fi address (`10.0.0.202`) was **refused** on both 11434 (Windows Ollama) and 11436 (the container). Connecting to `127.0.0.1` answered.
+* **Tooling caveat:** `netstat -ano` didn't list Docker's listener at all, so run 1's "listening" list was empty. Later in the session it stopped listing Ollama's own listener too, and `Get-NetTCPConnection` reported that one with state `0`. The cause is not known; this is a Windows 11 build 26300 machine. The script now checks reachability by connecting to the LAN address instead of reading listener tables.
+
+**2. Storage decides the cold start.** Both runs:
+
+| backend | first request in a new container (load / wall) | reloads 2–3 (load) | copy / start |
+|---|---|---:|---|
+| windows | 5.4–8.3 s / 6.3–9.3 s | 4.05–4.47 s | – |
+| bind (9p, read-only) | 65.7–68.0 s / 108–109 s | 25.4–27.1 s | `docker run` → API 5.2–7.6 s; `docker restart` → API 4.1–4.4 s, 6 models listed |
+| volume (ext4) | 42.6–48.9 s / 85–94 s | **2.85–3.16 s** | copy 3.32 GB in 21.1–21.4 s (155–158 MB/s); `docker run` → API 3.6–3.9 s |
+
+* **Every reload from the bind mount re-reads 3.3 GB across the VM boundary** (≈130 MB/s). From the volume it's faster than native Windows. The VM's page cache keeps the file, and the VM has 31 GiB of RAM to do it.
+* Copying into the volume took one 21 s read, and it pays back after the first reload.
+
+**3. A new container pays ≈80–90 s once, whatever the storage.** That's the first-request wall time minus a normal reload. The first long prompt also ran at 2.0–2.3K tok/s instead of ≈6K. The follow-up probe showed why:
+* the container's `/root/.nv/ComputeCache` is empty at start (4 KB);
+* it holds **78 MB after the first request**: the CUDA driver compiles GPU kernels on first use;
+* after a `docker restart`, which keeps the container's filesystem, the first request took **2.7 s load / 3.9 s wall**.
+
+So the cost is tied to the container's writable layer. Every `docker rm` + `run`, every new image version, and every rescheduled pod pays it again. Windows keeps its own cache across restarts, so it doesn't pay this.
+
+**4. Speed: generation 18–20% slower in a container; prompt processing the same.**
+
+| backend | gen tok/s, run 1 / run 2 (median of 5, 256 tokens) | prompt tok/s, run 1 / run 2 (median of 3, ≈1.5K tokens) | VRAM Δ per load |
+|---|---:|---:|---:|
+| windows | 118.4 / 120.9 | 5,859 / 6,115 | 3,818 / 3,901 MiB |
+| bind | 97.3 / 96.8 | 5,951 / 5,727 | 3,901 / 3,899 MiB |
+| volume | 96.2 / 97.0 | 6,035 / 5,969 | 3,901 / 3,900 MiB |
+
+* **bind = volume:** storage doesn't matter once the weights are on the GPU.
+* **Prompt processing is within ±5% of Windows, and generation isn't.** Processing a prompt is a few large batched GPU operations. Generating is one small step per token, so a fixed overhead per GPU call shows up there and not in prefill. That pattern fits a per-call cost on the `/dev/dxg` path into the Windows driver. It's a hypothesis: the two llama.cpp builds also differ, and I haven't separated the two causes.
+* **All three backends gave byte-identical text** on the short prompt, and the same answers to the long one (`3, 3, 13`). Those long-prompt answers are also wrong: the true count is 6. That's Lab 07 Step 3's counting failure again, in text this time.
+* `/api/ps` said 2,995 MiB on all three, against ≈3,900 measured. It's the same gap as in Lab 07, and the container didn't change it.
+* **Container RAM:** bind 2.7–3.2 GiB, volume 770 MiB (`docker stats`), with the weights in VRAM in both cases. The likely reason is that the bind-mounted file's pages are charged to the container. That's not verified.
+
+**5. Two instances on one GPU: memory adds up, and neither instance knows about the other.**
+* GPU memory went idle 2,203 → Windows 4b **6,104** → plus the container's embedding model **7,017 MiB** (run 2: 2,061 → 5,964 → 6,875). That's +3,901 and +913. Both instances reported 100% GPU (`size == size_vram`).
+* **Windows tok/s didn't change.** The script's single sample said 94.9 and 104.8 tok/s, which looked like a 12–20% drop. The follow-up probe, 5 samples per state, gave medians of **119.0** (no container), **118.8** (container idle), **119.4** (container + embedding model), 118.3 (unloaded) and 120.3 (removed). The first request after a change was sometimes 101–106. The script now takes the median of 5.
+* **`--contend`** (the 4b in both instances) put **9,730 MiB in use, 510 MiB free**. Both instances still said 100% GPU, and nothing failed or warned. The container planned its load using whatever was free after Windows' allocation. The container's 4b generated 74.9 tok/s and Windows 106.1, but those are single samples, not a measured slowdown.
+* On a 10 GB card that's a working configuration with no headroom: one longer context in either instance would spill. **No scheduler, kernel or Kubernetes object accounts for this.**
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| A: `127.0.0.1` only, owned by Docker's backend | ✅ (and refused on the LAN address); ❌ `netstat` couldn't show it |
+| B: reload windows 3–7 s / bind 20–30 s / volume 2–6 s | ✅ 4.1–4.5 / 25.4–27.1 / 2.9–3.2 s |
+| B: copy 20–40 s | ✅ 21 s (156 MB/s) |
+| B: `docker run` → API 3–6 s | ✅ 3.6–5.2 s, one 7.6 s |
+| B: restart keeps the models | ✅ 6 listed, nothing downloaded |
+| (not predicted) | ❌ first request in a new container: +80–90 s, the CUDA kernel cache |
+| VRAM Δ ≈3,850 ± 50 on all three | ✅ 3,818–3,901 |
+| C: containers 15–20% slower; bind = volume | ✅ 18–20%; bind = volume |
+| C: prompt eval lower in containers | ❌ the same within ±5% |
+| C: identical text (low confidence) | ✅ byte-identical |
+| D: +3,850 then +600–900, both 100% GPU | ✅ +3,901, +911–913 |
+| D: Windows tok/s unchanged | ✅ medians 118–120 (the script's single sample said otherwise) |
+
+**What Step 1 teaches:**
+1. **On Docker Desktop, the GPU needs only `--gpus=all`.** The container gets `/dev/dxg` and the host's driver files, and the CUDA stack and VRAM look the same as on Windows.
+2. **Put the weights inside the VM.** A named volume reloaded in ≈3 s, against ≈26 s through a bind mount. In Kubernetes terms: a node-local PVC or a pre-pulled cache beats a network share on every reschedule.
+3. **Cold start = reading the weights + compiling GPU kernels.** The kernel cache lives in the container's writable layer. Persist `/root/.nv` (a volume), or warm up before taking traffic. A readiness probe on `/api/version` would say "ready" ≈90 s too early.
+4. **The port, not Ollama, is the access control.** Ollama listens on every interface inside the container, so `-p 127.0.0.1:…` is what kept it off the LAN. Verify by connecting from the LAN address; listener tables can be wrong.
+5. **VRAM is shared without any accounting.** Two instances filled the card to 510 MiB free without a warning. Budget VRAM per node by hand, and expect the same in Kubernetes: `nvidia.com/gpu: 1` hands out whole devices and doesn't track memory.
+6. **Measure speed with several samples.** One request after a state change was up to 15% slow, and a single sample turned that into a false finding.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -130,6 +201,11 @@ Output: `results\raw\container-ollama-<stamp>\` with `report.md` and `data.json`
 | The first load in a container takes minutes | The weights are read across the VM boundary (9p bind mount) | Copy them into a named volume, or accept a one-time cost |
 | A container can reach Ollama but the LAN can too | `-p 11434:11434` publishes on every interface | Always `-p 127.0.0.1:<port>:11434`; check with `netstat -ano` for `LISTENING` |
 | Blobs disappear from the Windows store | A container with a **read-write** mount pruned them as "unused" on start | Mount the shared store `:ro`; one writer per store |
+| The first request in a new container takes ≈90 s; restarts are fast | The CUDA driver compiles kernels into `/root/.nv/ComputeCache` (empty → 78 MB) inside the container's writable layer | Mount a volume at `/root/.nv`, or send a warm-up request before marking the pod ready |
+| Generation 18–20% slower in a container than native, prompt eval the same | Per-token overhead on the container's GPU path (hypothesis: `/dev/dxg` GPU-PV, or the different build) | Expect it on Docker Desktop; compare on a native Linux host before blaming Ollama |
+| `netstat -ano` shows nothing on a published port that answers | Listener tables mis-reported on this Windows build (Docker's backend missing; Ollama's state `0`) | Test reachability: connect from the LAN address, not only `127.0.0.1` |
+| Two instances both say 100% GPU and the card is nearly full | Each instance plans with the free VRAM it sees; nothing coordinates them | Budget per GPU by hand; leave headroom for context growth |
+| A tok/s figure 10–20% off from one request | The first request after a load or state change is sometimes slow | Median of ≥5 requests |
 | `docker run --entrypoint /bin/ollama …` fails from Git Bash | Git Bash rewrites `/bin/ollama` to `C:/Program Files/Git/bin/ollama` | `MSYS_NO_PATHCONV=1`, or use PowerShell |
 
 ## 7. Cleanup
@@ -149,3 +225,6 @@ Docker Desktop can stay running or be quit from the tray. Nothing in this lab ch
 2. Why can't the container see the GPU without `--gpus=all`, and what does it get when you add the flag?
 3. Why does a reload take ≈26 s from the bind mount, but only seconds from a named volume or on Windows? Which of those numbers matters for a Kubernetes pod that's rescheduled?
 4. Why must a model store shared by two Ollama instances be mounted read-only in at least one of them?
+5. A new container's first request took ≈90 s, and after `docker restart` it took 4 s. Where did the time go, and how would you make a rescheduled Kubernetes pod avoid it?
+6. Generation was 18–20% slower in the container but prompt processing wasn't. What does that pattern suggest about where the overhead is?
+7. With both instances holding the 4b, the GPU had 510 MiB free and both still said 100% GPU. What would happen if one of them got a 32K-context request, and what in Kubernetes would have prevented this?

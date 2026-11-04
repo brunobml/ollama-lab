@@ -89,6 +89,22 @@ def loaded(backend):
              'ctx': m.get('context_length')} for m in httpx.get(url(backend, '/api/ps'), timeout=5).json()['models']]
 
 
+def lan_ip():
+    """IPv4 address of the interface with the default route (the address the LAN sees)."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
+        sk.connect(('192.0.2.1', 9))                 # TEST-NET-1: no packet is sent for a UDP connect
+        return sk.getsockname()[0]
+
+
+def reachable(host, port):
+    try:
+        httpx.get(f'http://{host}:{port}/api/version', timeout=3)
+        return True
+    except httpx.HTTPError:
+        return False
+
+
 def long_prompt(i):
     # ≈1,500 tokens of log lines; the run index up front defeats the prompt (prefix) cache between runs
     lines = ''.join(LOG_LINE.format(s % 60, 9000 + s, 20 + s % 37) for s in range(60))
@@ -178,12 +194,13 @@ say('\n## A. Exposure\n')
 data['exposure'] = {
     'port_bindings': json.loads(docker('inspect', '-f', '{{json .HostConfig.PortBindings}}', name)),
     'ollama_host_in_container': docker('exec', name, 'printenv', 'OLLAMA_HOST'),
-    'listening': [l.split() for l in subprocess.run(['netstat', '-ano', '-p', 'TCP'], capture_output=True,
-                  text=True).stdout.splitlines() if 'LISTENING' in l and any(f':{p} ' in l for p in PORTS.values())]}
+    # netstat -ano and Get-NetTCPConnection both mis-listed listeners on this Windows build (runs 1-2); the test
+    # that answers "who can reach it" is a connection attempt to the machine's own LAN address
+    'reachable': {f'{host}:{p}': reachable(host, p) for host in ('127.0.0.1', lan_ip()) for p in (11434, 11435)}}
 say(f'* PortBindings: {data["exposure"]["port_bindings"]}')
 say(f'* OLLAMA_HOST inside the container: {data["exposure"]["ollama_host_in_container"]}')
-for l in data['exposure']['listening']:
-    say(f'* Windows LISTENING: {l[1]} (pid {l[-1]})')
+for target, ok in data['exposure']['reachable'].items():
+    say(f'* connect to {target}: {"answers" if ok else "refused / no answer"}')
 
 # ---------------------------------------------------------------- D: two instances on one GPU
 say('\n## D. Two Ollama instances on one GPU\n')
@@ -193,7 +210,9 @@ d['after_windows_4b_mib'] = vram()
 httpx.post(url('bind', '/api/embed'), json={'model': SMALL, 'input': 'kubectl rollout status'}, timeout=300)
 d['after_container_embed_mib'] = vram()
 d['windows_ps'], d['bind_ps'] = loaded('windows'), loaded('bind')
-d['windows_gen_tps_both_loaded'] = generate('windows', SHORT, num_predict=256)['gen_tps']
+# median of 5: the first request after a change is sometimes 10-15% slower (a single sample misled runs 1-2)
+d['windows_gen_tps_both_loaded'] = statistics.median(generate('windows', SHORT, num_predict=256)['gen_tps']
+                                                     for _ in range(5))
 if args.contend:
     say('* --contend: loading the 4b in the container as well (announced overflow past the 8,500 MiB ceiling)')
     g = generate('bind', SHORT, num_predict=256)
