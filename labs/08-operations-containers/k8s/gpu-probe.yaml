@@ -1,0 +1,56 @@
+# Lab 08 Step 2, Part B: can a pod use the GPU with no device plugin?
+# Both pods mount what Docker injected into the k3d node (started with --gpus all): the paravirtualized GPU device
+# /dev/dxg, the driver libraries (Docker puts them in the node's /usr/lib64) and nvidia-smi. Only the
+# securityContext differs. Each pod prints what it can do and exits.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-probe-unprivileged
+  labels: {app: gpu-probe}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: debian:bookworm-slim
+    imagePullPolicy: Never
+    command: [sh, -c]
+    args:
+    - 'echo "devices in /dev: $(ls /dev | wc -l)"; grep CapEff /proc/self/status;
+       LD_LIBRARY_PATH=/host-gpu-lib /host-smi --query-gpu=name,memory.used --format=csv,noheader'
+    volumeMounts:
+    - {name: dxg, mountPath: /dev/dxg}
+    - {name: gpulib, mountPath: /host-gpu-lib, readOnly: true}
+    - {name: wsl, mountPath: /usr/lib/wsl, readOnly: true}
+    - {name: smi, mountPath: /host-smi, readOnly: true}
+  volumes:
+  - {name: dxg, hostPath: {path: /dev/dxg, type: CharDevice}}
+  - {name: gpulib, hostPath: {path: /usr/lib64, type: Directory}}
+  - {name: wsl, hostPath: {path: /usr/lib/wsl, type: Directory}}
+  - {name: smi, hostPath: {path: /usr/bin/nvidia-smi, type: File}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-probe-privileged
+  labels: {app: gpu-probe}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: debian:bookworm-slim
+    imagePullPolicy: Never
+    command: [sh, -c]
+    args:
+    - 'echo "devices in /dev: $(ls /dev | wc -l)"; grep CapEff /proc/self/status;
+       LD_LIBRARY_PATH=/host-gpu-lib /host-smi --query-gpu=name,memory.used --format=csv,noheader'
+    securityContext: {privileged: true}
+    volumeMounts:
+    - {name: dxg, mountPath: /dev/dxg}
+    - {name: gpulib, mountPath: /host-gpu-lib, readOnly: true}
+    - {name: wsl, mountPath: /usr/lib/wsl, readOnly: true}
+    - {name: smi, mountPath: /host-smi, readOnly: true}
+  volumes:
+  - {name: dxg, hostPath: {path: /dev/dxg, type: CharDevice}}
+  - {name: gpulib, hostPath: {path: /usr/lib64, type: Directory}}
+  - {name: wsl, hostPath: {path: /usr/lib/wsl, type: Directory}}
+  - {name: smi, hostPath: {path: /usr/bin/nvidia-smi, type: File}}

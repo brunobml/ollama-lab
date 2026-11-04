@@ -1,0 +1,44 @@
+# Lab 08 Step 2: Ollama on k3d with the GPU and NO device plugin.
+# The GPU reaches the pod only through hostPath mounts of what Docker injected into the node, and only because the
+# pod is privileged (an unprivileged pod gets "GPU access blocked by the operating system", Part B). Consequences
+# this step measures: the node advertises no nvidia.com/gpu, so the scheduler can't count or limit GPU pods.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  labels: {app: ollama}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # a RollingUpdate would start the new pod (and its model) before the old one is gone
+  selector: {matchLabels: {app: ollama}}
+  template:
+    metadata:
+      labels: {app: ollama}
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:0.40.13
+        imagePullPolicy: Never              # imported with `k3d image import`; nothing is pulled
+        ports: [{containerPort: 11434}]
+        securityContext: {privileged: true}  # required for /dev/dxg without a device plugin
+        readinessProbe:                      # answers within seconds; says nothing about the model (Part C)
+          httpGet: {path: /api/version, port: 11434}
+          periodSeconds: 2
+        volumeMounts:
+        - {name: dxg, mountPath: /dev/dxg}
+        - {name: gpulib, mountPath: /usr/local/nvidia/lib64, readOnly: true}   # on the image's LD_LIBRARY_PATH
+        - {name: wsl, mountPath: /usr/lib/wsl, readOnly: true}
+        - {name: models, mountPath: /root/.ollama/models}   # read-write: Ollama migrates and prunes the store on start
+      volumes:
+      - {name: dxg, hostPath: {path: /dev/dxg, type: CharDevice}}
+      - {name: gpulib, hostPath: {path: /usr/lib64, type: Directory}}
+      - {name: wsl, hostPath: {path: /usr/lib/wsl, type: Directory}}
+      - {name: models, hostPath: {path: /var/lib/ollama-models, type: Directory}}   # the named volume, mounted into the node
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+spec:
+  selector: {app: ollama}
+  ports: [{port: 11434, targetPort: 11434}]

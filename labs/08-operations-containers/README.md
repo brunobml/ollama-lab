@@ -117,6 +117,49 @@ Output: `results\raw\container-ollama-<stamp>\` with `report.md` and `data.json`
 | D: VRAM | +≈3,850 (Windows 4b), then +600–900 (embedding in the container); both `size == size_vram` (100% GPU) | Each instance sees only what's free when it loads |
 | D: Windows tok/s with both loaded | unchanged (±3%) | The embedding model sits idle; memory, not compute, is shared |
 
+### Step 2 — Kubernetes (k3d) with the GPU, and no device plugin
+
+**What we're learning:** what it takes to give a pod a GPU, and what Kubernetes stops knowing when you take a shortcut. This is the RoadMap's open "kind vs k3s" decision, settled by measurement:
+* **kind** has no way to pass `--gpus` to its node containers (`kind create cluster --help` has no GPU option; NVIDIA's nvkind wrapper needs the NVIDIA Container Toolkit, community-tested only on Docker Desktop);
+* **k3d** (k3s in Docker) has `--gpus all`, which Docker forwards to the node container. **D-15: k3d.**
+
+**Verified before the run (2026-11-04, probe cluster created and deleted):**
+* **The node gets the GPU, Kubernetes doesn't.** In the node: `/dev/dxg`, the driver libraries in `/usr/lib64` (Docker picks the image's library directory; `/usr/lib/x86_64-linux-gnu` in Debian), and `nvidia-smi`. `nvidia-smi` can't run in the node itself, because the k3s image has no glibc. There's no NVIDIA runtime in containerd, and the node's allocatable has **no `nvidia.com/gpu`**.
+* **No device plugin means privileged.** A pod that mounts `/dev/dxg` and the libraries with `hostPath` gets `Failed to initialize NVML: GPU access blocked by the operating system` (the device cgroup). The same pod with `privileged: true` prints `NVIDIA GeForce RTX 3080`. Privileged widens access from 17 to 186 devices in `/dev` and gives every Linux capability (`CapEff 000001ffffffffff`, against `00000000a80425fb`): it's root on the node.
+* **Ollama runs that way.** The node's `/usr/lib64` is mounted at `/usr/local/nvidia/lib64`, which is already on the image's `LD_LIBRARY_PATH`. The pod reports `library=CUDA … RTX 3080` and generates at 97.6 tok/s, the same as the Docker container in Step 1.
+* **Ollama writes to its store when it starts.** With the volume read-only the pod crash-looped: `Error: remove /root/.ollama/models/manifests-v2: read-only file system`. The Windows store has already been migrated to the `manifests-v2` layout, but Step 1's copy took only the old `manifests/`. The pod is the volume's single writer.
+* **Ready ≠ able to answer:** the readiness probe on `/api/version` passed after 5.6 s, and the first answer came 84 s later.
+* NVIDIA's device plugin has had a WSL mode since v0.19.1 ("report a single 'all' device to kubelet"; latest v0.20.1). It still needs a runtime or CDI to inject the device into pods. That's Step 3, after this step shows what it would add.
+
+**What runs** (`scripts/k8s_ollama.py`, manifests in `k8s/`):
+* **The cluster:** `ollama-lab`, 1 server, `rancher/k3s:v1.36.4-k3s1` (cached), `--gpus all`, API on `127.0.0.1:6445`, Step 1's volume mounted into the node, and its own kubeconfig file. Your kubeconfigs and the `argolab` cluster aren't touched. The images go in with `k3d image import`, so nothing is pulled.
+* **A. The cluster:** create and import times, the API binding, what the node advertises.
+* **B. GPU without a device plugin:** `k8s/gpu-probe.yaml`, unprivileged vs privileged.
+* **C. Ollama Deployment:** `k8s/ollama.yaml`, privileged, `strategy: Recreate`, the model store on `hostPath`. Measured:
+  * pod Ready vs first answer;
+  * warm speed;
+  * deleting the pod (a stand-in for a reschedule), then the same with a node-local `hostPath` for `/root/.nv`, the CUDA kernel cache from Step 1.
+* **D. `replicas: 2`:** where they land and whether both get the GPU. `--contend` also loads the 4b in both (overflow, announced).
+
+```powershell
+.\.venv\Scripts\python scripts\k8s_ollama.py              # ≈10–12 min; deletes the cluster at the end
+.\.venv\Scripts\python scripts\k8s_ollama.py --contend    # optional: both replicas load the 4b (past 8,500 MiB)
+.\.venv\Scripts\python scripts\k8s_ollama.py --keep       # optional: keep the cluster to explore (§7 deletes it)
+```
+
+**Predictions** (A, B and pod 1 were already seen in the smoke run, `k8s-ollama-20261104-150213`):
+
+| Measure | Prediction | Why |
+|---|---|---|
+| A | create 10–15 s; import 120–150 s; API `127.0.0.1:6445`; no `nvidia.com/gpu` | Smoke run: 11.3 s, 128 s |
+| B | unprivileged blocked; privileged works (17 vs 186 devices) | Smoke run |
+| C pod 1 | Ready ≈5 s; first answer 85–100 s; warm ≈97 tok/s; +≈3,900 MiB | Step 1: a new container compiles its CUDA kernels |
+| C pod 2 (pod deleted, no cache) | first answer 85–100 s again | The cache lives in the pod's writable layer, which is gone |
+| C pod 3 (empty cache volume) | 85–100 s | Nothing cached yet |
+| C pod 4 (pod deleted, cache on the node) | first answer ≤ 10 s | Step 1: a restart with the cache took 3.9 s |
+| D | both replicas Running on the one node, both see `/dev/dxg`; nothing Pending | Nothing tells the scheduler a GPU is involved |
+| D `--contend` | the second load succeeds; ≈9.7 GB used | Step 1: each instance plans with what's free |
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 — runs 1 and 2 (2026-11-04, `qwen3.5:4b`, temperature 0, seed 42, think off; run 2 with `--contend`)
@@ -206,11 +249,17 @@ So the cost is tied to the container's writable layer. Every `docker rm` + `run`
 | `netstat -ano` shows nothing on a published port that answers | Listener tables mis-reported on this Windows build (Docker's backend missing; Ollama's state `0`) | Test reachability: connect from the LAN address, not only `127.0.0.1` |
 | Two instances both say 100% GPU and the card is nearly full | Each instance plans with the free VRAM it sees; nothing coordinates them | Budget per GPU by hand; leave headroom for context growth |
 | A tok/s figure 10–20% off from one request | The first request after a load or state change is sometimes slow | Median of ≥5 requests |
+| Pod: `Failed to initialize NVML: GPU access blocked by the operating system` | `/dev/dxg` mounted by `hostPath` but the device cgroup denies it | `privileged: true` (root on the node), or a device plugin that injects the device (Step 3) |
+| Pod CrashLoopBackOff: `remove /root/.ollama/models/manifests-v2: read-only file system` | Ollama migrates/prunes its store on start | Give the store one read-write owner, or mount a store already in the `manifests-v2` layout |
+| Pod Ready in seconds, first answer after ≈90 s | The readiness probe checks the HTTP server, not the model or the kernel cache | Warm up before Ready (exec probe that runs a request), and persist `/root/.nv` |
+| A GPU Deployment update briefly needs twice the VRAM | `RollingUpdate` starts the new pod before stopping the old one | `strategy: Recreate` (or `maxSurge: 0`) |
 | `docker run --entrypoint /bin/ollama …` fails from Git Bash | Git Bash rewrites `/bin/ollama` to `C:/Program Files/Git/bin/ollama` | `MSYS_NO_PATHCONV=1`, or use PowerShell |
 
 ## 7. Cleanup
 
 ```powershell
+wsl -d Ubuntu -- k3d cluster delete ollama-lab             # Step 2 (the script already does this unless --keep)
+Remove-Item $HOME\.kube\ollama-lab.yaml -ErrorAction SilentlyContinue
 docker rm -f ollama-lab-bind ollama-lab-volume 2>$null   # the script already does this
 docker volume rm ollama-lab-models                          # the 3.3 GB copy of the 4b
 docker image rm ollama/ollama:0.40.13                       # optional: 5 GB; keep it for later steps
