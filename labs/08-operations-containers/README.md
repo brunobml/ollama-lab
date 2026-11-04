@@ -207,7 +207,7 @@ So the cost is tied to the container's writable layer. Every `docker rm` + `run`
 **5. Two instances on one GPU: memory adds up, and neither instance knows about the other.**
 * GPU memory went idle 2,203 → Windows 4b **6,104** → plus the container's embedding model **7,017 MiB** (run 2: 2,061 → 5,964 → 6,875). That's +3,901 and +913. Both instances reported 100% GPU (`size == size_vram`).
 * **Windows tok/s didn't change.** The script's single sample said 94.9 and 104.8 tok/s, which looked like a 12–20% drop. The follow-up probe, 5 samples per state, gave medians of **119.0** (no container), **118.8** (container idle), **119.4** (container + embedding model), 118.3 (unloaded) and 120.3 (removed). The first request after a change was sometimes 101–106. The script now takes the median of 5.
-* **`--contend`** (the 4b in both instances) put **9,730 MiB in use, 510 MiB free**. Both instances still said 100% GPU, and nothing failed or warned. The container planned its load using whatever was free after Windows' allocation. The container's 4b generated 74.9 tok/s and Windows 106.1, but those are single samples, not a measured slowdown.
+* **`--contend`** (the 4b in both instances) put **9,730 MiB in use, 510 MiB free**. Both instances still said 100% GPU, and nothing failed or warned. Step 1 didn't log the free memory the container planned against. In Step 2 the pods turned out to plan against a fixed number, not what was actually free (§5 Step 2, point 4). The container's 4b generated 74.9 tok/s and Windows 106.1, but those are single samples, not a measured slowdown.
 * On a 10 GB card that's a working configuration with no headroom: one longer context in either instance would spill. **No scheduler, kernel or Kubernetes object accounts for this.**
 
 **Predictions vs observed:**
@@ -235,6 +235,65 @@ So the cost is tied to the container's writable layer. Every `docker rm` + `run`
 5. **VRAM is shared without any accounting.** Two instances filled the card to 510 MiB free without a warning. Budget VRAM per node by hand, and expect the same in Kubernetes: `nvidia.com/gpu: 1` hands out whole devices and doesn't track memory.
 6. **Measure speed with several samples.** One request after a state change was up to 15% slow, and a single sample turned that into a false finding.
 
+### Step 2 — runs 1 and 2 (2026-11-04, `qwen3.5:4b`, temperature 0, seed 42, think off; run 2 with `--contend`)
+
+Runs: `k8s-ollama-20261104-154245` (full) and `…-155942` (`--contend`). Run 2 crashed in Part D. Its folder holds the two pods' logs, saved afterwards from the leftover cluster, plus a note. A manual reproduction ran on that cluster before I deleted it.
+
+**1. The cluster and the GPU probe matched the smoke run.**
+* Create took 11.2–11.3 s and the image import 125–144 s. The API was published on `127.0.0.1:6445`.
+* The node advertised 16 CPUs and 31.3 GiB, the whole Docker VM, and **no `nvidia.com/gpu`**.
+* The unprivileged probe got `GPU access blocked by the operating system`. The privileged one saw 186 devices, had every capability, and read `RTX 3080`.
+
+**2. Ready is not the same as able to answer. The gap is the kernel cache, and a node-local `hostPath` removes it.**
+
+| pod | `/root/.nv` | Ready | first request (load) | Ready → answered |
+|---|---|---:|---:|---:|
+| 1, new | in the pod's writable layer | 5.0 / 5.4 s | 89.5 / 86.0 s (45.4 / 43.1) | 94.9 / 91.8 s |
+| 2, pod 1 deleted | in the pod's writable layer | 4.6 / 4.8 s | 85.7 / 86.1 s (43.7 / 43.1) | 90.5 / 91.2 s |
+| 3, cache `hostPath`, empty | node `/var/lib/ollama-nv` | 4.5 / 5.0 s | 85.5 / 86.1 s (42.8 / 44.7) | 90.4 / 91.4 s |
+| 4, pod 3 deleted | node `/var/lib/ollama-nv`, kept | 3.5 / 4.1 s | **3.8 / 3.8 s (2.7 / 2.7)** | **7.6 / 8.1 s** |
+
+* **Each pod without a kept cache paid ≈86 s on its first request and held 78,948 KB in `/root/.nv` afterwards.** That's the same size as Step 1's container, written again by each pod.
+* **Pod 4 reused the node's cache and answered in 3.8 s,** the same as Step 1's `docker restart` (3.9 s).
+* **The readiness probe passed 85–90 s before the pod could answer.** A Service would have sent traffic to it during that time.
+* A `hostPath` cache works only because there is one node. On a real cluster the cache is per node, and also per GPU model and driver version. A rescheduled pod pays again on any node it hasn't run on yet.
+
+**3. Speed and memory were the same as the Step 1 container.**
+* Warm generation was 89.3 tok/s in run 1 and 98.3 in run 2 (the smoke run gave 97.6), each a median of 5.
+* The 89.3 is unexplained: the script keeps only the median, so I can't tell which samples were slow.
+* Each load added 3,899–3,975 MiB, and `/api/ps` said 100% GPU (`size == size_vram`).
+
+**4. Two replicas: the scheduler put both on the one node, and Ollama can't see the other pod's memory.**
+* **Placement:** both replicas were Ready in 3.7–4.3 s on `k3d-ollama-lab-server-0`, and both see `/dev/dxg`. Nothing went Pending, and nothing in the API mentions a GPU.
+* **`--contend`, run 2:** the first replica loaded the 4b (2.7 s, 95.9 tok/s; GPU 5,811 MiB used). The second replica answered **HTTP 500**: `cudaMalloc failed: out of memory` on its first 2,515 MiB allocation. Ollama retried with the vision projector on the CPU, failed the same way, and gave up within 3 s. The script then crashed on the error body.
+* **Ollama planned every load against the same 9,071 MiB of free VRAM.** That was llama.cpp's `projected to use 2771 MiB … vs. 9071 MiB of free device memory`, in all 10 loads across both pods. It includes the second-replica loads, made while the other pod held ≈3.9 GiB. At idle, `nvidia-smi` on Windows reported 8,477–8,540 MiB free, and with one pod loaded 4,641 MiB.
+* So inside these pods Ollama's free-memory number is fixed and higher than reality. With nothing else on the card it happens to be harmless. When the card is shared, Ollama **can't plan a partial CPU offload**, which Lab 02 showed it doing on Windows. The load either fits by luck or fails.
+* **Manual reproduction** on the same cluster, the 4b in replica A and then B, in both orders: **both loads succeeded each time**, at 9,312–9,314 MiB used and 740–742 free.
+  * The desktop was using ≈400 MiB less than at the failed load: 1,514 against 1,910 MiB idle.
+  * At the failure the second pod had ≈4.2 GiB nominally free for a ≈3.9 GiB load, and its *first* 2.5 GiB allocation failed.
+  * Why it failed at that margin isn't known. Two candidates are WDDM's per-process budget and the memory the desktop held at that moment. Neither is verified.
+* **The reproduction's first attempt was invalid.** The crashed script had left its `kubectl port-forward` running and holding `127.0.0.1:11437`. The reproduction's new port-forwards couldn't bind, and every request went silently to the old pod. That showed as a "second load" that took 0.0 s and added no VRAM. The script now refuses to start a port-forward on a busy port, and closes its port-forwards on exit.
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| A: create 10–15 s, import 120–150 s, `127.0.0.1:6445`, no `nvidia.com/gpu` | ✅ 11.2–11.3 s, 125–144 s |
+| B: unprivileged blocked, privileged works | ✅ |
+| C pod 1: Ready ≈5 s, first answer 85–100 s, ≈97 tok/s, +≈3,900 MiB | ✅ 5.0–5.4 s, 86–89 s, +3,899–3,975; speed ✅ 98.3 in run 2, ❌ 89.3 in run 1 |
+| C pod 2: 85–100 s again | ✅ 85.7–86.1 s |
+| C pod 3 (empty cache volume): 85–100 s | ✅ 85.5–86.1 s |
+| C pod 4 (cache on the node): ≤ 10 s | ✅ 3.8 s |
+| D: both on the one node, both see `/dev/dxg`, nothing Pending | ✅ |
+| D `--contend`: the second load succeeds, ≈9.7 GB | ½ failed in the run (HTTP 500, OOM); succeeded 4/4 in the manual reproduction at 9.3 GB |
+| (not predicted) | ❌ Ollama in the pods planned with a fixed 9,071 MiB free |
+
+**What Step 2 teaches:**
+1. **Without a device plugin, a GPU pod is privileged and the GPU is invisible to Kubernetes.** The node advertises no `nvidia.com/gpu`, so requests, limits, quotas and scheduling can't see it. Two GPU pods landed on one node with no complaint, and so would twenty.
+2. **Readiness has to mean "can answer".** `/api/version` is up 85–90 s before the first token. Use an exec or HTTP probe that runs a small generation, or a warm-up step, and keep `/root/.nv` on the node.
+3. **Ollama's VRAM planning trusts a number that, in these pods, didn't move.** On shared GPUs, decide the budget outside Ollama: one model-serving pod per GPU, or a hard memory split such as MIG on GPUs that have it (the 3080 doesn't), not two pods relying on luck. The device plugin's time-slicing shares a GPU between pods but doesn't split its memory. The failure mode is a 500 on the request that triggers the load, not a slow request.
+4. **Check that a result came from the target you meant.** A leftover port-forward made the wrong pod answer without any error. The "0.0 s load" was the only sign.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Cause | Check / fix |
@@ -247,7 +306,10 @@ So the cost is tied to the container's writable layer. Every `docker rm` + `run`
 | The first request in a new container takes ≈90 s; restarts are fast | The CUDA driver compiles kernels into `/root/.nv/ComputeCache` (empty → 78 MB) inside the container's writable layer | Mount a volume at `/root/.nv`, or send a warm-up request before marking the pod ready |
 | Generation 18–20% slower in a container than native, prompt eval the same | Per-token overhead on the container's GPU path (hypothesis: `/dev/dxg` GPU-PV, or the different build) | Expect it on Docker Desktop; compare on a native Linux host before blaming Ollama |
 | `netstat -ano` shows nothing on a published port that answers | Listener tables mis-reported on this Windows build (Docker's backend missing; Ollama's state `0`) | Test reachability: connect from the LAN address, not only `127.0.0.1` |
-| Two instances both say 100% GPU and the card is nearly full | Each instance plans with the free VRAM it sees; nothing coordinates them | Budget per GPU by hand; leave headroom for context growth |
+| Two instances both say 100% GPU and the card is nearly full | Nothing coordinates them; in the k3d pods Ollama also planned with a fixed 9,071 MiB free (Step 2) | Budget per GPU by hand; leave headroom for context growth |
+| The second Ollama pod on a GPU: HTTP 500 `cudaMalloc failed: out of memory` | The other pod holds VRAM that this pod's planning number doesn't show, so it doesn't offload layers to the CPU; one retry moves only the projector | One model-serving pod per GPU; check the planning line, `projected to use … vs. … MiB of free device memory` |
+| A request "loads" in 0.0 s and VRAM doesn't change | A leftover `kubectl port-forward` holds the local port; the new forward can't bind, and the old one answers for the wrong pod | Check the port is free before forwarding; find leftovers with `Get-CimInstance Win32_Process -Filter "Name='kubectl.exe'"` and their command lines |
+| A script crashed and its run folder is empty | The report was written only at the end | `k8s_ollama.py` now saves at exit; a crash leaves the cluster for inspection (§7 deletes it) |
 | A tok/s figure 10–20% off from one request | The first request after a load or state change is sometimes slow | Median of ≥5 requests |
 | Pod: `Failed to initialize NVML: GPU access blocked by the operating system` | `/dev/dxg` mounted by `hostPath` but the device cgroup denies it | `privileged: true` (root on the node), or a device plugin that injects the device (Step 3) |
 | Pod CrashLoopBackOff: `remove /root/.ollama/models/manifests-v2: read-only file system` | Ollama migrates/prunes its store on start | Give the store one read-write owner, or mount a store already in the `manifests-v2` layout |
@@ -277,3 +339,6 @@ Docker Desktop can stay running or be quit from the tray. Nothing in this lab ch
 5. A new container's first request took ≈90 s, and after `docker restart` it took 4 s. Where did the time go, and how would you make a rescheduled Kubernetes pod avoid it?
 6. Generation was 18–20% slower in the container but prompt processing wasn't. What does that pattern suggest about where the overhead is?
 7. With both instances holding the 4b, the GPU had 510 MiB free and both still said 100% GPU. What would happen if one of them got a 32K-context request, and what in Kubernetes would have prevented this?
+8. The readiness probe passed 85–90 s before the pod could answer. Write the probe you'd use instead, and explain why the `hostPath` kernel cache helps on this cluster but not after a reschedule to a new node.
+9. Why did the scheduler put two GPU pods on a node with one GPU, and what would `resources.limits: nvidia.com/gpu: 1` change, given what a device plugin advertises?
+10. The second replica failed with a CUDA out-of-memory error instead of offloading layers to the CPU, as Lab 02 saw on Windows. Which logged number explains that, and why couldn't it be right?

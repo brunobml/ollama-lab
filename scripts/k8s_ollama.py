@@ -20,7 +20,10 @@ Parts:
   D  replicas: 2 with no GPU accounting: where they land and what each sees
 """
 import argparse
+import atexit
 import json
+import re
+import socket
 import statistics
 import subprocess
 import sys
@@ -70,11 +73,18 @@ def timed(fn, *args):
 
 
 class PortForward:
-    """kubectl port-forward to one pod on 127.0.0.1 (kubectl's default address). Dies with the pod."""
+    """kubectl port-forward to one pod on 127.0.0.1 (kubectl's default address). Dies with the pod, not with this
+    script: a crash used to leave it holding LOCAL_PORT, and the next run's requests silently went to the old pod."""
+    open = []
+
     def __init__(self, pod):
+        with socket.socket() as s:
+            if s.connect_ex(('127.0.0.1', LOCAL_PORT)) == 0:
+                raise SystemExit(f'127.0.0.1:{LOCAL_PORT} is already in use (a leftover port-forward?)')
         self.proc = subprocess.Popen(['kubectl', '--kubeconfig', str(KUBECONFIG), '--context', CONTEXT,
                                       'port-forward', f'pod/{pod}', f'{LOCAL_PORT}:11434'],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        PortForward.open.append(self)
         for _ in range(60):
             try:
                 httpx.get(f'http://127.0.0.1:{LOCAL_PORT}/api/version', timeout=2)
@@ -84,15 +94,23 @@ class PortForward:
         raise SystemExit(f'port-forward to {pod} never answered')
 
     def close(self):
-        self.proc.terminate()
-        self.proc.wait(timeout=10)
+        if self in PortForward.open:
+            PortForward.open.remove(self)
+            self.proc.terminate()
+            self.proc.wait(timeout=10)
+
+
+atexit.register(lambda: [pf.close() for pf in list(PortForward.open)])
 
 
 def generate(num_predict=128):
     t = time.time()
     r = httpx.post(f'http://127.0.0.1:{LOCAL_PORT}/api/generate', timeout=900, json={
         'model': MODEL, 'prompt': PROMPT, 'stream': False, 'think': False,
-        'options': {'temperature': 0, 'seed': 42, 'num_predict': num_predict}}).json()
+        'options': {'temperature': 0, 'seed': 42, 'num_predict': num_predict}})
+    if r.status_code != 200:            # a failed load is HTTP 500 with {"error": ...}, not a KeyError
+        return {'wall_s': round(time.time() - t, 2), 'http': r.status_code, 'error': r.json().get('error', r.text)}
+    r = r.json()
     return {'wall_s': round(time.time() - t, 2), 'load_s': round(r['load_duration'] / 1e9, 2),
             'gen_tps': round(r['eval_count'] / (r['eval_duration'] / 1e9), 1), 'text': r['response']}
 
@@ -120,12 +138,22 @@ def unload_and_close(pf):
     pf.close()
 
 
+def free_seen(pod):
+    """What each load in this pod's log planned against: llama.cpp's 'projected to use X MiB ... vs. Y MiB free'."""
+    log = kubectl('logs', pod)
+    (outdir / f'{pod}.log').write_text(log, encoding='utf-8')
+    return [{'projected_mib': int(a), 'free_seen_mib': int(b)} for a, b in
+            re.findall(r'projected to use (\d+) MiB of device memory vs\. (\d+) MiB of free', log)]
+
+
 def first_answer(label, exclude=()):
     """A fresh pod: time to Ready, then the first request through a port-forward."""
     t0 = time.time()
     (pod,), ready_s = wait_ready(exclude=exclude)
     pf = PortForward(pod)
     g = generate()
+    if 'error' in g:
+        raise SystemExit(f'{pod}: HTTP {g["http"]}: {g["error"]}')
     res = {'pod': pod, 'ready_s': ready_s, 'first_wall_s': g['wall_s'], 'first_load_s': g['load_s'],
            'ready_to_answer_s': round(time.time() - t0, 1), 'nv_cache': kubectl(
                'exec', pod, '--', 'sh', '-c', 'du -sk /root/.nv 2>/dev/null | cut -f1')}
@@ -145,6 +173,13 @@ outdir = Path('results/raw') / f'k8s-ollama-{stamp}'
 outdir.mkdir(parents=True, exist_ok=True)
 report, data = [], {}
 say = lambda text='': (print(text, flush=True), report.append(text))
+
+
+@atexit.register
+def save():                     # also after a crash, which leaves the cluster running for inspection
+    (outdir / 'data.json').write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding='utf-8')
+    (outdir / 'report.md').write_text('\n'.join(report) + '\n', encoding='utf-8')
+    print(f'\nSaved {outdir}')
 
 # ---------------------------------------------------------------- preflight
 run(['docker', 'version', '--format', '{{.Server.Version}}'])
@@ -235,12 +270,20 @@ if not args.smoke:
         say('* --contend: loading the 4b in both replicas (announced overflow past the 8,500 MiB ceiling)')
         d['contend'] = []
         for p in d['pods']:
+            before = vram()
             pf = PortForward(p['name'])
             g = generate(256)
-            d['contend'].append({'pod': p['name'], 'load_s': g['load_s'], 'gen_tps': g['gen_tps'],
-                                 'vram_mib': vram(), 'ps': httpx.get(f'http://127.0.0.1:{LOCAL_PORT}/api/ps').json()})
+            g.pop('text', None)
+            d['contend'].append({'pod': p['name'], **g, 'vram_before_mib': before, 'vram_mib': vram(),
+                                 'ps': httpx.get(f'http://127.0.0.1:{LOCAL_PORT}/api/ps').json()['models']})
             pf.close()                       # the model stays loaded, so the second pod loads next to it
-            say(f'  * {p["name"]}: load {g["load_s"]} s, {g["gen_tps"]} tok/s, GPU now {vram()} MiB')
+            result = (f'HTTP {g["http"]}: {g["error"][:160]}' if 'error' in g
+                      else f'load {g["load_s"]} s, {g["gen_tps"]} tok/s')
+            say(f'  * {p["name"]}: GPU {before} MiB before; {result}; GPU now {vram()} MiB')
+        for c in d['contend']:
+            c['free_seen'] = free_seen(c['pod'])
+            say(f'  * {c["pod"]} planned its loads against free VRAM of: '
+                f'{[f["free_seen_mib"] for f in c["free_seen"]]} MiB (log saved)')
     data['replicas2'] = d
 
 # ---------------------------------------------------------------- cleanup
@@ -251,7 +294,3 @@ else:
     _, delete_s = timed(k3d, 'cluster', 'delete', CLUSTER)
     KUBECONFIG.unlink(missing_ok=True)
     say(f'\n* cluster deleted in {delete_s} s; GPU after cleanup {vram()} MiB (idle at start {idle})')
-
-(outdir / 'data.json').write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding='utf-8')
-(outdir / 'report.md').write_text('\n'.join(report) + '\n', encoding='utf-8')
-print(f'\nSaved {outdir}')
