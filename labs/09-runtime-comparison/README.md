@@ -176,6 +176,72 @@ ollama stop qwen3.5:4b
 2. Start LM Studio once. If it offers to download a model, **skip** it. If it asks about a runtime or engine download, accept: that's its llama.cpp engine, and Step 3 measures it.
 3. Tell me it's installed. I'll diff the snapshot, report every change, and set up the measurements.
 
+**What the install changed** (`scripts/system_snapshot.ps1 -Compare`, saved in `results/raw/lmstudio-install/`):
+
+| Where | Change |
+|---|---|
+| user `PATH` | + `C:\Users\bruno\.lmstudio\bin` (`lms.exe`) |
+| `HKCU\…\CurrentVersion\Run` | + `electron.app.LM Studio = …\LM Studio.exe --run-as-service`: **starts at every login** (`settings.json`: `enableLocalService: true`) |
+| Start menu, HKCU uninstall | + `LM Studio.lnk`; + `LM Studio 0.4.28+2` (per-user) |
+| URL protocol handler | + `lmstudio://` |
+| folders | + `%LOCALAPPDATA%\Programs\LM Studio` (the app, 771 MB), `%LOCALAPPDATA%\lm-studio-updater`, `%APPDATA%\LM Studio` (3 MB), `~\.lmstudio` (**2.5 GB**), `~\.lmstudio-home-pointer` |
+| unchanged | machine `PATH`, HKLM Run, services, scheduled tasks, firewall rules, Program Files |
+
+The listening-port diff was noise: Windows' listener tables are unreliable on this build (Lab 08). Its one new `0.0.0.0` listener belonged to `XrRuntime`, not LM Studio.
+
+**What `~\.lmstudio` holds:**
+* **Four llama.cpp engines**, each read from its `display-data.json`:
+  * CPU, CUDA and Vulkan engines **2.67.0** = llama.cpp **b11999** (`0893ec98f`), installed with the app;
+  * a CUDA 12 engine **2.70.0** = llama.cpp **b12116** (`5851a8e50`), **downloaded by itself at 12:18, 2 minutes after the install** (`autoUpdateExtensionPacks: true`).
+* **The engine actually used for GGUF is 2.70.0** (`backend-preferences-v2.json`). It's a `llama-server.exe` (`0.9.0-dev (build 1, commit 5851a8e)`, Clang 19.1.1) with a CUDA 12.8 runtime (cudart 6.14.11.12080) from `vendor\win-llama-cuda12-vendor-v2`.
+* An 84 MB embedding model (`nomic-embed-text-v1.5`), plus `node.exe`, `deno.exe` and `esbuild.exe` for plugins.
+* `settings.json`: `jitModelTTL 3600 s`, `apiPredictionHistoryEviction.ttlDays: 30`, `appUpdateChannel: stable`.
+* **The app's internal API is on `127.0.0.1:41343`** (`http-server.json`); it's what the `lms` CLI uses. Connecting from the LAN address `10.0.0.202` was **refused**.
+
+**The model:** `lms import`'s default is to **move** the file. That would have taken the blob out of Ollama's store and broken Ollama's 4b. `-L` makes a hard link, but `lms` warns about the blob's missing `.gguf` extension. So I made the two hard links myself:
+* `~\.lmstudio\models\ollama-lab\qwen3.5-4b\qwen3.5-4b-Q4_K_M.gguf` → Ollama's model blob;
+* `mmproj-qwen3.5-4b.gguf` → Ollama's projector blob.
+
+Each file now has 2 links and no extra disk. Deleting it in LM Studio removes only LM Studio's name. `lms ls` lists it as `qwen3.5-4b`, 4.2B, `qwen35`.
+
+**Probe** (the same raw prompt as Steps 1–2):
+* **Loading:** `lms load qwen3.5-4b --gpu max -c 4096 --parallel 1` took 5.96–5.98 s, +3,894 MiB.
+* **The API server** answers on `127.0.0.1:1234`, and **is refused from `10.0.0.202`**.
+* **The raw prompt went through unchanged** (23 prompt tokens).
+* **LM Studio's API changed the sampling.** With llama-server's options, `/api/v0/completions` reported ≈125 tok/s, and the text differed from llama-server's ("…an automated health check…").
+  * With Ollama's options it was ≈125 tok/s again, with yet another text.
+* **LM Studio's own `llama-server.exe` run directly** with Step 1's flags gave 142.4 tok/s with llama-server's options and 126.9 with Ollama's. Its text was **byte-identical to Steps 1–2** for both. So b11963 and b12116, three different builds, wrote the same bytes.
+* **Adding `repeat_penalty: 1, min_p: 0`** to the API request gave **byte-identical text to llama-server**, and the client-timed stream rose from 122 to 137 tok/s.
+  * So the LM Studio layer adds its own sampler defaults, probably `repeat_penalty 1.1` and `min_p 0.05`. That isn't verified: the script tests each one separately.
+
+**What runs** (`scripts/lmstudio_compare.py`, ≈6 min): LM Studio and its server must be running; the script loads and unloads the model with `lms`.
+* **A.** Load time, VRAM, the engine in use, and TCP connects to 1234 and the internal port, on 127.0.0.1 and the LAN address.
+* **B.** The raw prompt with llama-server's options, as sent, then with `repeat_penalty 1`, with `min_p 0`, and with both; then Ollama's options with and without both. For each: LM Studio's stats tok/s, client-timed stream rate, tokens, and byte-identity with Step 1's llama-server text.
+* **C.** `/v1/chat/completions` with the GGUF's own template: prompt tokens (Ollama 23, llama-server chatml 19), and whether thinking comes back as a separate field.
+* **D.** `--parallel 4`, 4 concurrent requests.
+* **E.** 1-token requests, median of 20.
+* **F.** A request with a marker in the prompt: new files in `api-prediction-history`, and any file under `~\.lmstudio` that holds the marker.
+
+```powershell
+ollama stop qwen3.5:4b
+.\.venv\Scripts\python scripts\lmstudio_compare.py      # ≈6 min; LM Studio must be running
+```
+
+**Predictions** (written before the first full run):
+
+| Measure | Prediction | Why |
+|---|---|---|
+| A | 5–7 s, +≈3,900 MiB; engine 2.70.0; 1234 and the internal port refused from the LAN | Probe |
+| B: as sent | ≈125 (LM Studio's stats) / ≈122 (client); text ≠ llama-server | Probe |
+| B: `repeat_penalty 1` alone | speed back to ≈137–142; text = llama-server (low confidence) | A repeat penalty touches every vocabulary entry, as the presence penalty did; `min_p` filters cheaply |
+| B: `min_p 0` alone | speed unchanged (≈125); text ≠ llama-server | As above |
+| B: both pinned | = llama-server, byte for byte; ≈137–142 | Probe |
+| B: Ollama's options + both pinned | = Step 1's llama-server text with Ollama's options; ≈120–127 | Same engine family, same options |
+| C | prompt tokens ≠ 19; thinking either in a separate field or absent (low confidence) | LM Studio uses the GGUF's Jinja template, which knows qwen3.5's think tags |
+| D | aggregate ≈280–300 tok/s | Steps 1–2: 288–297 at 4 slots |
+| E | 10–30 ms (an Electron/Node layer in front of llama-server) | Ollama's Go layer added ≈14 ms |
+| F | no prompt stored (`api-prediction-history` stayed empty through ≈30 probe requests) | Probe; the 30-day TTL may apply to UI history only |
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 — runs 1–3 (2026-11-05, `qwen3.5:4b` from the Ollama store, temperature 0, seed 42)
@@ -295,6 +361,82 @@ Run: `build-compare-20261105-114941`, mine. 4 server processes in turn, then `-n
 3. **Ollama's 18% gap from Step 1 had two parts:** its default penalty (≈17%), and on top of that a build whose penalty path is slower than the official one.
 4. **Synthetic benchmarks set the ceiling.** `llama-bench`'s tg128 was 8% above a served request. Quote them as the engine's limit, not as an API's throughput.
 
+### Step 3 — run 1 (2026-11-05, LM Studio 0.4.28+2, engine 2.70.0 = llama.cpp b12116, `qwen3.5:4b` hard-linked)
+
+Run: `lmstudio-compare-20261105-122711`, mine. The install diff and the probe are in §4 Step 3.
+
+**1. Load and exposure.**
+* `lms load`: 6.13 s, +3,906 MiB, runtime `llama.cpp-win-x86_64-nvidia-cuda12-avx2` 2.70.0.
+* **TCP connects from `10.0.0.202` were refused** on both 1234 (the API) and 41343 (the internal API); both answer on 127.0.0.1.
+
+**2. LM Studio's API adds a repeat penalty.** Raw prompt (23 tokens, passed unchanged), median of 5:
+
+| options sent | LM Studio's stats | client-timed stream | tokens | = llama-server, byte for byte |
+|---|---:|---:|---:|---|
+| llama-server's | 125.1 | 125.5 | 58 | no |
+| + `repeat_penalty 1` | **141.6** | 140.5 | 61 | **yes** |
+| + `min_p 0` | 124.5 | 125.4 | 58 | no |
+| + both | 140.7 | 141.1 | 61 | yes |
+| Ollama's | 125.4 | – | 60 | no |
+| Ollama's + both | 125.7 | – | 57 | yes |
+
+* **The whole difference is `repeat_penalty`.** Pinned to 1, LM Studio wrote llama-server's exact bytes at its speed. `min_p 0` changed nothing.
+* So LM Studio's default isn't 1, and it costs the same ≈1.2 ms per token as a presence penalty. Its exact value isn't in the server log at the default verbosity.
+* LM Studio's `tokens_per_second` agreed with the client-timed stream within 1%.
+* **With all options pinned, the three runtimes wrote the same bytes:** Ollama, llama-server (two builds of b11963) and LM Studio (b12116), with either sampler setting.
+
+**3. Chat uses the GGUF's own template, with thinking on.**
+* `/v1/chat/completions` built **21 prompt tokens** (Ollama 23, llama-server chatml 19).
+* The model spent **all 256 tokens thinking** (`Thinking Process: 1. **Analyze the Request:** …`). That went into a separate `reasoning_content` field, so **`content` was empty**.
+* Ollama with `think: false` answered directly, and llama-server's generic template leaked the think tags into the content.
+* So three runtimes give three behaviours for one chat request. A client that reads only `content` with a 256-token budget would see an empty answer from LM Studio.
+
+**4. Parallel 4 isn't the same configuration.**
+* `--parallel 4` gave 4 slots sharing **one unified KV cache** (`kv_unified = 'true'`, 4,096 tokens), where llama-server's `-np 4` gave each slot its own.
+* Aggregate throughput was **259.1 tok/s** (per request 75.6–80.5), against 288–297 for llama-server. VRAM was +4,061 MiB against +4,441.
+* **The 4 texts weren't all identical,** where llama-server's 4 were. A unified cache changes how requests are batched together, which is a plausible reason, but it isn't verified.
+
+**5. Overhead and retention.**
+* **Per-request overhead: 27.4 ms** for a 1-token request. That compares with 22.8 for Ollama and 8.4 for llama-server, so LM Studio's layer adds ≈19 ms.
+* **The prompts are kept in plain text** in LM Studio's server log, `~\.lmstudio\server-logs6-116-11-05.1.log`, at the default `runtimeLogVerbosityLevel: 3`:
+  * each request body, with the marker prompt;
+  * `Running completion on text: LAB09-LMSTUDIO-MARKER: Ex…`;
+  * the chat messages, and the model's `reasoning_content`.
+* The file is one per day, 283 KB after this session. I found no setting that limits how long it's kept.
+* `api-prediction-history` stayed empty.
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| A: 5–7 s, +≈3,900; 2.70.0; refused from the LAN | ✅ 6.13 s, +3,906, 2.70.0, refused on both ports |
+| B: as sent ≈125 / ≈122, text differs | ✅ 125.1 / 125.5 |
+| B: `repeat_penalty 1` alone → speed and text restored (low confidence) | ✅ 141.6, identical |
+| B: `min_p 0` alone → no change | ✅ |
+| B: both pinned → identical, ≈137–142 | ✅ 140.7 |
+| B: Ollama's options + both → identical, ≈120–127 | ✅ 125.7 |
+| C: prompt tokens ≠ 19; thinking separate or absent | ✅ 21; separate, and it used the whole budget |
+| D: ≈280–300 tok/s | ❌ 259.1, with a unified KV cache, so not the same configuration |
+| E: 10–30 ms | ✅ 27.4 ms |
+| F: no prompt stored | ❌ every prompt, response and reasoning in the daily server log |
+
+**What Step 3 teaches:**
+1. **A desktop runtime is a set of moving parts.** LM Studio:
+   * changed the user `PATH`;
+   * registered a login item and a URL handler;
+   * installed four llama.cpp engines (2.5 GB);
+   * **updated its engine by itself within 2 minutes;**
+   * runs a second, internal API.
+
+   Nothing was machine-wide and everything stayed on localhost, but pin the engine version (`autoUpdateExtensionPacks: false`) before any benchmark you want to repeat.
+2. **Every runtime has its own sampler defaults:** Ollama a presence penalty from the model, LM Studio a repeat penalty from the app, llama-server none. Each default costs ≈17% of generation speed and changes the text. Pin `presence_penalty`, `repeat_penalty`, `top_k`, `top_p` and `min_p` explicitly in every comparison, and then the engines agree to the byte.
+3. **Chat templates decide what "the same request" means.** The three runtimes gave three answers to one chat request: a direct answer, think tags leaking into the content, and an empty `content` with all the thinking in a separate field.
+4. **"Parallel" can mean different memory layouts.** A unified KV cache uses less VRAM and gave less throughput here, and texts that weren't identical. Compare slot counts and KV layout, not just the flag.
+5. **Know where each runtime keeps prompts:**
+   * Ollama only with `OLLAMA_DEBUG_LOG_REQUESTS` (Lab 08);
+   * llama-server not at all, in these runs;
+   * LM Studio by default, in a daily log under your home folder.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Cause | Check / fix |
@@ -307,6 +449,12 @@ Run: `build-compare-20261105-114941`, mine. 4 server processes in turn, then `-n
 | Chat answers through llama-server start with `<think>\n\n</think>` | The generic `chatml` template has no thinking control, so the model writes the empty block itself | Use the model's own template (`--jinja` with the GGUF's template, or Ollama's renderer), or strip it in the client |
 | Two builds of one llama.cpp commit differ in tok/s for some settings only | CPU-side code (e.g. the presence-penalty sampler) built by different compilers or flags; GPU kernels and output are the same | Benchmark the binary and options you'll run; compare with and without penalties |
 | A PowerShell script loses its process handle (`Stop-Process: … 'Id' because it is null`) | PowerShell variable names aren't case-sensitive: `$P` and `$p` are the same variable | Use distinct names; stop a lab process by its full executable path |
+| LM Studio ≈17% slower than llama-server with the same options; different text | LM Studio's API adds a repeat penalty (not 1) unless `repeat_penalty` is sent | Send `repeat_penalty: 1` (and the other sampler options) explicitly |
+| LM Studio chat answer has empty `content` | The GGUF's template thinks by default; the reasoning went to `reasoning_content` and used the token budget | Read `reasoning_content`, raise `max_tokens`, or turn thinking off in the request or preset |
+| `lms import` removed the source file | Its default is **move**; `-L` (hard link), `-l` (symlink) or `-c` (copy) keep it | Use `-L` for a file in another runtime's store, or make the hard link yourself (needs a `.gguf` name) |
+| LM Studio's engine version changed between runs | `autoUpdateExtensionPacks: true` downloads new engines (2.70.0 arrived 2 minutes after the install) | Pin the engine; record `runtime.version` from `/api/v0` responses |
+| Prompts found in `~\.lmstudio\server-logs\` | LM Studio logs request bodies, responses and reasoning at its default verbosity | Lower the log verbosity, delete the logs, or keep sensitive prompts out of it |
+| LM Studio starts at login | `enableLocalService: true` adds `HKCU\…\Run: LM Studio.exe --run-as-service` | Turn the local service off in LM Studio's settings, or remove the Run value |
 | `OLLAMA_NUM_PARALLEL` has no effect for qwen3.5 | Ollama starts its runner with `-np 1` for this model (Lab 04) | Run llama-server with `-np N` directly if you need batching |
 
 ## 7. Cleanup
@@ -314,10 +462,14 @@ Run: `build-compare-20261105-114941`, mine. 4 server processes in turn, then `-n
 ```powershell
 ollama stop qwen3.5:4b
 Get-Process llama-server -ErrorAction SilentlyContinue | Select-Object Id, Path   # check before stopping: Ollama's own runner has the bundled path
-Remove-Item -Recurse tools\downloads, tools\llama.cpp-b11963   # optional: the official build (589 MB of zips + 731 MB); needed for Step 2 reruns
+Remove-Item -Recurse tools\downloads, tools\llama.cpp-b11963   # optional: the official build (589 MB of zips + 731 MB) and the LM Studio installer (626 MB)
+& "$HOME\.lmstudio\bin\lms.exe" unload --all                  # Step 3: the scripts already do this
+Remove-Item "$HOME\.lmstudio\models\ollama-lab" -Recurse      # Step 3: removes only LM Studio's hard-link names; Ollama's blobs stay
+# Uninstalling LM Studio (optional): Settings → Apps → LM Studio. Then delete ~\.lmstudio (2.5 GB), ~\.lmstudio-home-pointer,
+# %APPDATA%\LM Studio and %LOCALAPPDATA%\lm-studio-updater, and remove ~\.lmstudio\bin from the user PATH if it remains.
 ```
 
-The scripts stop the llama-server they started. Ollama's own runner uses the bundled executable, so check before stopping one by hand. Nothing in Steps 1–2 is installed: the official build is a folder of files under `tools\`, with no installer, registry entries or PATH change.
+The scripts stop the llama-server they started. Ollama's own runner uses the bundled executable, so check before stopping one by hand. Nothing in Steps 1–2 is installed: the official build is a folder of files under `tools\`, with no installer, registry entries or PATH change. Step 3 installed LM Studio; §4 Step 3 lists every change it made.
 
 ## 8. Check Your Understanding
 
@@ -330,3 +482,7 @@ The scripts stop the llama-server they started. Ollama's own runner uses the bun
 7. Runs 1–2 showed Ollama processing prompts at 39K tok/s. What was really measured?
 8. The official and the bundled build produced the same bytes, yet one was 6.5% faster with Ollama's options and equal without them. Where in the pipeline can that difference sit, and why not on the GPU?
 9. `llama-bench` said 154.5 tok/s and the server 142–143 tok/s with the same binary. What does the benchmark leave out?
+10. Ollama, llama-server and LM Studio wrote three different texts for one raw prompt at temperature 0, then the same bytes. Which options did you have to pin, and where did each runtime's default come from?
+11. LM Studio's chat answer came back with empty `content`. Where did the tokens go, and what would a client have to do differently from Ollama's API?
+12. What did installing LM Studio change outside its own folders, and which of those changes would you undo on a shared machine?
+13. Where does each of the three runtimes store prompts by default, and how would you check a fourth?
