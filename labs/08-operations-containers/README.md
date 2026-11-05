@@ -235,9 +235,9 @@ So the cost is tied to the container's writable layer. Every `docker rm` + `run`
 5. **VRAM is shared without any accounting.** Two instances filled the card to 510 MiB free without a warning. Budget VRAM per node by hand, and expect the same in Kubernetes: `nvidia.com/gpu: 1` hands out whole devices and doesn't track memory.
 6. **Measure speed with several samples.** One request after a state change was up to 15% slow, and a single sample turned that into a false finding.
 
-### Step 2 — runs 1 and 2 (2026-11-04, `qwen3.5:4b`, temperature 0, seed 42, think off; run 2 with `--contend`)
+### Step 2 — runs 1–3 (2026-11-04/05, `qwen3.5:4b`, temperature 0, seed 42, think off; runs 2 and 3 with `--contend`)
 
-Runs: `k8s-ollama-20261104-154245` (full) and `…-155942` (`--contend`). Run 2 crashed in Part D. Its folder holds the two pods' logs, saved afterwards from the leftover cluster, plus a note. A manual reproduction ran on that cluster before I deleted it.
+Runs: `k8s-ollama-20261104-154245` (full) and `…-155942` (`--contend`). Run 2 crashed in Part D. Its folder holds the two pods' logs, saved afterwards from the leftover cluster, plus a note. A manual reproduction ran on that cluster before I deleted it. Run 3, `k8s-ollama-20261105-091225`, used the fixed script and was a full `--contend` run, with both pods' logs saved by the script.
 
 **1. The cluster and the GPU probe matched the smoke run.**
 * Create took 11.2–11.3 s and the image import 125–144 s. The API was published on `127.0.0.1:6445`.
@@ -248,29 +248,34 @@ Runs: `k8s-ollama-20261104-154245` (full) and `…-155942` (`--contend`). Run 2 
 
 | pod | `/root/.nv` | Ready | first request (load) | Ready → answered |
 |---|---|---:|---:|---:|
-| 1, new | in the pod's writable layer | 5.0 / 5.4 s | 89.5 / 86.0 s (45.4 / 43.1) | 94.9 / 91.8 s |
-| 2, pod 1 deleted | in the pod's writable layer | 4.6 / 4.8 s | 85.7 / 86.1 s (43.7 / 43.1) | 90.5 / 91.2 s |
-| 3, cache `hostPath`, empty | node `/var/lib/ollama-nv` | 4.5 / 5.0 s | 85.5 / 86.1 s (42.8 / 44.7) | 90.4 / 91.4 s |
-| 4, pod 3 deleted | node `/var/lib/ollama-nv`, kept | 3.5 / 4.1 s | **3.8 / 3.8 s (2.7 / 2.7)** | **7.6 / 8.1 s** |
+| 1, new | in the pod's writable layer | 5.0 / 5.4 / 5.2 s | 89.5 / 86.0 / 81.9 s (45.4 / 43.1 / 42.4) | 94.9 / 91.8 / 89.5 s |
+| 2, pod 1 deleted | in the pod's writable layer | 4.6 / 4.8 / 3.0 s | 85.7 / 86.1 / 80.5 s (43.7 / 43.1 / 41.1) | 90.5 / 91.2 / 85.8 s |
+| 3, cache `hostPath`, empty | node `/var/lib/ollama-nv` | 4.5 / 5.0 / 4.7 s | 85.5 / 86.1 / 80.0 s (42.8 / 44.7 / 40.6) | 90.4 / 91.4 / 87.0 s |
+| 4, pod 3 deleted | node `/var/lib/ollama-nv`, kept | 3.5 / 4.1 / 4.1 s | **3.8 / 3.8 / 3.7 s (2.7 / 2.7 / 2.7)** | **7.6 / 8.1 / 10.1 s** |
 
-* **Each pod without a kept cache paid ≈86 s on its first request and held 78,948 KB in `/root/.nv` afterwards.** That's the same size as Step 1's container, written again by each pod.
-* **Pod 4 reused the node's cache and answered in 3.8 s,** the same as Step 1's `docker restart` (3.9 s).
-* **The readiness probe passed 85–90 s before the pod could answer.** A Service would have sent traffic to it during that time.
+* **Each pod without a kept cache paid 80–89 s on its first request and held 78,948 KB in `/root/.nv` afterwards.** That's the same size as Step 1's container, written again by each pod.
+* **Pod 4 reused the node's cache and answered in 3.7–3.8 s,** the same as Step 1's `docker restart` (3.9 s).
+* **The readiness probe passed 80–90 s before the pod could answer.** A Service would have sent traffic to it during that time.
 * A `hostPath` cache works only because there is one node. On a real cluster the cache is per node, and also per GPU model and driver version. A rescheduled pod pays again on any node it hasn't run on yet.
 
 **3. Speed and memory were the same as the Step 1 container.**
-* Warm generation was 89.3 tok/s in run 1 and 98.3 in run 2 (the smoke run gave 97.6), each a median of 5.
+* Warm generation was 89.3 tok/s in run 1, 98.3 in run 2 and 98.9 in run 3 (the smoke run gave 97.6), each a median of 5.
 * The 89.3 is unexplained: the script keeps only the median, so I can't tell which samples were slow.
 * Each load added 3,899–3,975 MiB, and `/api/ps` said 100% GPU (`size == size_vram`).
 
 **4. Two replicas: the scheduler put both on the one node, and Ollama can't see the other pod's memory.**
-* **Placement:** both replicas were Ready in 3.7–4.3 s on `k3d-ollama-lab-server-0`, and both see `/dev/dxg`. Nothing went Pending, and nothing in the API mentions a GPU.
+* **Placement:** both replicas were Ready in 3.4–4.3 s on `k3d-ollama-lab-server-0`, and both see `/dev/dxg`. Nothing went Pending, and nothing in the API mentions a GPU.
 * **`--contend`, run 2:** the first replica loaded the 4b (2.7 s, 95.9 tok/s; GPU 5,811 MiB used). The second replica answered **HTTP 500**: `cudaMalloc failed: out of memory` on its first 2,515 MiB allocation. Ollama retried with the vision projector on the CPU, failed the same way, and gave up within 3 s. The script then crashed on the error body.
-* **Ollama planned every load against the same 9,071 MiB of free VRAM.** That was llama.cpp's `projected to use 2771 MiB … vs. 9071 MiB of free device memory`, in all 10 loads across both pods. It includes the second-replica loads, made while the other pod held ≈3.9 GiB. At idle, `nvidia-smi` on Windows reported 8,477–8,540 MiB free, and with one pod loaded 4,641 MiB.
+* **Ollama planned every load against the same 9,071 MiB of free VRAM.** That was llama.cpp's `projected to use 2771 MiB … vs. 9071 MiB of free device memory`, in all 10 loads across both pods of run 2, and in all 3 of run 3. That includes the second-replica loads, made while the other pod held ≈3.9 GiB. At idle, `nvidia-smi` on Windows reported 8,477–8,540 MiB free, and with one pod loaded 4,641 MiB.
 * So inside these pods Ollama's free-memory number is fixed and higher than reality. With nothing else on the card it happens to be harmless. When the card is shared, Ollama **can't plan a partial CPU offload**, which Lab 02 showed it doing on Windows. The load either fits by luck or fails.
 * **Manual reproduction** on the same cluster, the 4b in replica A and then B, in both orders: **both loads succeeded each time**, at 9,312–9,314 MiB used and 740–742 free.
   * The desktop was using ≈400 MiB less than at the failed load: 1,514 against 1,910 MiB idle.
   * At the failure the second pod had ≈4.2 GiB nominally free for a ≈3.9 GiB load, and its *first* 2.5 GiB allocation failed.
+* **`--contend`, run 3 (fixed script):** the second load **succeeded**.
+  * The new replica loaded first: GPU 1,653 → 5,554 MiB, 98.7 tok/s. Then pod 4 loaded next to it: 5,554 → **9,455 MiB**, about 600 MiB free, 97.4 tok/s. Both said 100% GPU.
+  * Pod 4's planning line still said 9,071 MiB free, with 3.9 GiB already taken by the other pod.
+  * The desktop's idle use was 1,644 MiB.
+  * Across the three tries the pattern is one failure at 1,910 MiB idle and five successes at 1,514 and 1,644 MiB. That fits a margin effect but proves nothing.
   * Why it failed at that margin isn't known. Two candidates are WDDM's per-process budget and the memory the desktop held at that moment. Neither is verified.
 * **The reproduction's first attempt was invalid.** The crashed script had left its `kubectl port-forward` running and holding `127.0.0.1:11437`. The reproduction's new port-forwards couldn't bind, and every request went silently to the old pod. That showed as a "second load" that took 0.0 s and added no VRAM. The script now refuses to start a port-forward on a busy port, and closes its port-forwards on exit.
 
@@ -280,12 +285,12 @@ Runs: `k8s-ollama-20261104-154245` (full) and `…-155942` (`--contend`). Run 2 
 |---|---|
 | A: create 10–15 s, import 120–150 s, `127.0.0.1:6445`, no `nvidia.com/gpu` | ✅ 11.2–11.3 s, 125–144 s |
 | B: unprivileged blocked, privileged works | ✅ |
-| C pod 1: Ready ≈5 s, first answer 85–100 s, ≈97 tok/s, +≈3,900 MiB | ✅ 5.0–5.4 s, 86–89 s, +3,899–3,975; speed ✅ 98.3 in run 2, ❌ 89.3 in run 1 |
-| C pod 2: 85–100 s again | ✅ 85.7–86.1 s |
-| C pod 3 (empty cache volume): 85–100 s | ✅ 85.5–86.1 s |
-| C pod 4 (cache on the node): ≤ 10 s | ✅ 3.8 s |
+| C pod 1: Ready ≈5 s, first answer 85–100 s, ≈97 tok/s, +≈3,900 MiB | ✅ 5.0–5.4 s, +3,899–3,975; first answer ✅ 86–89 s, ≈ 81.9 in run 3 (just under); speed ✅ 98.3 / 98.9, ❌ 89.3 in run 1 |
+| C pod 2: 85–100 s again | ✅ 85.7–86.1 s; ≈ 80.5 in run 3 |
+| C pod 3 (empty cache volume): 85–100 s | ✅ 85.5–86.1 s; ≈ 80.0 in run 3 |
+| C pod 4 (cache on the node): ≤ 10 s | ✅ 3.7–3.8 s |
 | D: both on the one node, both see `/dev/dxg`, nothing Pending | ✅ |
-| D `--contend`: the second load succeeds, ≈9.7 GB | ½ failed in the run (HTTP 500, OOM); succeeded 4/4 in the manual reproduction at 9.3 GB |
+| D `--contend`: the second load succeeds, ≈9.7 GB | ½ failed in run 2 (HTTP 500, OOM); succeeded 4/4 in the manual reproduction (9.3 GB) and in run 3 (9.5 GB) |
 | (not predicted) | ❌ Ollama in the pods planned with a fixed 9,071 MiB free |
 
 **What Step 2 teaches:**
