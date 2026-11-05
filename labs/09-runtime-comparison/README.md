@@ -150,6 +150,32 @@ ollama stop qwen3.5:4b
 | C | aggregate within ±5% (≈290 tok/s) | Step 1: 288–294 for the bundled build |
 | D | tg128 ≈ 145–155 tok/s (a little above the server: no HTTP, no sampler); pp512 ≈ 5–7K tok/s | Step 1: server 143 and ≈5.6K at 1,640 tokens |
 
+### Step 3 — LM Studio: what a desktop runtime installs, and what it runs
+
+**What we're learning:** the third kind of runtime, a desktop application, from an operator's point of view. What does it put on the machine? What does it listen on? What engine does it actually run, and with which defaults? We find out by measuring, not from its docs.
+
+**Approved 2026-11-05.** I downloaded and checked the installer; you run it.
+* **The installer:** `LM-Studio-0.4.28-2-x64.exe` from `installers.lmstudio.ai/win32/x64/0.4.28-2/`.
+  * 625,735,320 bytes, which matches the server's `Content-Length`; sha256 `442aa5cdb5b7d0a6693ba6d11e1663838afb2cdd8f5bfcc538cad23f00f0cf68`. LM Studio publishes no hash to compare against.
+  * **Authenticode `Valid`:** signer *Element Labs Inc.* (Brooklyn, NY), issuer *DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1*, timestamped by DigiCert, certificate valid until 2027-08-31.
+  * ProductVersion `0.4.28+2`.
+* **The docs disagree on where it installs:** one guide says `%LOCALAPPDATA%\LM-Studio`, another says the wizard asks. The `lms` CLI lives in `~\.lmstudio\bin`, and it needs the app to have run once. So `scripts/system_snapshot.ps1` diffs the machine instead. It takes a read-only snapshot of:
+  * user and machine `PATH`;
+  * the HKCU and HKLM Run keys and the Startup folder;
+  * Start-menu entries, HKCU uninstall entries and URL protocol handlers;
+  * scheduled tasks, services and matching firewall rules;
+  * AppData, LocalAppData and the Programs folder;
+  * the home folder's dot-directories, Program Files, and listening ports.
+
+  The "before" snapshot was taken 2026-11-05 12:11.
+* **The model:** `lms import -L` hard-links the existing 4b blob into LM Studio's model folder. That's the same C: volume, so no copy and no download.
+* **Settings to keep off:** "run on login" and "serve on local network". The API's exposure is checked by connecting from the LAN address. Lab 08 found Windows' listener tables unreliable on this build.
+
+**To install** (you):
+1. Run `tools\downloads\LM-Studio-0.4.28-2-x64.exe`, accept the defaults, and note any choice the wizard offers (install location, all users or just you).
+2. Start LM Studio once. If it offers to download a model, **skip** it. If it asks about a runtime or engine download, accept: that's its llama.cpp engine, and Step 3 measures it.
+3. Tell me it's installed. I'll diff the snapshot, report every change, and set up the measurements.
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 — runs 1–3 (2026-11-05, `qwen3.5:4b` from the Ollama store, temperature 0, seed 42)
