@@ -94,6 +94,62 @@ ollama stop qwen3.5:4b                                   # nothing loaded (the s
 | D: `-np 2` / `-np 4` | aggregate ≈1.6× / ≈2.5× of one stream; per-request tok/s lower; VRAM +100–300 MiB per extra slot (low confidence: whether qwen3.5's recurrent layers batch well at all) | Batched decoding shares each weight read; the hybrid model's per-slot state is small (Lab 01: 50 MiB recurrent + 32 KiB/token KV) |
 | E | Ollama adds 5–20 ms per request | Go HTTP, template render, scheduler lookup, proxying to the runner |
 
+### Step 2 — Two builds of the same commit: Ollama's bundled llama-server vs the official b11963
+
+**What we're learning:** whether "llama.cpp" is one thing. The same source can be built with different compilers, CUDA toolkits and GPU-architecture lists. This step holds the commit constant and varies only the build, the way you'd compare two images built from one Dockerfile on different base images.
+
+**Download** (approved 2026-11-05, D-17): into `tools\` (gitignored), from `github.com/ggml-org/llama.cpp/releases/tag/b11963`:
+* `llama-b11963-bin-win-cuda-13.4-x64.zip`, 164,987,385 bytes, sha256 `36e5f512b29879031eb6693a79a9caa4bf9c82fb50523edd0899273359627817`;
+* `cudart-llama-bin-win-cuda-13.4-x64.zip`, 423,535,356 bytes, sha256 `738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668`.
+
+Both hashes match the release's published digests. They were extracted together into `tools\llama.cpp-b11963\`: 731 MB, including `llama-bench`, `llama-batched-bench`, `llama-cli` and `llama-perplexity`, none of which Ollama ships.
+
+```powershell
+# what was run (Git Bash); repeat only if tools\ is gone
+curl -sL -o tools/downloads/<zip> https://github.com/ggml-org/llama.cpp/releases/download/b11963/<zip>
+sha256sum tools/downloads/*.zip        # compare with the hashes above
+unzip -q <zip> -d tools/llama.cpp-b11963
+```
+
+**Verified before the run:**
+
+| | bundled with Ollama | official b11963 |
+|---|---|---|
+| `--version` | `0.8.0-dev (build 1, commit 39febd2ad)` | `0.8.0-dev (build 11963, commit 39febd2ad)` |
+| compiler | Clang 18.1.8 | Clang 20.1.8 |
+| CUDA runtime (`cudart64_13.dll`) | 6.14.11.**13000** (13.0) | 6.14.11.**13040** (13.4) |
+| cuBLAS / cuBLASLt | 13.0 (50.3 / 477.9 MB) | 13.7 (54.9 / 492.8 MB) |
+| `ggml-cuda.dll` | 141.0 MB | 155.0 MB |
+| backend loading | needs `GGML_BACKEND_PATH` (Step 1) | self-contained: backends next to the exe |
+
+* **The official build runs on the GPU** with the driver's CUDA 13.1, so CUDA's minor-version compatibility covers the 13.4 runtime. It was healthy in 6.2 s on its first start, used +≈3,900 MiB, and generated 140.9–143.1 tok/s with llama-server's sampler defaults. The bundled build gave 142.8 in Step 1.
+* **A mistake of mine in the probe:** PowerShell variable names aren't case-sensitive, so `$P = '<prompt>'` overwrote `$p`, the process handle. The server kept running until I stopped it by its executable path, `tools\llama.cpp-b11963\llama-server.exe`, which only the lab's copy has. The script uses Python and its own process handles.
+
+**What runs** (`scripts/build_compare.py`, ≈8 min):
+* **A + B, 4 server processes in turn** (bundled, official, bundled, official), with Step 1's flags and the same GGUF blobs. For each:
+  * process → healthy, and VRAM;
+  * generation with Ollama's and with llama-server's sampler options (median of 5);
+  * prompt processing on unique 1,640-token prompts (median of 3);
+  * whether the text is byte-identical across all 4 processes.
+* **C.** Each build with `-np 4` and 4 concurrent requests.
+* **D.** `llama-bench -p 512 -n 128 -r 5 -fa auto` on the official build, the figure llama.cpp's own tooling reports.
+
+```powershell
+ollama stop qwen3.5:4b
+.\.venv\Scripts\python scripts\build_compare.py          # ≈8 min
+```
+
+**Predictions** (written before the first full run):
+
+| Measure | Prediction | Why |
+|---|---|---|
+| A | healthy in 4.5–6.5 s for both; VRAM within ±50 MiB | Same model, same buffers; the cuBLAS workspace may differ slightly |
+| B: generation | equal within ±3% for both sampler settings | Decoding one token uses llama.cpp's own CUDA kernels (quantized matrix-vector), compiled from the same source |
+| B: prompt processing | may differ by up to ±10% (low confidence) | Batched prefill can go through cuBLAS, and the versions differ (13.0 vs 13.7) |
+| B: text | byte-identical across all 4 processes (moderate confidence) | Same kernels; Lab 08 Step 1 found even the Linux container build byte-identical. A different cuBLAS could change rounding in prefill |
+| C | aggregate within ±5% (≈290 tok/s) | Step 1: 288–294 for the bundled build |
+| D | tg128 ≈ 145–155 tok/s (a little above the server: no HTTP, no sampler); pp512 ≈ 5–7K tok/s | Step 1: server 143 and ≈5.6K at 1,640 tokens |
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 — runs 1–3 (2026-11-05, `qwen3.5:4b` from the Ollama store, temperature 0, seed 42)
@@ -164,6 +220,55 @@ Runs: `engine-compare-20261105-111624`, `…-111808` and `…-111947`, all mine.
 4. **Batching is where llama-server pulls ahead.** 4 slots gave 2.26× the throughput for ≈525 MiB more, a configuration Ollama doesn't offer for this model. For one user that's irrelevant; for a shared service it's the main difference.
 5. **Check your cache.** A repeated prompt measured Ollama's prompt cache, not its prompt processing: 39K against 5.6K tok/s.
 
+### Step 2 — run 1 (2026-11-05, `qwen3.5:4b` GGUF, temperature 0, seed 42)
+
+Run: `build-compare-20261105-114941`, mine. 4 server processes in turn, then `-np 4` once per build, then `llama-bench`.
+
+**1. Same commit, same output, same memory.**
+
+| build | round | process → healthy | VRAM Δ | gen tok/s, Ollama's options | gen tok/s, llama-server's | prompt tok/s, 1,640 tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| bundled | 1 | 5.59 s | 3,897 MiB | 120.0 | 143.6 | 5,755 |
+| official | 1 | 5.04 s | 3,897 MiB | **127.8** | 142.6 | 5,691 |
+| bundled | 2 | 4.56 s | 3,899 MiB | 119.8 | 142.7 | 5,706 |
+| official | 2 | 4.81 s | 3,899 MiB | **127.4** | 142.2 | 5,694 |
+
+* **The text was byte-identical across all 4 processes,** for both sampler settings (57 and 61 tokens). Different compilers and CUDA 13.0 against 13.4 changed no output bytes.
+* **Memory was identical** (3,897–3,899 MiB). Prompt processing was within 1.1%, and generation with llama-server's options within 1%.
+
+**2. The difference is in the presence-penalty sampler, on the CPU.**
+* With Ollama's options (`presence_penalty 1.5`), the official build was **6.5% faster** in both rounds: 127.4–127.8 against 119.8–120.0.
+* Per token, the penalty costs ≈1.35 ms in the bundled build and ≈0.81 ms in the official one (1/120 − 1/143 against 1/127.6 − 1/142.4).
+* The GPU work is the same in both builds: the same generation speed without the penalty, and the same bytes with it. So the difference is the CPU code that applies the penalty to all 248K token scores. The compiler (Clang 20.1.8 against 18.1.8) or its flags are plausible causes, but **neither is verified**.
+* **Lesson:** "the same llama.cpp" can differ by 6% because of how it was built, and only in some configurations. Benchmark the binary you'll actually run, with the options you'll actually use.
+
+**3. Batching and llama-bench.**
+* **`-np 4` with 4 concurrent requests:**
+  * bundled: 296.5 tok/s aggregate (88 per request);
+  * official: 289.9 (86 per request), 2.2% lower;
+  * both +4,441 MiB, and the same text in every slot.
+* **`llama-bench`** (official only): **pp512 6,784 ± 89 tok/s, tg128 154.5 ± 0.7 tok/s.**
+  * That's 8% above the server's generation speed (142–143), with no HTTP, no sampler and no detokenizing.
+  * It's also above the server's 5.7K prompt rate, measured at 1,640 tokens and per request.
+  * Figures from llama.cpp's own tooling are therefore an upper bound for what a served API delivers.
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| A: healthy 4.5–6.5 s; VRAM ±50 MiB | ✅ 4.56–5.59 s; identical (3,897–3,899) |
+| B: generation equal ±3% | ✅ with llama-server's options (≤1%); ❌ with Ollama's: official +6.5% |
+| B: prompt processing ±10% (low confidence) | ✅ within 1.1% |
+| B: byte-identical across all 4 | ✅ |
+| C: aggregate ±5% (≈290) | ✅ 296.5 / 289.9 |
+| D: tg128 145–155; pp512 5–7K | ✅ 154.5; 6,784 |
+
+**What Step 2 teaches:**
+1. **A llama.cpp version doesn't determine its speed; the build does.** The same commit with a different compiler and CUDA toolkit gave the same bytes and the same GPU speed, but a 6.5% difference in the CPU-side sampler.
+2. **The difference only shows in some configurations.** Without a presence penalty the builds were equal. A benchmark with one sampler setting would have called them identical, and one with Ollama's defaults would have called the official build faster.
+3. **Ollama's 18% gap from Step 1 had two parts:** its default penalty (≈17%), and on top of that a build whose penalty path is slower than the official one.
+4. **Synthetic benchmarks set the ceiling.** `llama-bench`'s tg128 was 8% above a served request. Quote them as the engine's limit, not as an API's throughput.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Cause | Check / fix |
@@ -174,16 +279,19 @@ Runs: `engine-compare-20261105-111624`, `…-111808` and `…-111947`, all mine.
 | llama-server: `no API key is set and CORS allows all origins` | llama-server's defaults | Keep `--host 127.0.0.1`; set `--api-key` if anything else can reach it |
 | Ollama's prompt eval is 7× faster than llama-server's on the same prompt | The prompt was repeated: Ollama reused its prompt cache (`prompt_eval_cached_count`), and the other side ran with `cache_prompt: false` | Make every benchmark prompt unique; check `prompt_eval_cached_count` |
 | Chat answers through llama-server start with `<think>\n\n</think>` | The generic `chatml` template has no thinking control, so the model writes the empty block itself | Use the model's own template (`--jinja` with the GGUF's template, or Ollama's renderer), or strip it in the client |
+| Two builds of one llama.cpp commit differ in tok/s for some settings only | CPU-side code (e.g. the presence-penalty sampler) built by different compilers or flags; GPU kernels and output are the same | Benchmark the binary and options you'll run; compare with and without penalties |
+| A PowerShell script loses its process handle (`Stop-Process: … 'Id' because it is null`) | PowerShell variable names aren't case-sensitive: `$P` and `$p` are the same variable | Use distinct names; stop a lab process by its full executable path |
 | `OLLAMA_NUM_PARALLEL` has no effect for qwen3.5 | Ollama starts its runner with `-np 1` for this model (Lab 04) | Run llama-server with `-np N` directly if you need batching |
 
 ## 7. Cleanup
 
 ```powershell
 ollama stop qwen3.5:4b
-Get-Process llama-server -ErrorAction SilentlyContinue | Where-Object Path -like '*Ollama\lib\ollama\*' | Select-Object Id, Path   # check before stopping: Ollama's own runner has the same path
+Get-Process llama-server -ErrorAction SilentlyContinue | Select-Object Id, Path   # check before stopping: Ollama's own runner has the bundled path
+Remove-Item -Recurse tools\downloads, tools\llama.cpp-b11963   # optional: the official build (589 MB of zips + 731 MB); needed for Step 2 reruns
 ```
 
-The scripts stop the llama-server they started. Ollama's own runner uses the same executable, so check before stopping one by hand. Nothing in Step 1 is installed or changed.
+The scripts stop the llama-server they started. Ollama's own runner uses the bundled executable, so check before stopping one by hand. Nothing in Steps 1–2 is installed: the official build is a folder of files under `tools\`, with no installer, registry entries or PATH change.
 
 ## 8. Check Your Understanding
 
@@ -194,3 +302,5 @@ The scripts stop the llama-server they started. Ollama's own runner uses the sam
 5. The same chat request was 23 prompt tokens in Ollama and 19 in llama-server. What were the 4 tokens, and what did the model do without them?
 6. llama-server with `-np 4` gave 2.26× the throughput but 61% of the per-request speed. When would you choose it over Ollama's single slot, and what does each extra slot cost?
 7. Runs 1–2 showed Ollama processing prompts at 39K tok/s. What was really measured?
+8. The official and the bundled build produced the same bytes, yet one was 6.5% faster with Ollama's options and equal without them. Where in the pipeline can that difference sit, and why not on the GPU?
+9. `llama-bench` said 154.5 tok/s and the server 142–143 tok/s with the same binary. What does the benchmark leave out?

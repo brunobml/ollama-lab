@@ -26,3 +26,6 @@ results/raw/
 Thumbs.db
 .DS_Store
 .vscode/
+
+# Downloaded runtimes (Lab 09): binaries, not source
+tools/
