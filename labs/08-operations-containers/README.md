@@ -224,6 +224,59 @@ The analogy is a CSI driver, which also advertises capacity and then mounts some
 | F: replacement pod | not Running until the plugin is back (Pending, or rejected at admission) | Nothing can allocate the device |
 | F: re-apply | `nvidia.com/gpu` back within ≈10 s; the replacement then starts, and answers fast thanks to the node cache | As in A |
 
+### Step 4 — Observability: what Ollama reports, and what a sidecar adds
+
+**What we're learning:** how to watch an inference server that doesn't publish metrics. This is the part an SRE has to design: which signal comes from where, which ones are missing, and which ones mislead.
+
+**Verified before the run (2026-11-05, against Ollama 0.40.13 and a probe container):**
+* **No metrics endpoint.** `/metrics`, `/api/metrics` and `/debug/pprof/` all return 404, on Windows and in the container.
+* **The access log line** is `[GIN] <time> | <status> | <latency> | <client IP> | <method> "<path>"`. There's no model, no token count, and no request id.
+* **llama-server's `print_timing` lines** carry the per-request numbers: prompt eval and eval time and tokens. They're keyed by a slot and task id, not by model or request.
+  * They also show the prompt cache: a repeated prompt evaluated only `4 tokens`.
+  * One warm request wrote **≈3.2 KB of log at INFO** and ≈4.7 KB at `OLLAMA_DEBUG=1`.
+* **The response's `total_duration` includes the time spent queued.** In the probe, the 6th of 6 concurrent requests reported 3.79 s against ≈0.6 s of work, and the access log's latency matched `total_duration`.
+* **`OLLAMA_MAX_QUEUE` (default 512) only limits requests waiting for the scheduler.** In the 0.40.13 source (`server/sched.go`), a request for a model that's already loaded skips that queue and waits in the runner, with no limit.
+  * In the probe, 6 requests to a warm model gave 6× 200.
+  * On a cold model with `MAX_QUEUE=2`: 3× 200, and 3× **503** `server busy, please try again.  maximum pending requests exceeded` in under 1 ms.
+* **A cancelled stream is logged as `200`, with a short latency.** The header has already gone out. Only llama-server's `cancel task` line shows it. `499 request canceled` exists in the source, for cancellations before the response starts.
+* **`OLLAMA_DEBUG_LOG_REQUESTS=1`** isn't in `ollama serve --help`, but the source and the server's config dump have it: "Log inference request bodies and replay curl commands to a temp directory".
+  * It writes each request body, **prompt included**, to `/tmp/ollama-request-logs-<n>/`, mode `0600`, owner root.
+  * Next to it goes a `curl` replay script aimed at the server's own address.
+* **Measure the measurer.** My probe first showed ≈0.5 s between the client and Ollama on every request. Docker's port added only ≈1 ms (curl: 2.4 vs 1.3 ms to Windows Ollama).
+  * The cost was **creating an `httpx` client: 0.36 s**, of which 0.28 s is building an SSL context from the certifi CA bundle, even for `http://`. A reused client takes 1 ms.
+  * Lab scripts that call `httpx.post(...)` directly include ≈0.3 s in each wall time. The new scripts reuse one client.
+
+**What runs** (`scripts/observe_ollama.py`, ≈6 min):
+* **The setup:**
+  * one lab container, `ollama-lab-obs`, on `127.0.0.1:11438`, with `NUM_PARALLEL=1` and `MAX_QUEUE=2`;
+  * Step 1's model volume;
+  * a lab volume for `/root/.nv`, so the second configuration starts warm.
+* **The sidecar:** `scripts/metrics_proxy.py` runs in front on `127.0.0.1:11439`. It's a reverse proxy that records each request's status, model, time to first token (TTFT), wall time, client disconnects and Ollama's timing fields. Queue time is computed as `total − load − prompt eval − eval`. It serves Prometheus text on `/metrics`, and it can also run standalone.
+* **The preflight refuses to start** if any other `ollama-lab*` or `k3d-ollama-lab*` container exists, or if the Windows Ollama has a model loaded. That's the overlap that skewed Step 3's run 2.
+* **The parts:**
+  * **A:** endpoints, one request's log lines and bytes, the response fields.
+  * **B:** 8 concurrent streaming requests on a warm model through the proxy: TTFT, wall, Ollama's total, queue and eval, against the access log.
+  * **C:** a burst of 6 on a warm model, then on a cold one, with `MAX_QUEUE=2`.
+  * **D:** a client that closes a stream after 20 chunks.
+  * **E:** `OLLAMA_DEBUG=1` + `OLLAMA_DEBUG_LOG_REQUESTS=1`: log bytes, where the prompt appears, and whether the files survive `docker restart`.
+  * **F:** the proxy's `/metrics`.
+
+```powershell
+.\.venv\Scripts\python scripts\observe_ollama.py     # ≈6 min; removes its container and volume at the end
+```
+
+**Predictions** (written before the first full run):
+
+| Measure | Prediction | Why |
+|---|---|---|
+| A | 404s; one `[GIN]` line with no model; ≈3.2 KB of log per request; durations and counts in the response | Probe |
+| B | request *i* waits ≈ *i* × 1.3 s (128 tokens at ≈97 tok/s): queue 0 → ≈9 s, TTFT ≈ queue; `total_duration` ≈ client wall; the access log latency ≈ total | Probe: the queue is inside `total_duration` |
+| C warm | 6× 200, no 503 | The loaded-runner path skips the queue |
+| C cold | 3× 200 + 3× 503 in a few ms | Probe |
+| D | access log `200` with a short latency; llama-server `cancel task`; the proxy marks the disconnect; eval stops early (fewer than 400 tokens) | Probe; Lab 04 (cancellation) |
+| E | ≈1.45× the INFO log bytes; the prompt not in the container log; one body file per request containing it; the files survive `docker restart` (writable layer) and a new directory is added | Probe; `docker restart` keeps the container filesystem (Step 1) |
+| F | requests by status incl. `503`, 1 client disconnect, token counters, queue and TTFT histograms, the loaded model's `size_vram` | What the proxy records |
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 — runs 1 and 2 (2026-11-04, `qwen3.5:4b`, temperature 0, seed 42, think off; run 2 with `--contend`)
@@ -363,12 +416,14 @@ Runs: `k8s-ollama-20261104-154245` (full) and `…-155942` (`--contend`). Run 2 
 3. **Ollama's VRAM planning trusts a number that, in these pods, didn't move.** On shared GPUs, decide the budget outside Ollama: one model-serving pod per GPU, or a hard memory split such as MIG on GPUs that have it (the 3080 doesn't), not two pods relying on luck. The device plugin's time-slicing shares a GPU between pods but doesn't split its memory. The failure mode is a 500 on the request that triggers the load, not a slow request.
 4. **Check that a result came from the target you meant.** A leftover port-forward made the wrong pod answer without any error. The "0.0 s load" was the only sign.
 
-### Step 3 — run 1 (2026-11-05, `qwen3.5:4b`, temperature 0, seed 42, think off)
+### Step 3 — runs 1 and 2 (2026-11-05, `qwen3.5:4b`, temperature 0, seed 42, think off)
 
-Run: `k8s-gpu-plugin-20261105-102823`. I ran it end to end as the script's test, after writing the E and F predictions. Every part matched its prediction.
+Runs: `k8s-gpu-plugin-20261105-102823` (mine, as the script's test, after writing the E and F predictions) and `…-103900` (yours). Every part matched its prediction in both. Values below are run 1 / run 2.
+
+**Run 2 caveat:** from 17:39:26 to 17:41:52 UTC, a probe container of mine for Step 4 held the 4b on the same GPU. I hadn't seen that your run had started. That overlaps run 2's Part B, whose `nvidia-smi` line reads 5,433 MiB instead of ≈1,540: +3,880, one 4b load. Parts C–F started after I removed the container.
 
 **1. The plugin turned the GPU into a resource Kubernetes can count.**
-* `nvidia.com/gpu` went from absent to **capacity 1 / allocatable 1, 1.5 s after `kubectl apply`**.
+* `nvidia.com/gpu` went from absent to **capacity 1 / allocatable 1, 1.5 / 8.3 s after `kubectl apply`**. The spread is likely the kubelet's node-status update interval, but that isn't verified.
 * The log said `Detected platform: wsl` and used the driver store `nvhdci.inf_amd64_d13945b69e80a76d`.
 * It wrote one CDI spec: kind `k8s.device-plugin.nvidia.com/gpu`, device `all` = `/dev/dxg`, 8 read-only mounts, no hooks, and `NVIDIA_VISIBLE_DEVICES=void`. That env var tells any NVIDIA runtime to do nothing; CDI does the work.
 * It warned twice: `Could not locate libdxcore.so`.
@@ -386,42 +441,117 @@ Run: `k8s-gpu-plugin-20261105-102823`. I ran it end to end as the script's test,
 
 **3. Unprivileged Ollama matched the privileged pod.**
 * Inside the pod: `CapEff 0000000000000000`, 17 devices, and `/dev/dxg` present (`crw-rw-rw- 10, 258`).
-* Ready took 4.4 s. The first request took 81.8 s (load 41.4 s), with the kernel cache empty and 78,948 KB written to the node.
-* Warm generation was **98.7 tok/s** (samples 97.1–101.2), using +3,909 MiB at 100% GPU.
-* After a pod deletion, with the cache kept on the node: Ready in 4.0 s, first request **3.7 s**.
+* Ready took 4.4 / 3.6 s. The first request took 81.8 / 84.3 s (load 41.4 / 43.5 s), with the kernel cache empty and 78,948 KB written to the node.
+* Warm generation was **98.7 / 97.9 tok/s** (samples 96.2–101.2), using +3,909 / +3,880 MiB at 100% GPU.
+* After a pod deletion, with the cache kept on the node: Ready in 4.0 / 4.1 s, first request **3.7 / 3.8 s**.
 * **The planning line still said 9,071 MiB free.** The plugin changes who may use the GPU, not what Ollama believes is free.
 
 **4. Counting the GPU changes the failure modes.**
 * **`replicas: 2`:** one pod Running, the other **Pending, `Insufficient nvidia.com/gpu`**. In Step 2 both ran, and two loads filled the card.
-* **`RollingUpdate`:** the new pod stayed Pending, the old pod kept serving, and `rollout status` timed out after 45 s with `1 old replicas are pending termination`. That's 25% `maxSurge` rounding up to 1 and 25% `maxUnavailable` rounding down to 0. Switching to `Recreate` finished the rollout in **3.8 s**.
+* **`RollingUpdate`:** the new pod stayed Pending, the old pod kept serving, and `rollout status` timed out after 45 s with `1 old replicas are pending termination`. That's 25% `maxSurge` rounding up to 1 and 25% `maxUnavailable` rounding down to 0. Switching to `Recreate` finished the rollout in **3.8 / 3.5 s**.
 * So `Recreate` is still the right strategy for a 1-GPU Deployment, for a new reason. Before, an update briefly needed twice the VRAM. Now an update would wait forever for a second GPU. `maxSurge: 0, maxUnavailable: 1` would also work.
 
 **5. Removing the plugin: running pods survive, new ones can't start.**
-* With the DaemonSet deleted, the running pod still answered (97.3 tok/s). The device was injected when its container started, and the plugin isn't in the data path.
-* The node went from **(capacity 1, allocatable 1) to (1, 0) within 9.1 s**. Capacity stayed at 1, so the node still reported a GPU that nothing could allocate.
+* With the DaemonSet deleted, the running pod still answered (97.3 / 96.9 tok/s). The device was injected when its container started, and the plugin isn't in the data path.
+* The node went from **(capacity 1, allocatable 1) to (1, 0) within 9.1 / 9.4 s**. Capacity stayed at 1, so the node still reported a GPU that nothing could allocate.
 * After I deleted the Ollama pod, its replacement sat **Pending: `Insufficient nvidia.com/gpu`**.
-* Re-applying the plugin brought allocatable back in **3.3 s**. The replacement was Ready 6.8 s after the re-apply.
+* Re-applying the plugin brought allocatable back in **3.3 / 9.5 s**. The replacement was Ready 6.8 / 13.8 s after the re-apply.
 * Operationally: a plugin outage blocks every GPU reschedule and new GPU pod, but doesn't touch running ones. That's why the official DaemonSet uses `priorityClassName: system-node-critical`, and this one copies it.
 
 **Predictions vs observed:**
 
 | Prediction | Observed |
 |---|---|
-| A: `nvidia.com/gpu: 1` within ≈10 s; `/dev/dxg` + 8 mounts, no hooks; libdxcore warning | ✅ 1.5 s |
+| A: `nvidia.com/gpu: 1` within ≈10 s; `/dev/dxg` + 8 mounts, no hooks; libdxcore warning | ✅ 1.5 / 8.3 s |
 | B: CDI only fails, CDI + libs works unprivileged, the third pod waits | ✅ |
-| C: `CapEff 0`, 17 devices; 80–90 s; ≈97 tok/s; +≈3,900; 9,071; pod 2 ≤ 10 s | ✅ 81.8 s, 98.7 tok/s, +3,909, 9,071, 3.7 s |
+| C: `CapEff 0`, 17 devices; 80–90 s; ≈97 tok/s; +≈3,900; 9,071; pod 2 ≤ 10 s | ✅ 81.8 / 84.3 s, 98.7 / 97.9 tok/s, +3,909 / +3,880, 9,071, 3.7 / 3.8 s |
 | D: the second replica Pending | ✅ |
-| E: `RollingUpdate` stuck, `Recreate` completes | ✅ timed out at 45 s; `Recreate` 3.8 s |
-| F: the running pod keeps answering | ✅ 97.3 tok/s |
-| F: allocatable drops to 0 (timing unsure) | ✅ 9.1 s; capacity stays 1 |
+| E: `RollingUpdate` stuck, `Recreate` completes | ✅ timed out at 45 s; `Recreate` 3.8 / 3.5 s |
+| F: the running pod keeps answering | ✅ 97.3 / 96.9 tok/s |
+| F: allocatable drops to 0 (timing unsure) | ✅ 9.1 / 9.4 s; capacity stays 1 |
 | F: the replacement doesn't run until the plugin is back | ✅ Pending, `Insufficient nvidia.com/gpu` |
-| F: back within ≈10 s, replacement fast | ✅ 3.3 s, Ready at 6.8 s |
+| F: back within ≈10 s, replacement fast | ✅ 3.3 / 9.5 s, Ready at 6.8 / 13.8 s |
 
 **What Step 3 teaches:**
 1. **A device plugin does two jobs: it advertises a count and it injects devices.** Here CDI did the injecting, through k3s's containerd, with no NVIDIA runtime on the node. The device cgroup let `/dev/dxg` through because CDI added it, which was the job `privileged: true` did in Step 2.
 2. **Least privilege, almost.** The GPU workload runs with no capabilities and the default device set. One `hostPath` remains: the node's `/usr/lib64`, for `libdxcore.so`, which the plugin's WSL spec leaves out. Pod Security's `baseline` level rejects `hostPath` volumes. On a native Linux node with the NVIDIA Container Toolkit, the CDI spec covers the libraries too.
 3. **`nvidia.com/gpu: 1` is a whole device, not a memory budget.** It stopped a second Ollama from sharing the card. It doesn't tell Ollama how much memory is free (still 9,071 MiB), and it doesn't size a model.
 4. **Once GPUs are counted, rollout and capacity planning change.** A 1-GPU Deployment can't surge, and a plugin outage freezes GPU scheduling. Watch the plugin like any other node agent: allocatable dropping to 0 while capacity stays at 1 is the signal.
+
+### Step 4 — run 1 (2026-11-05, `qwen3.5:4b`, temperature 0, seed 42, think off)
+
+Run: `observe-ollama-20261105-105709`, mine, as the script's test after the predictions were written.
+
+An earlier run, `…-105416`, finished but lost the log-derived values. I'd diffed `docker logs` with stdout and stderr concatenated, and Ollama writes the `[GIN]` access log to stdout and everything else to stderr. A growing stderr shifted the stdout offset, so the `[GIN]` lines came back empty. The script now diffs each stream separately. Its non-log numbers match this run.
+
+**1. What Ollama gives you for one request.**
+* **Endpoints:** `/metrics`, `/api/metrics` and `/debug/pprof/` return 404.
+* **Access log:** one line, `[GIN] … | 200 | 641.15ms | 172.17.0.1 | POST "/api/generate"`.
+* **llama-server's timing lines:** three of them, `prompt eval time = 54.61 ms / 4 tokens`, `eval time = 581.95 ms / 57 tokens (96.23 tokens per second)` and `total time`, keyed by `task 18`.
+* **Log volume:** 2,438 bytes in 25 lines for one warm request at INFO.
+* **The response carries 7 timing fields:** `total_duration`, `load_duration`, `prompt_eval_count/duration`, `eval_count/duration`, and `prompt_eval_cached_count`, which says how much of the prompt came from the cache.
+* **Each signal has a gap:**
+  * the access log has the status and latency but not the model;
+  * the timing lines have the tokens but not the request;
+  * the response has everything, but only the client sees it.
+
+**2. Queueing is visible, if you know where to look.** 8 concurrent streams, `NUM_PARALLEL=1`, each answer 57 tokens:
+
+| # | TTFT | wall | Ollama `total_duration` | queue = total − phases | eval |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.107 | 0.695 | 0.690 | 0.046 | 0.587 |
+| 1 | 0.704 | 1.302 | 1.296 | 0.640 | 0.597 |
+| 3 | 1.909 | 2.506 | 2.500 | 1.845 | 0.596 |
+| 7 | 4.330 | 4.934 | 4.928 | 4.266 | 0.603 |
+
+* **The queue grew by ≈0.6 s per request,** one answer's eval time. Eval stayed flat at 0.58–0.60 s, so the requests ran strictly one after another.
+* **`total_duration` includes the queue.** It was within 7 ms of the client's wall time, and the access log's latency matched it (`690.93ms` … `4.92s`).
+* **TTFT = queue + ≈0.06 s.** The waiting happens before the first token, so the client's TTFT, or `total − load − prompt eval − eval` from the response, is the queue signal. The access log can't tell slow from queued.
+
+**3. Overload: `OLLAMA_MAX_QUEUE` only guards a cold model.**
+* **Warm model, 6 requests:** 6× 200, finishing at 0.38 → 2.04 s. Nothing was rejected; the wait grew instead.
+* **Cold model, 6 requests:** 3× 200 (after 3.2–4.0 s: load and run) and **3× 503 within 4–6 ms**, `server busy, please try again.  maximum pending requests exceeded`.
+* So the limit is a load-time guard, not a concurrency limit. A warm server takes every request and queues it in the runner with no bound. Shed load in front of Ollama, at the proxy, gateway or ingress, if you need a limit.
+
+**4. A client that disconnects is logged as a fast success.**
+* The client read 20 chunks and closed at 0.28 s.
+* The access log said `200 | 298.86ms`.
+* llama-server logged `stop: cancel task, id_task = 100`, and printed no timing line, so the logs don't show how many tokens were generated.
+* The proxy recorded `client_disconnected: True` and counted it in `ollama_proxy_client_disconnects_total`.
+* **In access-log terms a cancelled stream looks like a fast 200.** A dashboard built on those lines would read user abandonment as good latency.
+
+**5. Debug logging costs volume, and request logging writes prompts to disk.**
+* **Volume:** `OLLAMA_DEBUG=1` wrote 4,080–4,726 bytes per warm request, **1.7–1.9×** INFO. The prompt never appeared in the container log at either level.
+* **Request logging:** `OLLAMA_DEBUG_LOG_REQUESTS=1` logged its own warning at start (`… include request bodies and replay curl commands`). It wrote **one body file per request, 4 of 4 holding the prompt**, mode `0600` root, plus a replay script: `curl … --url "http://127.0.0.1:11438/api/generate" … --data-binary @…body.json`.
+* **After `docker restart` the files were still there,** and a second directory had been added. Nothing rotates or deletes them. They live as long as the container's writable layer, which in Kubernetes means until the pod is deleted.
+
+**6. The sidecar's `/metrics` holds what an SRE needs.**
+* `requests_total` by status: 18× 200, 3× 503.
+* `client_disconnects_total`: 1.
+* `tokens_total`: 744 completion, 391 prompt. Prompt tokens count only those evaluated, not cached ones.
+* Histograms for request, TTFT, queue and load seconds.
+* `in_flight`, and the loaded model's `size_vram` (3,140,495,604 bytes) from `/api/ps`.
+* The full scrape is in `metrics.txt`.
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| A: 404s; one `[GIN]` line without a model; ≈3.2 KB per request; durations and counts | ✅ ; ❌ 2.4 KB (the probe's 3.2 KB counted a different request) |
+| B: queue ≈ *i* × 1.3 s; TTFT ≈ queue; total ≈ wall; access log ≈ total | ✅ shape and equalities; ❌ ≈ *i* × 0.6 s: I assumed 128 tokens, and the answer stopped at 57 |
+| C warm: 6× 200 | ✅ |
+| C cold: 3× 200 + 3× 503 in a few ms | ✅ 4–6 ms |
+| D: access log 200 and short; `cancel task`; proxy marks it; eval stops early | ✅ ✅ ✅; not observable: no timing line for a cancelled task |
+| E: ≈1.45× bytes; prompt not in the log; one file per request; files survive `docker restart` + a new directory | ❌ 1.7–1.9×; ✅ ✅ ✅ |
+| F: statuses incl. 503, 1 disconnect, tokens, histograms, `size_vram` | ✅ |
+
+**What Step 4 teaches:**
+1. **Ollama is observable only from outside.** No metrics endpoint; an access log without a model; token timings without a request id. A sidecar or gateway that reads the response's timing fields gives you per-model RED metrics (rate, errors, duration) plus TTFT, queue and tokens. In Kubernetes that's a sidecar container in the pod, or the ingress or gateway.
+2. **Queue time hides inside latency.** `total_duration` and the access log include it. Use TTFT, or total minus the phases, for a saturation signal. With `NUM_PARALLEL=1`, latency grows by one answer's length per queued request.
+3. **`OLLAMA_MAX_QUEUE` doesn't protect a warm server.** It returned 503 only while the model was loading. Put rate limits and concurrency caps in front.
+4. **Access-log status lies about cancellations.** A client that leaves mid-stream is a fast 200. Count disconnects where you can see them.
+5. **Debug options are data-handling decisions.** Request logging puts every prompt, with a ready-made replay command, into files that outlive restarts. Treat it like turning on body logging in an API gateway: off by default, time-boxed, and the files deleted afterwards.
+6. **Measure the measurer.** About 0.3 s of my "server latency" was the client building an SSL context, and a log diff mixed two streams. Both were found by comparing two independent measurements.
 
 ## 6. Troubleshooting & Failure Modes
 
@@ -448,6 +578,13 @@ Run: `k8s-gpu-plugin-20261105-102823`. I ran it end to end as the script's test,
 | GPU pod: `Failed to initialize NVML: N/A`; `/dev/dxg` and the driver-store files are there | The plugin's WSL CDI spec lacks `libdxcore.so`, which Docker put in the node's `/usr/lib64` | Mount the node's `/usr/lib64` read-only on the image's `LD_LIBRARY_PATH` (`/usr/local/nvidia/lib64` for Ollama) |
 | `0/1 nodes are available: 1 Insufficient nvidia.com/gpu` | Every GPU is allocated, or the plugin is gone (allocatable 0, capacity unchanged) | `kubectl get node -o jsonpath='{.status.allocatable}'`; check the plugin DaemonSet |
 | A 1-GPU Deployment's rollout hangs: `1 old replicas are pending termination` | `RollingUpdate` surges a pod that needs a GPU no node has free | `strategy: Recreate`, or `maxSurge: 0` + `maxUnavailable: 1` |
+| No `/metrics` on Ollama (404); dashboards have no model or token data | Ollama 0.40.13 exports no metrics; the access log has no model | Put a proxy or gateway in front that reads the response's `*_duration`/`*_count` fields (`scripts/metrics_proxy.py`) |
+| Latency climbs under load but the server looks healthy | Requests queue in the runner (`NUM_PARALLEL=1`), and `total_duration` and the access log include the wait | Watch TTFT, or `total − load − prompt_eval − eval`; cap concurrency in front |
+| `OLLAMA_MAX_QUEUE` set but no 503s under load | The limit applies only to requests waiting for the scheduler (model load); a loaded model's requests skip it | Rate-limit at the proxy or ingress |
+| 503 `server busy, please try again.  maximum pending requests exceeded` | A burst arrived while the model was loading and the scheduler queue was full | Warm the model first; raise `OLLAMA_MAX_QUEUE`; retry with backoff |
+| Cancelled streams look like fast 200s | The 200 header was sent before the client left; only llama-server logs `cancel task` | Count disconnects at the proxy |
+| Prompts found under `/tmp/ollama-request-logs-*` | `OLLAMA_DEBUG_LOG_REQUESTS=1` saves every request body and a curl replay script; nothing deletes them | Leave it off; if used, time-box it and delete the directory (or the pod) |
+| Every request in a script is ≈0.3 s slower than the server says | A new `httpx` client per call builds an SSL context (certifi bundle), even for `http://` | Reuse one `httpx.Client` |
 | `docker run --entrypoint /bin/ollama …` fails from Git Bash | Git Bash rewrites `/bin/ollama` to `C:/Program Files/Git/bin/ollama` | `MSYS_NO_PATHCONV=1`, or use PowerShell |
 
 ## 7. Cleanup
@@ -455,7 +592,7 @@ Run: `k8s-gpu-plugin-20261105-102823`. I ran it end to end as the script's test,
 ```powershell
 wsl -d Ubuntu -- k3d cluster delete ollama-lab             # Steps 2-3 (the scripts already do this unless --keep)
 Remove-Item $HOME\.kube\ollama-lab.yaml -ErrorAction SilentlyContinue
-docker rm -f ollama-lab-bind ollama-lab-volume 2>$null   # the script already does this
+docker rm -f ollama-lab-bind ollama-lab-volume ollama-lab-obs 2>$null   # the script already does this
 docker volume rm ollama-lab-models                          # the 3.3 GB copy of the 4b
 docker image rm nvcr.io/nvidia/k8s-device-plugin:v0.20.1    # optional: 161 MB (Step 3)
 docker image rm ollama/ollama:0.40.13                       # optional: 5 GB; keep it for later steps
@@ -480,3 +617,8 @@ Docker Desktop can stay running or be quit from the tray. Nothing in this lab ch
 12. The Ollama pod has no capabilities, yet it opens `/dev/dxg`. Which component put the device in its container and its device cgroup, and which file told it how?
 13. With `nvidia.com/gpu: 1`, why does a default `RollingUpdate` hang, while in Step 2 it would have run two pods on one GPU?
 14. The plugin was deleted and the running Ollama pod kept working, but its replacement stayed Pending. Explain both, and name the node status field you'd alert on.
+15. Which three places does Ollama report a request's numbers, and what does each lack?
+16. The 8th of 8 concurrent requests had a `total_duration` of 4.9 s, but its eval took 0.6 s. Where did the rest go, and which metric would have shown it as saturation rather than slowness?
+17. Why did `OLLAMA_MAX_QUEUE=2` reject requests to a cold model but none to a warm one, and where would you enforce a concurrency limit instead?
+18. A dashboard built from access logs shows p50 latency improving while users complain. How can cancelled streams produce that picture?
+19. What does `OLLAMA_DEBUG_LOG_REQUESTS=1` write, who can read it, and how long does it last in a container and in a pod?
