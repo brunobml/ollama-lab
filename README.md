@@ -25,6 +25,7 @@ A hands-on learning lab for local LLM inference with Ollama on an RTX 3080 (10 G
 * [Lab 06 — Tool Calling, MCP & AI Agents](labs/06-tools-mcp-agents/README.md) ✅
 * [Lab 07 — Multimodal Models: Images as Tokens](labs/07-multimodal/README.md) ✅
 * [Lab 08 — Operations: Ollama in Containers and Kubernetes](labs/08-operations-containers/README.md) ✅
+* [Lab 09 — Runtime Comparison: Ollama, llama.cpp and LM Studio](labs/09-runtime-comparison/README.md) — in progress
 
 Each lab README follows the same template; measured results are in its section 5 ("Hypotheses → Observed Metrics").
 
