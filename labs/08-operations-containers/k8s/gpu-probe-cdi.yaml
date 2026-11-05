@@ -1,0 +1,49 @@
+# Lab 08 Step 3, Part B: unprivileged pods that REQUEST the GPU (nvidia.com/gpu: 1) from the device plugin.
+# The plugin's CDI spec injects /dev/dxg and 8 driver-store files, but not libdxcore.so (it looks in /usr/lib/wsl/lib;
+# Docker put it in the node's /usr/lib64). gpu-cdi-only gets only what CDI injects; gpu-cdi-libs adds the node's
+# /usr/lib64 read-only. gpu-second asks for the GPU while another pod holds it.
+apiVersion: v1
+kind: Pod
+metadata: {name: gpu-cdi-only, labels: {app: gpu-probe}}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: debian:bookworm-slim
+    imagePullPolicy: Never
+    command: [sh, -c]
+    args:
+    - 'echo "devices in /dev: $(ls /dev | wc -l)"; grep CapEff /proc/self/status; D=$(ls -d /usr/lib/wsl/drivers/*);
+       echo "driver store files: $(ls $D | wc -l)"; LD_LIBRARY_PATH=$D $D/nvidia-smi --query-gpu=name,memory.used --format=csv,noheader'
+    resources: {limits: {nvidia.com/gpu: 1}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: gpu-cdi-libs, labels: {app: gpu-probe}}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: debian:bookworm-slim
+    imagePullPolicy: Never
+    command: [sh, -c]
+    args:
+    - 'echo "devices in /dev: $(ls /dev | wc -l)"; grep CapEff /proc/self/status; D=$(ls -d /usr/lib/wsl/drivers/*);
+       echo "driver store files: $(ls $D | wc -l)"; LD_LIBRARY_PATH=/host-gpu-lib:$D $D/nvidia-smi --query-gpu=name,memory.used --format=csv,noheader'
+    resources: {limits: {nvidia.com/gpu: 1}}
+    volumeMounts:
+    - {name: gpulib, mountPath: /host-gpu-lib, readOnly: true}
+  volumes:
+  - {name: gpulib, hostPath: {path: /usr/lib64, type: Directory}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: gpu-second, labels: {app: gpu-probe}}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: debian:bookworm-slim
+    imagePullPolicy: Never
+    command: [sh, -c, 'echo got the GPU']
+    resources: {limits: {nvidia.com/gpu: 1}}

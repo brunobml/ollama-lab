@@ -1,0 +1,40 @@
+# Lab 08 Step 3: NVIDIA's device plugin on a k3d node (WSL2, Docker Desktop, no NVIDIA Container Toolkit).
+# Verified on the probe cluster (2026-11-05): the plugin detects the WSL platform from /dev/dxg + the driver store,
+# advertises nvidia.com/gpu: 1 ("all" GPUs behind /dev/dxg), and writes a CDI spec to the node's /var/run/cdi.
+# k3s's containerd 2.3 already has CDI enabled (crictl info: enableCDI true, /etc/cdi and /var/run/cdi), so with
+# deviceListStrategy cdi-cri the kubelet passes the CDI device name to containerd, which adds /dev/dxg to the
+# workload container and its device cgroup. The WORKLOAD needs no privileges; this pod does (a node agent).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin
+  namespace: kube-system
+spec:
+  selector: {matchLabels: {name: nvidia-device-plugin}}
+  template:
+    metadata:
+      labels: {name: nvidia-device-plugin}
+    spec:
+      priorityClassName: system-node-critical
+      containers:
+      - name: plugin
+        image: nvcr.io/nvidia/k8s-device-plugin:v0.20.1   # sha256:27c1b255…; imported, not pulled by the cluster
+        imagePullPolicy: Never
+        env:
+        - {name: DEVICE_LIST_STRATEGY, value: cdi-cri}     # no NVIDIA runtime on the node: CDI instead of env vars
+        - {name: CDI_DISABLE_HOOKS, value: all}            # the hooks run on the node, which has no nvidia-cdi-hook or glibc
+        - {name: NVIDIA_DRIVER_ROOT, value: /}             # the node's /, seen by the plugin at /driver-root
+        - {name: LD_LIBRARY_PATH, value: /driver-root/usr/lib64}   # the libraries Docker injected into the node
+        securityContext: {privileged: true}                # needs /dev/dxg to enumerate the GPU
+        volumeMounts:
+        - {name: device-plugins, mountPath: /var/lib/kubelet/device-plugins}   # the kubelet's registration socket
+        - {name: cdi, mountPath: /var/run/cdi}                                  # where the CDI spec is written
+        - {name: driver-root, mountPath: /driver-root, readOnly: true}
+        - {name: dxg, mountPath: /dev/dxg}
+        - {name: wsl, mountPath: /usr/lib/wsl, readOnly: true}                  # the driver store (9p from Windows)
+      volumes:
+      - {name: device-plugins, hostPath: {path: /var/lib/kubelet/device-plugins, type: Directory}}
+      - {name: cdi, hostPath: {path: /var/run/cdi, type: DirectoryOrCreate}}
+      - {name: driver-root, hostPath: {path: /, type: Directory}}
+      - {name: dxg, hostPath: {path: /dev/dxg, type: CharDevice}}
+      - {name: wsl, hostPath: {path: /usr/lib/wsl, type: Directory}}

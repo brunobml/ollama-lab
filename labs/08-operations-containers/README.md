@@ -160,6 +160,70 @@ Output: `results\raw\container-ollama-<stamp>\` with `report.md` and `data.json`
 | D | both replicas Running on the one node, both see `/dev/dxg`; nothing Pending | Nothing tells the scheduler a GPU is involved |
 | D `--contend` | the second load succeeds; ≈9.7 GB used | Step 1: each instance plans with what's free |
 
+### Step 3 — NVIDIA's device plugin with CDI: unprivileged GPU pods, `nvidia.com/gpu` counted
+
+**What we're learning:** what a device plugin actually does. It does two separate jobs:
+* **Advertising:** the node gets an `nvidia.com/gpu` count, so the scheduler and quotas can see GPUs.
+* **Injection:** a pod that's allocated a GPU gets the device and the driver files, with no privileges.
+
+The analogy is a CSI driver, which also advertises capacity and then mounts something into the pod. Step 2 did the injection by hand with privileged pods and did no advertising at all.
+
+**Verified before the run (2026-11-05, probe cluster created and deleted):**
+* **Plugin:** `nvcr.io/nvidia/k8s-device-plugin:v0.20.1` (released 2026-09-22, ≥2 weeks old; 55.8 MB compressed, 161 MB on disk, `sha256:27c1b255…`). Pulling it was this step's only download. The repository README is out of date (it says v0.17.1 and assumes the NVIDIA Container Toolkit), so I checked the v0.20.1 source instead:
+  * WSL support is in `internal/rm/wsl_devices.go`. It advertises a single device, `all`, for everything behind `/dev/dxg`, with memory and compute capability reported as 0.
+  * The flags include `--device-list-strategy` (`envvar` by default, which needs the NVIDIA runtime; `cdi-cri` doesn't) and `--cdi-disable-hooks`.
+  * Its `docs/cdi.md` still asks for the `nvidia` runtime and a RuntimeClass. This setup has neither.
+* **k3s's containerd already speaks CDI:** `crictl info` shows `enableCDI: true` and `cdiSpecDirs: [/etc/cdi, /var/run/cdi]`. Nothing on the node had to change.
+* **What I ran:** the plugin as a privileged DaemonSet (`k8s/nvidia-device-plugin.yaml`) with:
+  * `DEVICE_LIST_STRATEGY=cdi-cri`;
+  * `CDI_DISABLE_HOOKS=all`, because the hooks would run on the k3s node, which has no glibc or `nvidia-cdi-hook`;
+  * the node's `/` at `/driver-root`;
+  * `/dev/dxg`, and `/usr/lib/wsl`, the driver store, over 9p.
+* **The first attempt failed** with `Unable to load the NVML library`. On WSL, `libnvidia-ml.so.1` loads the real library from `/usr/lib/wsl/drivers/…`, which I hadn't mounted. With that mount the plugin:
+  * logged `Detected platform: wsl` and registered `nvidia.com/gpu`;
+  * advertised `nvidia.com/gpu: 1` (capacity and allocatable);
+  * wrote `/var/run/cdi/k8s.device-plugin.nvidia.com-gpu.json`: device `all` = `/dev/dxg`, 8 driver-store files mounted read-only, `NVIDIA_VISIBLE_DEVICES=void`, no hooks.
+* **`libdxcore.so` is missing from that spec.** The plugin logs `Could not locate libdxcore.so`, because it looks in `/usr/lib/wsl/lib` and Docker put the file in the node's `/usr/lib64`.
+  * An unprivileged pod with only what CDI injects gets `Failed to initialize NVML: N/A`.
+  * Adding the node's `/usr/lib64` read-only works. That directory holds only the files Docker injected; the plain k3s image has none.
+  * The result was `NVIDIA GeForce RTX 3080` with **17 devices and the default capabilities** (`00000000a80425fb`).
+* **Ollama ran unprivileged:** `capabilities: drop: [ALL]` (`CapEff 0000000000000000`), `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, and `limits: nvidia.com/gpu: 1`.
+  * The first request took 81.7 s (load 42.0 s) with an empty kernel cache.
+  * Warm generation ran at 97.4 tok/s, using +3,896 MiB at 100% GPU. That's the same as the privileged pod.
+  * It still planned against `9071 MiB of free device memory`.
+* **A second replica stayed Pending:** `0/1 nodes are available: 1 Insufficient nvidia.com/gpu`.
+
+**What runs** (`scripts/k8s_gpu_plugin.py`, ≈15 min; the same cluster settings as Step 2, deleted at the end):
+* **A. The plugin:** time from `kubectl apply` to `nvidia.com/gpu` on the node, the CDI spec it writes, and its log.
+* **B. Unprivileged probe pods** (`k8s/gpu-probe-cdi.yaml`): CDI only, CDI plus the node's `/usr/lib64`, and a third pod asking for the GPU at the same time.
+* **C. Ollama** (`k8s/ollama-gpu.yaml`): first answer, speed, capabilities and devices in the pod, and the planning number. Then a pod deletion with the kernel cache on the node.
+* **D. `replicas: 2`** with one GPU.
+* **E. A `RollingUpdate`** with the GPU counted, then a switch back to `Recreate`.
+* **F. The plugin deleted while Ollama runs:**
+  * whether the running pod still answers;
+  * what happens to the node's `nvidia.com/gpu` (polled for up to 6 min);
+  * what a replacement pod does;
+  * how long until the GPU comes back once the plugin is re-applied.
+
+```powershell
+.\.venv\Scripts\python scripts\k8s_gpu_plugin.py          # ≈15 min; deletes the cluster at the end
+.\.venv\Scripts\python scripts\k8s_gpu_plugin.py --keep   # optional: keep the cluster to explore (§7 deletes it)
+```
+
+**Predictions** (A–D come from the probe; E and F were written before any run):
+
+| Measure | Prediction | Why |
+|---|---|---|
+| A | `nvidia.com/gpu: 1` within ≈10 s of `apply`; spec = `/dev/dxg` + 8 mounts, no hooks; `Could not locate libdxcore.so` | Probe |
+| B | CDI only: NVML fails; CDI + libs: works with 17 devices and default capabilities; the third pod waits with `Insufficient nvidia.com/gpu`, then runs | Probe |
+| C | `CapEff 0`, 17 devices; first answer 80–90 s; warm ≈97 tok/s; +≈3,900 MiB; planning 9,071 MiB; pod 2 ≤ 10 s | Probe; Step 2's cache result |
+| D | the second replica Pending, `Insufficient nvidia.com/gpu` | Probe |
+| E | `RollingUpdate`: the new pod Pending, the old one keeps serving, `rollout status` times out; `Recreate` completes | With 1 replica, 25% `maxSurge` rounds up to 1 and 25% `maxUnavailable` rounds down to 0. The update needs a second GPU first. This is Step 2's reason for `Recreate`, the other way round: then it was double VRAM, now a stuck rollout |
+| F: running pod | keeps answering | The device was injected when the container started; the plugin isn't in the data path |
+| F: node `nvidia.com/gpu` | allocatable drops to 0 (low confidence on when: immediately or after a grace period of a few minutes) | The kubelet's device manager tracks the plugin's socket |
+| F: replacement pod | not Running until the plugin is back (Pending, or rejected at admission) | Nothing can allocate the device |
+| F: re-apply | `nvidia.com/gpu` back within ≈10 s; the replacement then starts, and answers fast thanks to the node cache | As in A |
+
 ## 5. Hypotheses → Observed Metrics
 
 ### Step 1 — runs 1 and 2 (2026-11-04, `qwen3.5:4b`, temperature 0, seed 42, think off; run 2 with `--contend`)
@@ -299,6 +363,66 @@ Runs: `k8s-ollama-20261104-154245` (full) and `…-155942` (`--contend`). Run 2 
 3. **Ollama's VRAM planning trusts a number that, in these pods, didn't move.** On shared GPUs, decide the budget outside Ollama: one model-serving pod per GPU, or a hard memory split such as MIG on GPUs that have it (the 3080 doesn't), not two pods relying on luck. The device plugin's time-slicing shares a GPU between pods but doesn't split its memory. The failure mode is a 500 on the request that triggers the load, not a slow request.
 4. **Check that a result came from the target you meant.** A leftover port-forward made the wrong pod answer without any error. The "0.0 s load" was the only sign.
 
+### Step 3 — run 1 (2026-11-05, `qwen3.5:4b`, temperature 0, seed 42, think off)
+
+Run: `k8s-gpu-plugin-20261105-102823`. I ran it end to end as the script's test, after writing the E and F predictions. Every part matched its prediction.
+
+**1. The plugin turned the GPU into a resource Kubernetes can count.**
+* `nvidia.com/gpu` went from absent to **capacity 1 / allocatable 1, 1.5 s after `kubectl apply`**.
+* The log said `Detected platform: wsl` and used the driver store `nvhdci.inf_amd64_d13945b69e80a76d`.
+* It wrote one CDI spec: kind `k8s.device-plugin.nvidia.com/gpu`, device `all` = `/dev/dxg`, 8 read-only mounts, no hooks, and `NVIDIA_VISIBLE_DEVICES=void`. That env var tells any NVIDIA runtime to do nothing; CDI does the work.
+* It warned twice: `Could not locate libdxcore.so`.
+
+**2. Privilege is no longer needed for the GPU.** All three probe pods requested `nvidia.com/gpu: 1`, and all three kept 17 devices and the default capabilities (`a80425fb`).
+
+| pod | what it got | result |
+|---|---|---|
+| `gpu-cdi-only` | CDI's edits only | `/dev/dxg` and the 8 driver-store files, then `Failed to initialize NVML: N/A` (no `libdxcore.so`) |
+| `gpu-cdi-libs` | CDI + the node's `/usr/lib64` read-only | `NVIDIA GeForce RTX 3080, 1536 MiB` |
+| `gpu-second` | a GPU request only | ran last |
+
+* **The scheduler handed out the one GPU one pod at a time.** `gpu-cdi-only` got it first. The other two logged `0/1 nodes are available: 1 Insufficient nvidia.com/gpu` and ran as each earlier pod finished.
+* **The privilege moved from the workload to one node agent.** The plugin DaemonSet is privileged; the pods using the GPU aren't. That's the same split as a CSI node plugin.
+
+**3. Unprivileged Ollama matched the privileged pod.**
+* Inside the pod: `CapEff 0000000000000000`, 17 devices, and `/dev/dxg` present (`crw-rw-rw- 10, 258`).
+* Ready took 4.4 s. The first request took 81.8 s (load 41.4 s), with the kernel cache empty and 78,948 KB written to the node.
+* Warm generation was **98.7 tok/s** (samples 97.1–101.2), using +3,909 MiB at 100% GPU.
+* After a pod deletion, with the cache kept on the node: Ready in 4.0 s, first request **3.7 s**.
+* **The planning line still said 9,071 MiB free.** The plugin changes who may use the GPU, not what Ollama believes is free.
+
+**4. Counting the GPU changes the failure modes.**
+* **`replicas: 2`:** one pod Running, the other **Pending, `Insufficient nvidia.com/gpu`**. In Step 2 both ran, and two loads filled the card.
+* **`RollingUpdate`:** the new pod stayed Pending, the old pod kept serving, and `rollout status` timed out after 45 s with `1 old replicas are pending termination`. That's 25% `maxSurge` rounding up to 1 and 25% `maxUnavailable` rounding down to 0. Switching to `Recreate` finished the rollout in **3.8 s**.
+* So `Recreate` is still the right strategy for a 1-GPU Deployment, for a new reason. Before, an update briefly needed twice the VRAM. Now an update would wait forever for a second GPU. `maxSurge: 0, maxUnavailable: 1` would also work.
+
+**5. Removing the plugin: running pods survive, new ones can't start.**
+* With the DaemonSet deleted, the running pod still answered (97.3 tok/s). The device was injected when its container started, and the plugin isn't in the data path.
+* The node went from **(capacity 1, allocatable 1) to (1, 0) within 9.1 s**. Capacity stayed at 1, so the node still reported a GPU that nothing could allocate.
+* After I deleted the Ollama pod, its replacement sat **Pending: `Insufficient nvidia.com/gpu`**.
+* Re-applying the plugin brought allocatable back in **3.3 s**. The replacement was Ready 6.8 s after the re-apply.
+* Operationally: a plugin outage blocks every GPU reschedule and new GPU pod, but doesn't touch running ones. That's why the official DaemonSet uses `priorityClassName: system-node-critical`, and this one copies it.
+
+**Predictions vs observed:**
+
+| Prediction | Observed |
+|---|---|
+| A: `nvidia.com/gpu: 1` within ≈10 s; `/dev/dxg` + 8 mounts, no hooks; libdxcore warning | ✅ 1.5 s |
+| B: CDI only fails, CDI + libs works unprivileged, the third pod waits | ✅ |
+| C: `CapEff 0`, 17 devices; 80–90 s; ≈97 tok/s; +≈3,900; 9,071; pod 2 ≤ 10 s | ✅ 81.8 s, 98.7 tok/s, +3,909, 9,071, 3.7 s |
+| D: the second replica Pending | ✅ |
+| E: `RollingUpdate` stuck, `Recreate` completes | ✅ timed out at 45 s; `Recreate` 3.8 s |
+| F: the running pod keeps answering | ✅ 97.3 tok/s |
+| F: allocatable drops to 0 (timing unsure) | ✅ 9.1 s; capacity stays 1 |
+| F: the replacement doesn't run until the plugin is back | ✅ Pending, `Insufficient nvidia.com/gpu` |
+| F: back within ≈10 s, replacement fast | ✅ 3.3 s, Ready at 6.8 s |
+
+**What Step 3 teaches:**
+1. **A device plugin does two jobs: it advertises a count and it injects devices.** Here CDI did the injecting, through k3s's containerd, with no NVIDIA runtime on the node. The device cgroup let `/dev/dxg` through because CDI added it, which was the job `privileged: true` did in Step 2.
+2. **Least privilege, almost.** The GPU workload runs with no capabilities and the default device set. One `hostPath` remains: the node's `/usr/lib64`, for `libdxcore.so`, which the plugin's WSL spec leaves out. Pod Security's `baseline` level rejects `hostPath` volumes. On a native Linux node with the NVIDIA Container Toolkit, the CDI spec covers the libraries too.
+3. **`nvidia.com/gpu: 1` is a whole device, not a memory budget.** It stopped a second Ollama from sharing the card. It doesn't tell Ollama how much memory is free (still 9,071 MiB), and it doesn't size a model.
+4. **Once GPUs are counted, rollout and capacity planning change.** A 1-GPU Deployment can't surge, and a plugin outage freezes GPU scheduling. Watch the plugin like any other node agent: allocatable dropping to 0 while capacity stays at 1 is the signal.
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Cause | Check / fix |
@@ -320,15 +444,20 @@ Runs: `k8s-ollama-20261104-154245` (full) and `…-155942` (`--contend`). Run 2 
 | Pod CrashLoopBackOff: `remove /root/.ollama/models/manifests-v2: read-only file system` | Ollama migrates/prunes its store on start | Give the store one read-write owner, or mount a store already in the `manifests-v2` layout |
 | Pod Ready in seconds, first answer after ≈90 s | The readiness probe checks the HTTP server, not the model or the kernel cache | Warm up before Ready (exec probe that runs a request), and persist `/root/.nv` |
 | A GPU Deployment update briefly needs twice the VRAM | `RollingUpdate` starts the new pod before stopping the old one | `strategy: Recreate` (or `maxSurge: 0`) |
+| Device plugin: `failed to initialize nvml: Unable to load the NVML library` on WSL | `libnvidia-ml.so.1` loads the real library from the driver store, `/usr/lib/wsl/drivers/…`, which isn't mounted | Mount the node's `/usr/lib/wsl` into the plugin pod (read-only) |
+| GPU pod: `Failed to initialize NVML: N/A`; `/dev/dxg` and the driver-store files are there | The plugin's WSL CDI spec lacks `libdxcore.so`, which Docker put in the node's `/usr/lib64` | Mount the node's `/usr/lib64` read-only on the image's `LD_LIBRARY_PATH` (`/usr/local/nvidia/lib64` for Ollama) |
+| `0/1 nodes are available: 1 Insufficient nvidia.com/gpu` | Every GPU is allocated, or the plugin is gone (allocatable 0, capacity unchanged) | `kubectl get node -o jsonpath='{.status.allocatable}'`; check the plugin DaemonSet |
+| A 1-GPU Deployment's rollout hangs: `1 old replicas are pending termination` | `RollingUpdate` surges a pod that needs a GPU no node has free | `strategy: Recreate`, or `maxSurge: 0` + `maxUnavailable: 1` |
 | `docker run --entrypoint /bin/ollama …` fails from Git Bash | Git Bash rewrites `/bin/ollama` to `C:/Program Files/Git/bin/ollama` | `MSYS_NO_PATHCONV=1`, or use PowerShell |
 
 ## 7. Cleanup
 
 ```powershell
-wsl -d Ubuntu -- k3d cluster delete ollama-lab             # Step 2 (the script already does this unless --keep)
+wsl -d Ubuntu -- k3d cluster delete ollama-lab             # Steps 2-3 (the scripts already do this unless --keep)
 Remove-Item $HOME\.kube\ollama-lab.yaml -ErrorAction SilentlyContinue
 docker rm -f ollama-lab-bind ollama-lab-volume 2>$null   # the script already does this
 docker volume rm ollama-lab-models                          # the 3.3 GB copy of the 4b
+docker image rm nvcr.io/nvidia/k8s-device-plugin:v0.20.1    # optional: 161 MB (Step 3)
 docker image rm ollama/ollama:0.40.13                       # optional: 5 GB; keep it for later steps
 ollama stop qwen3.5:4b
 ```
@@ -347,3 +476,7 @@ Docker Desktop can stay running or be quit from the tray. Nothing in this lab ch
 8. The readiness probe passed 85–90 s before the pod could answer. Write the probe you'd use instead, and explain why the `hostPath` kernel cache helps on this cluster but not after a reschedule to a new node.
 9. Why did the scheduler put two GPU pods on a node with one GPU, and what would `resources.limits: nvidia.com/gpu: 1` change, given what a device plugin advertises?
 10. The second replica failed with a CUDA out-of-memory error instead of offloading layers to the CPU, as Lab 02 saw on Windows. Which logged number explains that, and why couldn't it be right?
+11. What does a device plugin do that Step 2's privileged pod did by hand, and what does it add that Step 2 couldn't do at all?
+12. The Ollama pod has no capabilities, yet it opens `/dev/dxg`. Which component put the device in its container and its device cgroup, and which file told it how?
+13. With `nvidia.com/gpu: 1`, why does a default `RollingUpdate` hang, while in Step 2 it would have run two pods on one GPU?
+14. The plugin was deleted and the running Ollama pod kept working, but its replacement stayed Pending. Explain both, and name the node status field you'd alert on.

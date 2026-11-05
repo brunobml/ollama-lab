@@ -1,0 +1,46 @@
+# Lab 08 Step 3: Ollama with the GPU from the device plugin. Compared with Step 2's ollama.yaml:
+#   no privileged, every capability dropped, no /dev/dxg or /usr/lib/wsl mounts (CDI injects them),
+#   resources.limits nvidia.com/gpu: 1 (the scheduler now counts it), the CUDA kernel cache on the node from the start.
+# Still a hostPath: the node's /usr/lib64 for libdxcore.so and libcuda.so.1, which the plugin's CDI spec leaves out.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  labels: {app: ollama}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # Part E: with the GPU counted, a RollingUpdate's new pod can't be scheduled
+  selector: {matchLabels: {app: ollama}}
+  template:
+    metadata:
+      labels: {app: ollama}
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:0.40.13
+        imagePullPolicy: Never
+        ports: [{containerPort: 11434}]
+        resources: {limits: {nvidia.com/gpu: 1}}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+          seccompProfile: {type: RuntimeDefault}
+        readinessProbe:
+          httpGet: {path: /api/version, port: 11434}
+          periodSeconds: 2
+        volumeMounts:
+        - {name: gpulib, mountPath: /usr/local/nvidia/lib64, readOnly: true}   # on the image's LD_LIBRARY_PATH
+        - {name: models, mountPath: /root/.ollama/models}
+        - {name: nvcache, mountPath: /root/.nv}
+      volumes:
+      - {name: gpulib, hostPath: {path: /usr/lib64, type: Directory}}
+      - {name: models, hostPath: {path: /var/lib/ollama-models, type: Directory}}
+      - {name: nvcache, hostPath: {path: /var/lib/ollama-nv, type: DirectoryOrCreate}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+spec:
+  selector: {app: ollama}
+  ports: [{port: 11434, targetPort: 11434}]
