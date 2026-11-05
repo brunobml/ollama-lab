@@ -437,6 +437,42 @@ Run: `lmstudio-compare-20261105-122711`, mine. The install diff and the probe ar
    * llama-server not at all, in these runs;
    * LM Studio by default, in a daily log under your home folder.
 
+### Summary — the comparison matrix
+
+**Test conditions (all steps):**
+* **Machine:** RTX 3080 10 GB, driver 591.86 (CUDA 13.1), Windows 11 build 26300.
+* **Model:** `qwen3.5:4b` Q4_K_M, the same GGUF bytes in every runtime (Ollama's blob, hard-linked for LM Studio), with the vision projector loaded, context 4,096.
+* **Requests:** temperature 0, seed 42, the same raw ChatML prompt (23 tokens), one runtime on the GPU at a time.
+* **Measurement:** medians of 5 after a warm-up, one shared HTTP client, 2026-11-05.
+
+| | Ollama 0.40.13 | llama-server (bundled with Ollama, b11963) | llama-server (official b11963) | LM Studio 0.4.28+2 (engine 2.70.0 = b12116) |
+|---|---|---|---|---|
+| What it is | registry + API + scheduler + templates around llama-server | the engine's HTTP server | the same, released build | desktop app + API + engine manager |
+| Build | – (runs the bundled build) | Clang 18.1.8, CUDA 13.0 | Clang 20.1.8, CUDA 13.4 | Clang 19.1.1, CUDA 12.8 |
+| Install footprint | per-user app (`lib\ollama` includes `cuda_v13`, 903 MB) | none extra (inside Ollama) | a folder (731 MB), no installer | per-user app 771 MB + 2.5 GB `~\.lmstudio`; user PATH, login item, URL handler; self-updating engines |
+| Model management | pull, store, tags, Modelfile | a file path | a file path | catalog/download, `lms import` (default **move**) |
+| Load to first answer | 3.7 s (process already running) | 4.8–5.6 s to healthy + 0.25 s | 4.8–5.0 s + first request | 6.0–6.1 s (`lms load`) |
+| VRAM, 1 slot | +3,902 MiB | +3,897–3,899 | +3,897–3,899 | +3,894–3,906 |
+| Sampler defaults that matter | `presence_penalty 1.5, top_k 20` (model params layer) | none | none | a repeat penalty ≠ 1 (app) |
+| Generation, its own defaults | 120.7 tok/s | 142.8 | 142.2–142.6 | 125.1 |
+| Generation, pinned options with no penalty | 144.8 | 142.8 | 142.2–142.6 | 140.7–141.6 |
+| Generation, pinned Ollama options | 120.7 | 119.3–120.0 | **127.4–127.8** | 125.7 |
+| Prompt processing, 1,640 tokens, uncached | 5,596 tok/s | 5,553–5,755 | 5,691–5,694 | not measured |
+| Text with identical pinned options | identical | identical | identical | identical |
+| 4 concurrent requests | serialized (`-np 1`): 128 tok/s total | `-np 4`: 288–297 tok/s, separate KV per slot | `-np 4`: 290 | `--parallel 4`: 259, unified KV, texts differ |
+| Per-request overhead (1 token) | 22.8 ms | 8.4 ms | – | 27.4 ms |
+| Chat template | own renderer (qwen3.5); `think: false` adds an empty think block | generic `chatml` (`--no-jinja`): the model writes the think tags into the answer | same | the GGUF's Jinja template: thinks by default, `reasoning_content` separate |
+| Exposure by default | 127.0.0.1:11434; CORS limited to local origins | 127.0.0.1 as configured; **no API key, CORS allows all** | same | 127.0.0.1:1234 + internal 127.0.0.1:41343 (LAN refused) |
+| Prompts kept on disk by default | no (only with `OLLAMA_DEBUG_LOG_REQUESTS`) | no | no | **yes**: daily server log with prompts, responses and reasoning |
+| Metrics | none (`/metrics` 404; Lab 08) | `timings` in each response | same + `llama-bench` (tg128 154.5, pp512 6,784) | `stats` in `/api/v0` responses |
+
+**Which to use for what** (on this machine, from these measurements):
+* **Ollama:** one person or a few tools, many models, pulled and switched on demand. It handles the store, templates and loading for you. You pay ≈14 ms per request, and its default `presence_penalty` (≈17% of speed, changed text) unless you override it. It doesn't batch qwen3.5.
+* **llama-server:** a service for one model, where throughput under concurrency matters (`-np 4` gave 2.26×), or where you need every flag. You manage files, templates and exposure yourself: it has no API key and permissive CORS by default. Benchmark the exact build you deploy (6.5% between two builds of one commit).
+* **LM Studio:** interactive desktop use, trying models, a GUI. Pin the engine and sampler options before measuring anything, and know that it logs prompts in your home folder and starts at login.
+
+The engine was never the difference: with every sampler option pinned, all four columns wrote the same bytes. **The differences are defaults, templates, batching, packaging and what each one keeps.**
+
 ## 6. Troubleshooting & Failure Modes
 
 | Symptom | Cause | Check / fix |
